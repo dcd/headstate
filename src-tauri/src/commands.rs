@@ -9017,3 +9017,19 @@ fn finish(app: &AppHandle, done: UpdateRunDone) {
     }
     log::info!("update run opened {url}");
 }
+
+/// GitLab commands have no GitHub client dependency and no shared stats totals.
+#[tauri::command]
+pub async fn gitlab_stats_tree(host: String) -> Result<crate::gitlab::stats::Tree, String> {
+    crate::gitlab::stats::tree(&host).await
+}
+#[tauri::command]
+pub async fn gitlab_stats_load(
+    app: AppHandle,
+    host: String,
+    scope: crate::gitlab::stats::Scope,
+    days: u32,
+    refresh: bool,
+) -> Result<crate::gitlab::stats::Report, String> {
+    crate::gitlab::stats::load(&host, scope, days, db_path(&app), refresh).await
+}

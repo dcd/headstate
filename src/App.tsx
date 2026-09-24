@@ -196,8 +196,8 @@ import { MOBILE_HIDDEN_VIEWS, useActiveFilters, useFilters, viewLabel } from "./
 /// handful from the app's hand-drawn SVG. If the set had shipped the count
 /// would be in the thousands. Nothing to do here, and worth recording so
 /// the 44 MB does not get re-investigated.
-const StatsPage = lazy(() =>
-  import("./components/StatsPage").then((m) => ({ default: m.StatsPage })),
+const ProviderStatsPage = lazy(() =>
+  import("./components/ProviderStatsPage").then((m) => ({ default: m.ProviderStatsPage })),
 );
 const SystemHealthPage = lazy(() =>
   import("./components/SystemHealthPage").then((m) => ({
@@ -1005,10 +1005,9 @@ export default function App() {
             {/* Suspense because the page is now a lazy chunk (#838); see
                 the `SystemHealthPage` branch above for why the boundary
                 sits inside the padded wrapper. */}
-            {selection === "gitlab" ? <p className="rounded-md border border-[#30363d] p-4 text-sm text-[#8b949e]">GitLab PR Stats are not available yet.</p> : <>
-              {selection === "both" ? <p className="mb-3 text-sm text-[#8b949e]">GitHub stats only. GitLab stats are separate and not available yet.</p> : null}
-              <Suspense fallback={<ViewLoading />}><StatsPage /></Suspense>
-            </>}
+            <Suspense fallback={<ViewLoading />}>
+              <ProviderStatsPage />
+            </Suspense>
           </div>
         ) : selection !== "github" ? (
           <div className="p-4">

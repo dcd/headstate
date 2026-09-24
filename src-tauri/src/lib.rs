@@ -450,6 +450,8 @@ pub fn run() {
             commands::get_merged_detail,
             commands::stats_count,
             commands::stats_tree,
+            commands::gitlab_stats_tree,
+            commands::gitlab_stats_load,
             commands::stats_board,
             commands::stats_series,
             commands::stats_reviewers,

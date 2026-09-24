@@ -1215,6 +1215,12 @@ const MIGRATIONS: &[&str] = &[
      DROP TABLE snapshot;
      ALTER TABLE snapshot_sources RENAME TO snapshot;
      COMMIT;",
+    // GitLab receipts retain coverage and history without relabelling GitHub tables.
+    "CREATE TABLE gitlab_stats_cache (
+        key TEXT PRIMARY KEY,
+        payload TEXT NOT NULL,
+        fetched_at TEXT NOT NULL
+    );",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
