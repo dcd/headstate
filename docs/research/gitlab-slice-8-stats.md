@@ -165,3 +165,27 @@ Astra/xhigh review remain gates; none is implied by this checkpoint.
 API contracts checked against the official [merge requests API](https://docs.gitlab.com/api/merge_requests/)
 and [discussions API](https://docs.gitlab.com/api/discussions/). Tests added here
 use synthetic fixtures and do not claim live permission or tier validation.
+
+## Review corrections, 2026-09-24
+
+The fresh Astra/xhigh review of `5ebda65` found two P2 defects. A later-page
+429 without rate headers now stops all following cohorts and comment reads by
+its `RateLimited` stop reason; absent headers do not revoke that evidence.
+Invalid-row qualification preserves the stop reason. A synthetic regression
+checks both created and merged pagination, verifies the exact request count,
+and includes duplicate rows so validation cannot accidentally re-enable work.
+
+Daily history writes now take an SQLite IMMEDIATE transaction, reread the
+current receipt, and merge measured cohorts before committing. The caller uses
+the resulting persisted receipt. A slower failed request cannot erase a
+completed day or return a locally stale missing-day result after a concurrent
+success. A coordinated two-writer regression reproduces that ordering. Latest
+attempt metadata and each cohort's own evidence/timestamp remain separate.
+
+Stats tree, load and backfill now have typed wrappers in `src/api/tauri.ts`, used
+by the query/mutation hooks, satisfying the desktop command reachability
+contract that direct `transport.call` sites elsewhere do not satisfy.
+
+After these corrections: thirteen focused Vitest tests, TypeScript, targeted
+ESLint, knip, formatting and whitespace checks pass. Rust regression rerun and
+fresh review of the changed diff remain required at this checkpoint.

@@ -2,7 +2,7 @@
 //! viewer id, scope and window. History is evidence from this fetch, not an
 //! invented accumulated total. Existing GitHub history/cache remains untouched.
 use crate::gitlab::stats::{HistoryReceipt, Report};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use std::path::Path;
 
 pub fn get(path: &Path, key: &str) -> Result<Option<Report>, String> {
@@ -47,8 +47,26 @@ pub fn history_put(
     partition: &str,
     day: &str,
     receipt: &HistoryReceipt,
-) -> Result<(), String> {
-    let conn = super::open_db(path).map_err(|e| e.to_string())?;
-    conn.execute("INSERT INTO gitlab_stats_history (partition, day, payload) VALUES (?1, ?2, ?3) ON CONFLICT(partition, day) DO UPDATE SET payload = excluded.payload", params![partition, day, serde_json::to_string(receipt).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
-    Ok(())
+) -> Result<HistoryReceipt, String> {
+    let mut conn = super::open_db(path).map_err(|e| e.to_string())?;
+    // Read and merge only after taking the write reservation. Another desktop
+    // or phone request may have completed the day while this fetch was running.
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let raw: Option<String> = tx
+        .query_row(
+            "SELECT payload FROM gitlab_stats_history WHERE partition = ?1 AND day = ?2",
+            params![partition, day],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let mut saved = receipt.clone();
+    if let Some(prior) = raw.and_then(|value| serde_json::from_str::<HistoryReceipt>(&value).ok()) {
+        saved.retain_prior(&prior);
+    }
+    tx.execute("INSERT INTO gitlab_stats_history (partition, day, payload) VALUES (?1, ?2, ?3) ON CONFLICT(partition, day) DO UPDATE SET payload = excluded.payload", params![partition, day, serde_json::to_string(&saved).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(saved)
 }

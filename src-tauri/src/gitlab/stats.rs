@@ -53,6 +53,19 @@ pub struct Coverage {
     pub rate_reset: Option<u64>,
 }
 
+impl Coverage {
+    fn rate_limited(&self) -> bool {
+        self.stop == Stop::RateLimited || self.rate_remaining == Some(0)
+    }
+    fn invalidate(&mut self) {
+        self.complete = false;
+        // Invalid rows do not revoke the server's instruction to stop requests.
+        if self.stop != Stop::RateLimited {
+            self.stop = Stop::InvalidData;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub path: String,
@@ -423,8 +436,7 @@ async fn pages_limited(
             .total
             .is_some_and(|n| n != rows.len() as u64 && coverage.complete || n < rows.len() as u64)
     {
-        coverage.complete = false;
-        coverage.stop = Stop::InvalidData;
+        coverage.invalidate();
         coverage.total = None;
     }
     Ok((rows, coverage))
@@ -473,14 +485,13 @@ pub async fn tree(host: &str) -> Result<Tree, String> {
                 continue;
             }
         }
-        coverage.complete = false;
-        coverage.stop = Stop::InvalidData;
+        coverage.invalidate();
     }
     coverage.received = projects.len();
     let mut groups = Vec::new();
     let mut group_coverage = None;
     let mut group_error = None;
-    if coverage.rate_remaining == Some(0) || started.elapsed() >= BUDGET {
+    if coverage.rate_limited() || started.elapsed() >= BUDGET {
         group_error = Some("Request budget exhausted before requesting groups".into());
     } else {
         match pages(
@@ -504,8 +515,7 @@ pub async fn tree(host: &str) -> Result<Tree, String> {
                             continue;
                         }
                     }
-                    measured.complete = false;
-                    measured.stop = Stop::InvalidData;
+                    measured.invalidate();
                 }
                 measured.received = groups.len();
                 groups.sort();
@@ -593,8 +603,7 @@ fn summarize(
                 continue;
             }
         }
-        coverage.complete = false;
-        coverage.stop = Stop::InvalidData;
+        coverage.invalidate();
     }
     coverage.received = history.len();
     let mut counts = Counts {
@@ -760,7 +769,8 @@ async fn load_window(
     );
     // Each subsequent operation receives only the remaining load budget. No
     // outer timeout can drop already measured rows.
-    if report.coverage.rate_remaining == Some(0) {
+    let mut limited = report.coverage.rate_limited();
+    if limited {
         report.merged_error =
             Some("GitLab request budget exhausted; merged MRs were not requested".into());
     } else if started.elapsed() < BUDGET {
@@ -777,6 +787,7 @@ async fn load_window(
             }
             Err(failure) => {
                 if failure.stop == Stop::RateLimited {
+                    limited = true;
                     report.coverage.rate_remaining = failure.remaining;
                     report.coverage.rate_reset = failure.reset;
                 }
@@ -786,12 +797,10 @@ async fn load_window(
     } else {
         report.merged_error = Some("Load budget exhausted before requesting merged MRs".into());
     }
-    let limited = report.merged_error.as_deref() == Some(error(&Stop::RateLimited).as_str())
-        || report.coverage.rate_remaining == Some(0)
-        || report
-            .merged_window
-            .as_ref()
-            .is_some_and(|m| m.coverage.rate_remaining == Some(0));
+    limited |= report
+        .merged_window
+        .as_ref()
+        .is_some_and(|m| m.coverage.rate_limited());
     report.activity = Some(
         activity::load(
             program,
@@ -829,8 +838,7 @@ fn summarize_merged(report: &Report, raw: Vec<Value>, mut coverage: Coverage) ->
                 continue;
             }
         }
-        coverage.complete = false;
-        coverage.stop = Stop::InvalidData;
+        coverage.invalidate();
     }
     coverage.received = history.len();
     let mut series = BTreeMap::<String, usize>::new();
@@ -925,6 +933,55 @@ mod tests {
         );
         assert!(endpoint(&Scope::Person("a&scope=all".into())).is_err());
         assert!(endpoint(&Scope::Person("group/user".into())).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn later_429_without_headers_stops_all_following_cohorts() {
+        use std::os::unix::fs::PermissionsExt;
+        for throttle_created in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let program = dir.path().join("glab");
+            let row = serde_json::to_string(&sample(1)).unwrap();
+            let created_next = if throttle_created { "2" } else { "" };
+            // The duplicate also checks that row validation cannot erase the
+            // rate-limit stop reason before load_window decides what to fetch.
+            let script = format!(
+                r##"#!/bin/sh
+printf '%s\n' "$5" >> "$0.calls"
+case "$5" in
+  *state=all*page=1) printf 'HTTP/2 200\nx-next-page: {created_next}\n\n[{row},{row}]';;
+  *state=merged*page=1) printf 'HTTP/2 200\nx-next-page: 2\n\n[{row}]';;
+  *page=2) printf 'HTTP/2 429\n\nlimited'; exit 1;;
+  *) printf 'HTTP/2 200\nx-next-page: \n\n[]';;
+esac
+"##
+            );
+            std::fs::write(&program, script).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let report = load_window(
+                &program,
+                source("gitlab.com").unwrap(),
+                "1".into(),
+                Scope::Mine,
+                "2026-09-01T00:00:00Z".parse().unwrap(),
+                "2026-09-03T00:00:00Z".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+            let calls = std::fs::read_to_string(program.with_extension("calls")).unwrap();
+            assert_eq!(calls.lines().count(), if throttle_created { 2 } else { 3 });
+            assert!(!calls.contains("/notes?"));
+            assert_eq!(report.counts.created, 1);
+            let coverage = if throttle_created {
+                &report.coverage
+            } else {
+                &report.merged_window.as_ref().unwrap().coverage
+            };
+            assert_eq!(coverage.stop, Stop::RateLimited);
+            assert_eq!(coverage.rate_remaining, None);
+            assert_eq!(report.activity.unwrap().comments, None);
+        }
     }
 
     #[test]
