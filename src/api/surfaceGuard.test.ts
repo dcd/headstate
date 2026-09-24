@@ -142,8 +142,12 @@ describe("the remote surface's frontend half", () => {
       "revealLog",
       "revokePairedDevice",
       "setAutostart",
+      "setGitLabHost",
       "setNotifyPrefs",
       "setRemoteEnabled",
+      // App only synchronizes desktop polling preferences behind
+      // IS_DESKTOP_BUILD; the phone keeps its source choice locally.
+      "setSourceSelection",
       "setWorktreeDirs",
     ].sort();
 

@@ -1,3 +1,5 @@
+import type { PrIdentity } from "./identity";
+
 /// TypeScript mirrors of the Rust model in `src-tauri/src/github/model.rs`.
 /// Field names and enum values are wire-format, not TS convention: serde
 /// renames `CiState`/`MergeState` to lowercase and `ReviewState` to
@@ -14,13 +16,11 @@ export interface Label {
   color: string;
 }
 
-export interface PullRequest {
+export interface PullRequest extends PrIdentity {
   /// GraphQL node ID, so a row can act without opening the detail view.
   id: string;
-  number: number;
   title: string;
   url: string;
-  repo: string;
   author: string;
   is_draft: boolean;
   /// The branch being merged, and the branch it merges into.
