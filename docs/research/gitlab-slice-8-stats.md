@@ -73,3 +73,25 @@ shape provenance; its two-draft fixture does not validate merged cohort metrics.
 The [GitLab merge requests API](https://docs.gitlab.com/api/merge_requests/)
 documents `created_after`, `created_before`, created scopes and project/group
 list endpoints. This checkpoint uses those REST filters with explicit scope.
+
+## Review corrections to the checkpoint
+
+The Astra/xhigh review of `6fa932b` requested two P2 fixes. HTTP 429 responses
+now carry their rate headers even when the error body is non-JSON. Later-page
+429s replace the receipt's previous remaining/reset values; missing headers
+clear those values to unknown. Retrieved rows and corrected coverage survive
+cache persistence. A synthetic two-page regression covers both header cases.
+
+Refresh now starts a new scope discovery before mounting statistics again,
+including retrying partial project discovery. Scope selection is associated
+with the discovered host/account; changing accounts resets the selection to
+My authored MRs and removes the previous account's project options. A stats
+response with a different viewer or source is rejected before the query cache
+can assign it to the discovery account's key. Component regressions exercise
+same-account partial discovery retry, account-switch refresh, and a switch
+between discovery and the stats response followed by recovery.
+
+Follow-up focused evidence: 8 Rust stats tests and 9 Vitest tests (6 GitLab
+statistics component tests plus 3 surface guards) passed. Full release gates
+and independent re-review remain separate requirements; this correction does
+not close the broader slice 8 work listed above.

@@ -34,13 +34,21 @@ export interface GitLabStatsReport {
   review_activity: number | null;
   history: { source: Source; project: string; iid: number; title: string; url: string; author: string; state: string; created_at: string; merged_at: string | null }[];
 }
-export function useGitLabStatsTree(host: string) {
-  return useQuery({ queryKey: ["stats", "gitlab", host, "tree"], queryFn: () => call<Tree>("gitlab_stats_tree", { host }), staleTime: 0, gcTime: 0, retry: false });
+export function useGitLabStatsTree(host: string, revision: number) {
+  return useQuery({ queryKey: ["stats", "gitlab", host, "tree", revision], queryFn: () => call<Tree>("gitlab_stats_tree", { host }), staleTime: 0, gcTime: 0, retry: false });
 }
 export function useGitLabStats(host: string, viewer: string | undefined, scope: GitLabScope, days: number) {
   return useQuery({
     queryKey: ["stats", "gitlab", host, viewer, scope, days],
-    queryFn: () => call<GitLabStatsReport>("gitlab_stats_load", { host, scope, days, refresh: true }),
+    queryFn: async () => {
+      const report = await call<GitLabStatsReport>("gitlab_stats_load", { host, scope, days, refresh: true });
+      // glab credentials can change between discovery and this request. Never
+      // put the new account's result into the previous account's query key.
+      if (report.viewer !== viewer || report.source.provider !== "gitlab" || report.source.host !== host) {
+        throw new Error("GitLab account changed while loading statistics. Refresh to reload the account and scopes.");
+      }
+      return report;
+    },
     enabled: viewer !== undefined, staleTime: 0, gcTime: 0, retry: false,
   });
 }
