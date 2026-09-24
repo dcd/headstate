@@ -455,6 +455,7 @@ pub fn run() {
             commands::stats_tree,
             commands::gitlab_stats_tree,
             commands::gitlab_stats_load,
+            commands::gitlab_stats_backfill,
             commands::stats_board,
             commands::stats_series,
             commands::stats_reviewers,

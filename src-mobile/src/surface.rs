@@ -65,6 +65,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("stats_tree", Class::Read),
     ("gitlab_stats_tree", Class::Read),
     ("gitlab_stats_load", Class::Read),
+    ("gitlab_stats_backfill", Class::Read),
     // The Mine/Others per-author board (#826). A Read; the desktop's
     // ceiling, concurrency cap and budget refusal are inside the command.
     ("stats_board", Class::Read),

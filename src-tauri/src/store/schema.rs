@@ -1221,6 +1221,13 @@ const MIGRATIONS: &[&str] = &[
         payload TEXT NOT NULL,
         fetched_at TEXT NOT NULL
     );",
+    // Durable GitLab day receipts; account and scope are part of the partition.
+    "CREATE TABLE gitlab_stats_history (
+        partition TEXT NOT NULL,
+        day TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        PRIMARY KEY (partition, day)
+    );",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {

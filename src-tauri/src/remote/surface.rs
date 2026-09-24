@@ -114,6 +114,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("stats_tree", Class::Read),
     ("gitlab_stats_tree", Class::Read),
     ("gitlab_stats_load", Class::Read),
+    ("gitlab_stats_backfill", Class::Read),
     // The per-author board behind the Mine and Others views (#826). A
     // Read, and the most expensive one in this table: it probes, slices,
     // and fetches per-PR nodes across a whole scope.
@@ -1045,6 +1046,13 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         .await),
         "stats_tree" => res(commands::stats_tree(app.state()).await),
         "gitlab_stats_tree" => res(commands::gitlab_stats_tree(a.get("host")?).await),
+        "gitlab_stats_backfill" => res(commands::gitlab_stats_backfill(
+            app.clone(),
+            a.get("host")?,
+            a.get("scope")?,
+            a.get("days")?,
+        )
+        .await),
         "gitlab_stats_load" => res(commands::gitlab_stats_load(
             app.clone(),
             a.get("host")?,

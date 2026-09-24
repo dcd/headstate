@@ -24,3 +24,22 @@ pub fn put(path: &Path, key: &str, report: &Report) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     Ok(())
 }
+
+pub fn history_get(path: &Path, partition: &str, day: &str) -> Result<Option<Report>, String> {
+    let conn = super::open_db(path).map_err(|e| e.to_string())?;
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT payload FROM gitlab_stats_history WHERE partition = ?1 AND day = ?2",
+            params![partition, day],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    Ok(raw.and_then(|v| serde_json::from_str(&v).ok()))
+}
+
+pub fn history_put(path: &Path, partition: &str, report: &Report) -> Result<(), String> {
+    let conn = super::open_db(path).map_err(|e| e.to_string())?;
+    conn.execute("INSERT INTO gitlab_stats_history (partition, day, payload) VALUES (?1, ?2, ?3) ON CONFLICT(partition, day) DO UPDATE SET payload = excluded.payload", params![partition, report.start.date_naive().to_string(), serde_json::to_string(report).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
+    Ok(())
+}
