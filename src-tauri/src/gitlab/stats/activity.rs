@@ -13,6 +13,8 @@ pub struct Activity {
     pub mean_first_response_hours: Option<f64>,
     pub responded_mrs: usize,
     pub failures: Vec<String>,
+    #[serde(default)]
+    pub rate_limited: bool,
     pub rate_remaining: Option<u64>,
     pub rate_reset: Option<u64>,
 }
@@ -34,6 +36,7 @@ pub(super) async fn load(program: &Path, report: &Report, budget: Duration) -> A
         mean_first_response_hours: None,
         responded_mrs: 0,
         failures: vec![],
+        rate_limited: false,
         rate_remaining: None,
         rate_reset: None,
     };
@@ -60,6 +63,7 @@ pub(super) async fn load(program: &Path, report: &Report, budget: Duration) -> A
                     result.failures.push(error(&failure.stop));
                     result.complete = false;
                     if failure.stop == Stop::RateLimited {
+                        result.rate_limited = true;
                         result.rate_remaining = failure.remaining;
                         result.rate_reset = failure.reset;
                         break;
@@ -85,6 +89,7 @@ pub(super) async fn load(program: &Path, report: &Report, budget: Duration) -> A
             times.push((first - mr.created_at).num_seconds() as f64 / 3600.0);
         }
         if coverage.rate_limited() {
+            result.rate_limited = true;
             result
                 .failures
                 .push("GitLab rate limit reached while reading comments".into());

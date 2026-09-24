@@ -44,6 +44,7 @@ export interface GitLabStatsReport {
     complete: boolean; mrs_checked: number; mrs_total: number; comments: number | null;
     participants: { username: string; comments: number; mrs: number }[];
     mean_first_response_hours: number | null; responded_mrs: number;
+    rate_limited?: boolean;
     failures: string[]; rate_remaining: number | null; rate_reset: number | null;
   } | null;
   review_evidence?: {

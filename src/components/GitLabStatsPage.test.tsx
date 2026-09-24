@@ -141,8 +141,24 @@ describe("GitLab merged and participation coverage", () => {
     };
     render(<GitLabStatsResults report={data} />);
     expect(screen.getAllByText(/At least 1 current approvals/)).toHaveLength(2);
-    expect(screen.getByText(/Unavailable current change requests/)).toBeTruthy();
+    expect(screen.getAllByText(/Unavailable current change requests/)).toHaveLength(2);
+    expect(screen.queryByText(/At least 0 current change requests/)).toBeNull();
     expect(screen.getByText(/First formal review: Unavailable/)).toBeTruthy();
+  });
+  it("keeps per-person approvals unavailable when only change requests were measured", () => {
+    const data = report(true);
+    data.review_evidence = {
+      mrs_total: 1, approvals_checked: 0, changes_checked: 1,
+      approvals_complete: false, changes_complete: true,
+      current_approvals: null, current_change_requests: 1,
+      mean_first_current_approval_hours: null, timed_approved_mrs: 0,
+      reviewers: [{ username: "alice", approvals: 0, change_requests: 1 }],
+      failures: ["GitLab denied access to this statistics scope"], rate_remaining: null, rate_reset: null,
+    };
+    render(<GitLabStatsResults report={data} />);
+    expect(screen.getAllByText(/Unavailable current approvals/)).toHaveLength(2);
+    expect(screen.queryByText(/At least 0 current approvals/)).toBeNull();
+    expect(screen.getByText("alice: Unavailable current approvals; 1 current change requests")).toBeTruthy();
   });
 });
 

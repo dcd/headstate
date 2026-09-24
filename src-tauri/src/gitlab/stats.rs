@@ -355,6 +355,7 @@ async fn pages_limited(
     let mut rows = Vec::new();
     let mut page_number = 1;
     let mut total_conflict = false;
+    let separator = if base.contains('?') { '&' } else { '?' };
     let mut coverage = Coverage {
         complete: false,
         stop: Stop::PageLimit,
@@ -373,7 +374,7 @@ async fn pages_limited(
         let out = match request(
             program,
             host,
-            &format!("{base}&per_page={PAGE_SIZE}&page={page_number}"),
+            &format!("{base}{separator}per_page={PAGE_SIZE}&page={page_number}"),
             remaining,
         )
         .await
@@ -821,7 +822,7 @@ async fn load_window(
     limited |= report
         .activity
         .as_ref()
-        .is_some_and(|a| a.rate_remaining == Some(0));
+        .is_some_and(|a| a.rate_limited || a.rate_remaining == Some(0));
     report.review_evidence = Some(
         review_evidence::load(
             program,
@@ -1016,6 +1017,53 @@ esac
         assert_eq!(out.authors[0].timed_merges, 0);
         assert_eq!(out.reviewer_rows_measured, 0);
         assert_eq!(out.review_activity, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn comment_429_without_headers_stops_formal_review_requests() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("glab");
+        let row = serde_json::to_string(&sample(1)).unwrap();
+        std::fs::write(
+            &program,
+            format!(
+                r##"#!/bin/sh
+printf '%s\n' "$5" >> "$0.calls"
+case "$5" in
+  *state=all*|*state=merged*) printf 'HTTP/2 200\nx-next-page: \n\n[{row}]' ;;
+  */notes\?*) printf 'HTTP/2 429\n\nlimited'; exit 1 ;;
+  *) exit 1 ;;
+esac
+"##
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let report = load_window(
+            &program,
+            source("gitlab.com").unwrap(),
+            "1".into(),
+            Scope::Mine,
+            "2026-09-01T00:00:00Z".parse().unwrap(),
+            "2026-09-03T00:00:00Z".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        let calls = std::fs::read_to_string(program.with_extension("calls")).unwrap();
+        assert_eq!(calls.lines().count(), 3);
+        assert!(!calls.contains("/approvals"));
+        assert!(!calls.contains("/reviewers"));
+        assert_eq!(report.counts.created, 1);
+        assert_eq!(report.merged_window.unwrap().count, 1);
+        let activity = report.activity.unwrap();
+        assert!(activity.rate_limited);
+        assert_eq!(activity.rate_remaining, None);
+        assert_eq!(activity.comments, None);
+        let evidence = report.review_evidence.unwrap();
+        assert_eq!(evidence.current_approvals, None);
+        assert_eq!(evidence.current_change_requests, None);
     }
     #[test]
     fn duplicate_invalid_and_wrong_host_rows_qualify_all_measures() {

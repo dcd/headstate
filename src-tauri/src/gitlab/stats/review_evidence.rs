@@ -5,6 +5,7 @@
 use super::*;
 
 const MAX_MRS: usize = 10;
+const MAX_REVIEWER_PAGES: usize = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewEvidence {
@@ -71,6 +72,35 @@ fn reviewer_states(body: &Value) -> Option<Vec<String>> {
     Some(requested)
 }
 
+async fn evidence_request(
+    program: &Path,
+    host: &str,
+    endpoint: &str,
+    is_approval: bool,
+    budget: Duration,
+) -> Result<(Value, Coverage), RequestFailure> {
+    if !is_approval {
+        return pages_limited(program, host, endpoint, budget, MAX_REVIEWER_PAGES)
+            .await
+            .map(|(rows, coverage)| (Value::Array(rows), coverage));
+    }
+    // Approvals is one object containing all current approvers. Reviewers is
+    // a paginated list and must carry its pagination receipt through parsing.
+    let response = request(program, host, endpoint, budget).await?;
+    Ok((
+        response.body,
+        Coverage {
+            complete: true,
+            stop: Stop::Complete,
+            pages: 1,
+            received: 1,
+            total: Some(1),
+            rate_remaining: response.remaining,
+            rate_reset: response.reset,
+        },
+    ))
+}
+
 pub(super) async fn load(program: &Path, report: &Report, budget: Duration) -> ReviewEvidence {
     let started = tokio::time::Instant::now();
     let mut result = ReviewEvidence {
@@ -102,31 +132,29 @@ pub(super) async fn load(program: &Path, report: &Report, budget: Duration) -> R
                 stopped = true;
                 break;
             }
-            match request(
+            match evidence_request(
                 program,
                 &report.source.host,
                 &format!("{base}/{suffix}"),
+                is_approval,
                 remaining,
             )
             .await
             {
-                Ok(response) => {
-                    result.rate_remaining = response.remaining;
-                    result.rate_reset = response.reset;
+                Ok((body, coverage)) => {
+                    result.rate_remaining = coverage.rate_remaining;
+                    result.rate_reset = coverage.rate_reset;
                     if is_approval {
                         // Empty approved_by is a measured zero, not missing data.
-                        if response
-                            .body
+                        if body
                             .get("approved_by")
                             .and_then(Value::as_array)
                             .is_some_and(Vec::is_empty)
-                            && response.body.get("iid").and_then(Value::as_u64) == Some(mr.iid)
+                            && body.get("iid").and_then(Value::as_u64) == Some(mr.iid)
                         {
                             result.approvals_checked += 1;
                             result.current_approvals.get_or_insert(0);
-                        } else if let Some(ApprovalRows { entries, first }) =
-                            approvals(&response.body, mr)
-                        {
+                        } else if let Some(ApprovalRows { entries, first }) = approvals(&body, mr) {
                             result.approvals_checked += 1;
                             *result.current_approvals.get_or_insert(0) += entries.len();
                             first_approval_hours
@@ -139,8 +167,10 @@ pub(super) async fn load(program: &Path, report: &Report, budget: Duration) -> R
                                 .failures
                                 .push("GitLab returned unreadable approval evidence".into());
                         }
-                    } else if let Some(requested) = reviewer_states(&response.body) {
-                        result.changes_checked += 1;
+                    } else if let Some(requested) = reviewer_states(&body) {
+                        if coverage.complete {
+                            result.changes_checked += 1;
+                        }
                         *result.current_change_requests.get_or_insert(0) += requested.len();
                         for username in requested {
                             people.entry(username).or_default().1 += 1;
@@ -150,7 +180,18 @@ pub(super) async fn load(program: &Path, report: &Report, budget: Duration) -> R
                             .failures
                             .push("GitLab returned unreadable reviewer states".into());
                     }
-                    if response.remaining == Some(0) {
+                    if !coverage.complete && !coverage.rate_limited() {
+                        result.failures.push(match coverage.stop {
+                            Stop::PageLimit => {
+                                "Reviewer page limit reached before all states were read".into()
+                            }
+                            Stop::UnknownPagination => {
+                                "GitLab did not provide complete reviewer pagination".into()
+                            }
+                            _ => error(&coverage.stop),
+                        });
+                    }
+                    if coverage.rate_limited() {
                         result
                             .failures
                             .push("GitLab rate limit reached while reading review outcomes".into());
@@ -255,7 +296,7 @@ mod tests {
 printf '%s\n' "$5" >> "$0.calls"
 case "$5" in
   */1/approvals) printf 'HTTP/2 200\n\n{"iid":1,"approved_by":[{"user":{"username":"alice"},"approved_at":"2026-09-01T12:00:00Z"}]}' ;;
-  */1/reviewers) printf 'HTTP/2 429\nratelimit-remaining: 0\n\nlimited'; exit 1 ;;
+  */1/reviewers\?*) printf 'HTTP/2 429\nratelimit-remaining: 0\n\nlimited'; exit 1 ;;
   *) exit 1 ;;
 esac
 "##,
@@ -270,5 +311,117 @@ esac
         assert_eq!(result.rate_remaining, Some(0));
         let calls = std::fs::read_to_string(program.with_extension("calls")).unwrap();
         assert_eq!(calls.lines().count(), 2);
+    }
+
+    #[cfg(unix)]
+    async fn scripted_reviewers(script: &str, mrs: u64) -> (ReviewEvidence, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let report =
+            super::super::tests::report((1..=mrs).map(super::super::tests::sample).collect());
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("glab");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$5\" >> \"$0.calls\"\n{script}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result = load(&program, &report, Duration::from_secs(2)).await;
+        let calls = std::fs::read_to_string(program.with_extension("calls")).unwrap();
+        (result, calls)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewer_states_follow_pagination_before_claiming_complete() {
+        let (result, calls) = scripted_reviewers(
+            r##"case "$5" in
+  */approvals) printf 'HTTP/2 200\n\n{"iid":1,"approved_by":[]}' ;;
+  */reviewers\?per_page=100\&page=1) printf 'HTTP/2 200\nx-next-page: 2\nx-total: 2\n\n[{"user":{"username":"alice"},"state":"reviewed"}]' ;;
+  */reviewers\?per_page=100\&page=2) printf 'HTTP/2 200\nx-next-page: \nx-total: 2\n\n[{"user":{"username":"bob"},"state":"requested_changes"}]' ;;
+  *) exit 1 ;;
+esac"##,
+            1,
+        )
+        .await;
+        assert_eq!(calls.lines().count(), 3);
+        assert_eq!(result.changes_checked, 1);
+        assert!(result.changes_complete);
+        assert_eq!(result.current_change_requests, Some(1));
+        assert_eq!(result.reviewers[0].username, "bob");
+        assert!(result.failures.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewer_page_limit_retains_lower_bounds() {
+        let (result, calls) = scripted_reviewers(
+            r##"case "$5" in
+  */approvals) printf 'HTTP/2 200\n\n{"iid":1,"approved_by":[]}' ;;
+  *page=1) printf 'HTTP/2 200\nx-next-page: 2\nx-total: 3\n\n[{"user":{"username":"alice"},"state":"requested_changes"}]' ;;
+  *page=2) printf 'HTTP/2 200\nx-next-page: 3\nx-total: 3\n\n[{"user":{"username":"bob"},"state":"requested_changes"}]' ;;
+  *) exit 1 ;;
+esac"##,
+            1,
+        )
+        .await;
+        assert_eq!(calls.lines().count(), 3);
+        assert!(!calls.contains("page=3"));
+        assert_eq!(result.changes_checked, 0);
+        assert!(!result.changes_complete);
+        assert_eq!(result.current_change_requests, Some(2));
+        assert_eq!(result.reviewers.len(), 2);
+        assert_eq!(
+            result.failures,
+            ["Reviewer page limit reached before all states were read"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn later_reviewer_429_preserves_rows_and_stops_later_mrs_without_headers() {
+        let (result, calls) = scripted_reviewers(
+            r##"case "$5" in
+  */1/approvals) printf 'HTTP/2 200\n\n{"iid":1,"approved_by":[]}' ;;
+  */1/reviewers\?*page=1) printf 'HTTP/2 200\nx-next-page: 2\nratelimit-remaining: 99\n\n[{"user":{"username":"alice"},"state":"requested_changes"}]' ;;
+  */1/reviewers\?*page=2) printf 'HTTP/2 429\n\nlimited'; exit 1 ;;
+  *) exit 1 ;;
+esac"##,
+            2,
+        )
+        .await;
+        assert_eq!(calls.lines().count(), 3);
+        assert!(!calls.contains("/2/"));
+        assert_eq!(result.current_change_requests, Some(1));
+        assert_eq!(result.reviewers[0].change_requests, 1);
+        assert_eq!(result.changes_checked, 0);
+        assert!(!result.changes_complete);
+        assert_eq!(result.rate_remaining, None);
+        assert_eq!(
+            result.failures,
+            ["GitLab rate limit reached while reading review outcomes"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_reviewer_pagination_keeps_counts_partial() {
+        let (result, calls) = scripted_reviewers(
+            r##"case "$5" in
+  */approvals) printf 'HTTP/2 200\n\n{"iid":1,"approved_by":[]}' ;;
+  */reviewers\?*) printf 'HTTP/2 200\n\n[{"user":{"username":"alice"},"state":"requested_changes"}]' ;;
+  *) exit 1 ;;
+esac"##,
+            1,
+        )
+        .await;
+        assert_eq!(calls.lines().count(), 2);
+        assert_eq!(result.current_change_requests, Some(1));
+        assert_eq!(result.changes_checked, 0);
+        assert!(!result.changes_complete);
+        assert_eq!(
+            result.failures,
+            ["GitLab did not provide complete reviewer pagination"]
+        );
     }
 }
