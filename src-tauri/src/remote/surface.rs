@@ -590,6 +590,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("update_all_state", Class::Read),
     // write: changes GitHub state through the existing write module, or
     // a desktop setting.
+    ("gitlab_action_capabilities", Class::Read),
+    ("gitlab_action", Class::Write),
     ("act_on_pr", Class::Write),
     ("act_on_prs", Class::Write),
     ("review_pr", Class::Write),
@@ -1267,6 +1269,10 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("body")?,
         )
         .await),
+        "gitlab_action_capabilities" => {
+            res(commands::gitlab_action_capabilities(a.get("identity")?).await)
+        }
+        "gitlab_action" => res(commands::gitlab_action(a.get("request")?).await),
         "resolve_thread" => res(commands::resolve_thread(
             app.state(),
             a.get("threadId")?,

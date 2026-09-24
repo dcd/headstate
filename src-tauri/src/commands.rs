@@ -9033,3 +9033,18 @@ pub async fn gitlab_stats_load(
 ) -> Result<crate::gitlab::stats::Report, String> {
     crate::gitlab::stats::load(&host, scope, days, db_path(&app), refresh).await
 }
+
+/// Full identity is mandatory: these writes never fall through to GitHub.
+#[tauri::command]
+pub async fn gitlab_action_capabilities(
+    identity: crate::identity::PrIdentity,
+) -> Result<crate::gitlab::actions::Capabilities, String> {
+    crate::gitlab::actions::capabilities(&identity).await
+}
+
+#[tauri::command]
+pub async fn gitlab_action(
+    request: crate::gitlab::actions::ActionRequest,
+) -> Result<crate::gitlab::actions::Receipt, String> {
+    crate::gitlab::actions::execute(&request).await
+}
