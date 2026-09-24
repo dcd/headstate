@@ -132,6 +132,8 @@ export type SourceRefreshReply = SourceRefreshResult | {
 };
 export const getSourceSnapshot = (source: Source, list: SourceList) =>
   call<SourceSnapshot>("get_source_snapshot", { source, list });
+export const getSourcePollStatus = (source: Source, list: SourceList) =>
+  call<import("./sourceRefresh").SourceStatus>("get_source_poll_status", { source, list });
 export const refreshSelectedSource = (source: Source, list: SourceList, requestId?: string) =>
   call<SourceRefreshReply>("refresh_source", { source, list, requestId });
 export const setSourceSelection = (selection: "github" | "gitlab" | "both") =>

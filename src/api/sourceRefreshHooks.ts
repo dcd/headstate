@@ -2,7 +2,7 @@ import { useEffect, useSyncExternalStore } from "react";
 import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { PullRequest } from "../types/pr";
 import { SourceRefreshState, type SourceStatus } from "./sourceRefresh";
-import { getCached, refreshSource } from "./tauri";
+import { getCached, getSourcePollStatus, refreshSource } from "./tauri";
 import { listen, type UnlistenFn } from "./transport";
 import { safeUnlisten } from "./unlisten";
 import { IS_MOBILE_BUILD } from "../lib/target";
@@ -40,6 +40,10 @@ function observe(qc: QueryClient, list: List, value: Entry) {
   register(listen<SourceStatus>("source-poll-status", ({ payload }) => {
     if (payload.source.provider === "github" && payload.source.host === "github.com" && payload.list === list) state.accept(payload);
   }));
+  // Events can predate this view mounting. Read the current source status
+  // after subscribing; a newer event or in-flight request wins if it races.
+  void getSourcePollStatus({ provider: "github", host: "github.com" }, list)
+    .then((status) => { if (!cancelled) state.hydrate(status); }, () => {});
   register(listen<PullRequest[]>(list === "authored" ? "prs-updated" : "reviewing-updated", ({ payload }) => state.legacyRows(payload)));
   if (list === "authored") register(listen<string>("poll-error", ({ payload }) => state.legacyError(payload)));
   value.stop = () => {

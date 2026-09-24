@@ -11,6 +11,9 @@ vi.mock("./tauri", async (original) => ({
   ...await original<Record<string, unknown>>(),
   getCached: vi.fn(async () => PR_FIXTURES),
   getCachedReviewing: vi.fn(async () => ({ prs: PR_FIXTURES, stale_secs: null })),
+  getSourcePollStatus: vi.fn(async (_source: unknown, list: "authored" | "reviewing") => ({
+    source: { provider: "github", host: "github.com" }, list, phase: "not_requested", error: null,
+  })),
   refreshSource: vi.fn(async () => PR_FIXTURES.slice(1)),
 }));
 import { refreshSource } from "./tauri";
