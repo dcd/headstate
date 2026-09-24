@@ -47,7 +47,12 @@ export function useGitLabQueue(list: SourceList, enabled: boolean) {
       // phone must not turn a cache read failure into a measured empty list.
     }).finally(() => { if (active) void refresh(); });
 
-    const timer = window.setInterval(() => { if (active) void refresh(); }, 60_000);
+    const timer = window.setInterval(() => {
+      if (!active) return;
+      model.tick();
+      publish();
+      void refresh();
+    }, 60_000);
     return () => {
       active = false;
       window.clearInterval(timer);

@@ -62,5 +62,34 @@ describe("GitLab queue reconciliation", () => {
   it("keeps unknown receipt age unknown", () => {
     expect(receiptAge(null)).toBe("unknown");
     expect(receiptAge("unreadable")).toBe("unknown");
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-24T12:00:00Z"));
+    try {
+      expect(receiptAge("2026-09-24 10:00:00")).toBe(7200);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ages the accepted receipt when a later failure repeats its revision and as time passes", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-24T10:00:00Z"));
+    try {
+      const state = new GitLabQueueState();
+      state.accept(update({ revision: 1, receipt_revision: 1, last_received_at: "2026-09-24T10:00:00Z" }));
+      expect(state.snapshot().staleSecs).toBeNull();
+      vi.setSystemTime(new Date("2026-09-24T11:00:01Z"));
+      state.accept(update({ phase: "failed", error: "offline", revision: 2, receipt_revision: 1,
+        last_received_at: "2026-09-24T11:00:01Z", mrs: [mr("saved")] }));
+      expect(state.snapshot().staleSecs).toBe(3601);
+      expect(state.snapshot().error).toBe("offline");
+      vi.setSystemTime(new Date("2026-09-24T11:01:01Z"));
+      state.tick();
+      expect(state.snapshot().staleSecs).toBe(3661);
+      expect(state.snapshot().rows?.[0].title).toBe("first");
+      expect(state.snapshot().error).toBe("offline");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -25,6 +25,7 @@ export class GitLabQueueState {
   private retired = new Set<string>();
   private revision = -1;
   private receiptRevision = -1;
+  private receivedAt: string | null | undefined;
   private providerError: string | null = null;
   private transportError: { id: string; message: string } | null = null;
   private order = 0;
@@ -41,11 +42,19 @@ export class GitLabQueueState {
     };
   }
 
+  tick() {
+    if (this.receivedAt !== undefined) {
+      const staleSecs = receiptAge(this.receivedAt);
+      if (staleSecs !== this.value.staleSecs) this.publish({ staleSecs });
+    }
+  }
+
   seed(data: SourceSnapshot["data"]) {
     // Cache is a fallback only. It cannot overwrite a live event that arrived
     // during the disk read, including a measured empty live list.
     if (this.value.rows !== undefined) return;
     if (data.state === "git_lab_available") {
+      this.receivedAt = data.fetched_at;
       this.publish({ rows: data.mrs, coverage: data.coverage, staleSecs: data.stale_secs, loading: false });
     } else if (data.state === "unreadable") {
       this.providerError = "The saved GitLab list could not be read.";
@@ -80,12 +89,14 @@ export class GitLabQueueState {
     }
     if (update.mrs !== null && update.receipt_revision !== null && update.receipt_revision > this.receiptRevision) {
       this.receiptRevision = update.receipt_revision;
-      const age = receiptAge(update.last_received_at);
-      this.publish({ rows: update.mrs, coverage: update.coverage, staleSecs: age, loading: false });
+      this.receivedAt = update.last_received_at;
+      this.publish({ rows: update.mrs, coverage: update.coverage, staleSecs: receiptAge(this.receivedAt), loading: false });
     } else {
       // A failed/fetching event often repeats the last saved `mrs`. Its
-      // presence is not evidence that those rows were fetched again.
-      this.publish(update.phase === "fetching" ? {} : { loading: false });
+      // presence is not evidence that those rows were fetched again. Recheck
+      // the age of the accepted receipt without adopting this event's time.
+      const staleSecs = this.receivedAt === undefined ? this.value.staleSecs : receiptAge(this.receivedAt);
+      this.publish(update.phase === "fetching" ? { staleSecs } : { loading: false, staleSecs });
     }
   }
 
@@ -120,7 +131,11 @@ export class GitLabQueueState {
 /// the event arrived now.
 export function receiptAge(receivedAt: string | null): number | null | "unknown" {
   if (receivedAt === null) return "unknown";
-  const milliseconds = Date.parse(receivedAt);
+  // SQLite cache timestamps are UTC without a zone marker; live poll
+  // timestamps are RFC 3339. Treat both as UTC across desktop timezones.
+  const normalized = /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/.test(receivedAt)
+    ? `${receivedAt.replace(" ", "T")}Z` : receivedAt;
+  const milliseconds = Date.parse(normalized);
   if (!Number.isFinite(milliseconds)) return "unknown";
   const seconds = Math.max(0, Math.floor((Date.now() - milliseconds) / 1000));
   return seconds > 3600 ? seconds : null;
