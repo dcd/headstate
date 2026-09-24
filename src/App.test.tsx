@@ -197,6 +197,7 @@ await Promise.all([
 
 function renderApp() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  qc.setQueryData(["gitlab-host"], "gitlab.com");
   return render(
     <QueryClientProvider client={qc}>
       <App />
@@ -218,6 +219,7 @@ describe("assembled auth and PR status", () => {
     mockDataUpdatedAt.mockReturnValue(Date.now());
     mockIPC((cmd) => {
       if (cmd === "get_auth_state") return { ok: false, message: "gh was not found" };
+      if (cmd === "get_gitlab_host") return "gitlab.com";
       if (cmd === "get_gitlab_auth_state") return {
         host: "gitlab.com", ok: true, issue: null, message: "",
       };

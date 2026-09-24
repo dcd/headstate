@@ -7,7 +7,7 @@ import { IS_MOBILE_BUILD } from "../lib/target";
 
 export function useGitLabQueue(list: SourceList, enabled: boolean, host = "gitlab.com") {
   const source = useMemo(() => ({ provider: "gitlab" as const, host }), [host]);
-  const model = useMemo(() => new GitLabQueueState(), [source, list]);
+  const model = useMemo(() => new GitLabQueueState(host, list), [host, list]);
   const [state, setState] = useState(() => ({ source, list, snapshot: model.snapshot() }));
   const publish = useCallback(() => setState({ source, list, snapshot: model.snapshot() }), [model, source, list]);
 

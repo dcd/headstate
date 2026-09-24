@@ -1,5 +1,5 @@
 import type { MergeRequest } from "../types/gitlab";
-import type { SourceCoverage, SourcePollUpdate, SourceRefreshReply, SourceSnapshot } from "./tauri";
+import type { SourceCoverage, SourceList, SourcePollUpdate, SourceRefreshReply, SourceSnapshot } from "./tauri";
 
 export type GitLabQueueSnapshot = {
   rows: MergeRequest[] | undefined;
@@ -17,6 +17,7 @@ type Request = { id: string; order: number; session: string | undefined; complet
 /// revisions can change the provider error. A late reply therefore cannot
 /// erase a failure (or a later receipt) already observed through events.
 export class GitLabQueueState {
+  constructor(private readonly expectedHost?: string, private readonly expectedList?: SourceList) {}
   private value: GitLabQueueSnapshot = {
     rows: undefined, coverage: null, staleSecs: null,
     loading: true, refreshing: false, error: null,
@@ -70,6 +71,7 @@ export class GitLabQueueState {
   }
 
   accept(update: SourcePollUpdate) {
+    if (this.expectedHost !== undefined && (update.source.provider !== "gitlab" || update.source.host !== this.expectedHost || update.list !== this.expectedList)) return;
     if (this.retired.has(update.session)) return;
     if (this.session !== update.session) {
       if (this.session !== undefined) this.retired.add(this.session);

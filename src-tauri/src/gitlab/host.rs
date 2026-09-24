@@ -125,7 +125,7 @@ mod tests {
             "https://gitlab.com",
             "gitlab.com:443",
             "gitlab.com/path",
-            "user@gitlab.com",
+            "user@gitlab",
             "gitlab..com",
             "-gitlab.com",
             "gitlab-.com",
