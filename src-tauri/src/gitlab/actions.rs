@@ -1000,10 +1000,12 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
         (dir, program)
     }
 
+    #[cfg(unix)]
     fn read(path: String, response: Value) -> Value {
         json!({"method":"GET","path":path,"response":response})
     }
 
+    #[cfg(unix)]
     fn context_steps(r: &Value, p: &Value) -> Vec<Value> {
         vec![
             read(format!("{BASE}?include_rebase_in_progress=true"), r.clone()),
@@ -1020,6 +1022,7 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
         json!({"id":id,"name":name,"stage":"test","status":status,"pipeline":pipeline()})
     }
 
+    #[cfg(unix)]
     fn retry_steps(before: Value, after: &[Value]) -> Vec<Value> {
         let mut steps = context_steps(&raw(), &permissions());
         steps.push(read(
