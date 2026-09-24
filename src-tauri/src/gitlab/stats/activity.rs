@@ -8,7 +8,7 @@ pub struct Activity {
     pub complete: bool,
     pub mrs_checked: usize,
     pub mrs_total: usize,
-    pub comments: usize,
+    pub comments: Option<usize>,
     pub participants: Vec<Participant>,
     pub mean_first_response_hours: Option<f64>,
     pub responded_mrs: usize,
@@ -29,7 +29,7 @@ pub(super) async fn load(program: &Path, report: &Report, budget: Duration) -> A
         complete: report.coverage.complete,
         mrs_checked: 0,
         mrs_total: report.history.len(),
-        comments: 0,
+        comments: None,
         participants: vec![],
         mean_first_response_hours: None,
         responded_mrs: 0,
@@ -56,15 +56,26 @@ pub(super) async fn load(program: &Path, report: &Report, budget: Duration) -> A
         let (notes, coverage) =
             match pages_limited(program, &report.source.host, &endpoint, remaining, 1).await {
                 Ok(value) => value,
-                Err(error) => {
-                    result.failures.push(error);
+                Err(failure) => {
+                    result.failures.push(error(&failure.stop));
                     result.complete = false;
+                    if failure.stop == Stop::RateLimited {
+                        result.rate_remaining = failure.remaining;
+                        result.rate_reset = failure.reset;
+                        break;
+                    }
                     continue;
                 }
             };
         result.rate_remaining = coverage.rate_remaining;
         result.rate_reset = coverage.rate_reset;
-        let (valid, first) = absorb(&notes, mr, report.end, &mut people, &mut result.comments);
+        let (valid, first) = absorb(
+            &notes,
+            mr,
+            report.end,
+            &mut people,
+            result.comments.get_or_insert(0),
+        );
         if valid && coverage.complete {
             result.mrs_checked += 1;
         } else {
@@ -81,6 +92,9 @@ pub(super) async fn load(program: &Path, report: &Report, budget: Duration) -> A
         }
     }
     result.complete &= result.mrs_checked == result.mrs_total;
+    if result.complete && result.mrs_total == 0 {
+        result.comments = Some(0);
+    }
     result.responded_mrs = times.len();
     result.mean_first_response_hours = (result.complete && !times.is_empty())
         .then(|| times.iter().sum::<f64>() / times.len() as f64);
@@ -168,5 +182,26 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(people["reviewer"], (1, 1));
         assert!(first.is_some());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exhausted_budget_is_unknown_and_first_429_stops_more_comments() {
+        use std::os::unix::fs::PermissionsExt;
+        let report = super::super::tests::report(vec![
+            super::super::tests::sample(1),
+            super::super::tests::sample(2),
+        ]);
+        let missing = load(Path::new("no-program"), &report, Duration::ZERO).await;
+        assert_eq!(missing.comments, None);
+        assert!(!missing.complete);
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("glab");
+        std::fs::write(&program, "#!/bin/sh\nprintf 'HTTP/2 429\\nratelimit-remaining: 0\\nratelimit-reset: 123\\n\\nlimited'\nexit 1\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let limited = load(&program, &report, Duration::from_secs(1)).await;
+        assert_eq!(limited.comments, None);
+        assert_eq!(limited.failures.len(), 1);
+        assert_eq!(limited.rate_remaining, Some(0));
+        assert_eq!(limited.rate_reset, Some(123));
     }
 }

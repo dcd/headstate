@@ -1,7 +1,7 @@
 //! Short-lived GitLab receipts. Their JSON key includes provider, host, stable
 //! viewer id, scope and window. History is evidence from this fetch, not an
 //! invented accumulated total. Existing GitHub history/cache remains untouched.
-use crate::gitlab::stats::Report;
+use crate::gitlab::stats::{HistoryReceipt, Report};
 use rusqlite::{params, OptionalExtension};
 use std::path::Path;
 
@@ -25,7 +25,11 @@ pub fn put(path: &Path, key: &str, report: &Report) -> Result<(), String> {
     Ok(())
 }
 
-pub fn history_get(path: &Path, partition: &str, day: &str) -> Result<Option<Report>, String> {
+pub fn history_get(
+    path: &Path,
+    partition: &str,
+    day: &str,
+) -> Result<Option<HistoryReceipt>, String> {
     let conn = super::open_db(path).map_err(|e| e.to_string())?;
     let raw: Option<String> = conn
         .query_row(
@@ -38,8 +42,13 @@ pub fn history_get(path: &Path, partition: &str, day: &str) -> Result<Option<Rep
     Ok(raw.and_then(|v| serde_json::from_str(&v).ok()))
 }
 
-pub fn history_put(path: &Path, partition: &str, report: &Report) -> Result<(), String> {
+pub fn history_put(
+    path: &Path,
+    partition: &str,
+    day: &str,
+    receipt: &HistoryReceipt,
+) -> Result<(), String> {
     let conn = super::open_db(path).map_err(|e| e.to_string())?;
-    conn.execute("INSERT INTO gitlab_stats_history (partition, day, payload) VALUES (?1, ?2, ?3) ON CONFLICT(partition, day) DO UPDATE SET payload = excluded.payload", params![partition, report.start.date_naive().to_string(), serde_json::to_string(report).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
+    conn.execute("INSERT INTO gitlab_stats_history (partition, day, payload) VALUES (?1, ?2, ?3) ON CONFLICT(partition, day) DO UPDATE SET payload = excluded.payload", params![partition, day, serde_json::to_string(receipt).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
     Ok(())
 }

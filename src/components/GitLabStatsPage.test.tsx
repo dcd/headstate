@@ -111,3 +111,41 @@ describe("GitLab statistics account refresh", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 });
+
+describe("GitLab merged and participation coverage", () => {
+  it("keeps merged window counts separate and suppresses partial means", () => {
+    const data = report(true);
+    data.merged_window = { fetched_at: data.fetched_at, coverage: { ...data.coverage, complete: false, stop: "page_limit" }, count: 7, series: [{ day: "2026-09-01", merged: 7 }], authors: [{ username: "other-author", merged: 7, mean_merge_hours: 99 }], history: [] };
+    render(<GitLabStatsResults report={data} />);
+    expect(screen.getByText("At least 7 merged MRs")).toBeTruthy();
+    expect(screen.queryByText(/99.0 hours/)).toBeNull();
+    expect(screen.getByText("24.0 hours (1 MRs)")).toBeTruthy();
+  });
+  it("withholds absent comments and incomplete response latency", () => {
+    const data = report(true);
+    data.activity = { complete: false, mrs_checked: 0, mrs_total: 1, comments: null, participants: [], mean_first_response_hours: 3, responded_mrs: 1, failures: ["GitLab rate limit reached; try again later"], rate_remaining: 0, rate_reset: null };
+    render(<GitLabStatsResults report={data} />);
+    expect(screen.getByText(/Unavailable comments/)).toBeTruthy();
+    expect(screen.queryByText(/3.0 hours/)).toBeNull();
+    expect(screen.getByText(/Comment read requests remaining: 0/)).toBeTruthy();
+  });
+});
+
+describe("GitLab explicit history", () => {
+  beforeEach(() => vi.mocked(call).mockReset());
+  it("spends only after clicking and resets the receipt when scope changes", async () => {
+    vi.mocked(call).mockImplementation(async name => name === "gitlab_stats_tree" ? tree("1", ["group/project"]) : name === "gitlab_stats_backfill" ? { source: { provider: "gitlab", host: "gitlab.com" }, viewer: "1", scope: { kind: "mine" }, requested_days: 30, attempted_days: 1, complete_days: 1, slices: [], error: null } : accountReport("1"));
+    mountPage(); await screen.findByText("author-1");
+    expect(vi.mocked(call).mock.calls.filter(([name]) => name === "gitlab_stats_backfill")).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: "Load next history day" }));
+    await screen.findByText(/1 of 30 closed days/);
+    fireEvent.change(screen.getByLabelText("GitLab statistics scope"), { target: { value: JSON.stringify({ kind: "project", path: "group/project" }) } });
+    await waitFor(() => expect(screen.queryByText(/1 of 30 closed days/)).toBeNull());
+  });
+  it("rejects account changes in the history reply", async () => {
+    vi.mocked(call).mockImplementation(async name => name === "gitlab_stats_tree" ? tree("1", []) : name === "gitlab_stats_backfill" ? { source: { provider: "gitlab", host: "gitlab.com" }, viewer: "2" } : accountReport("1"));
+    mountPage(); await screen.findByText("author-1");
+    fireEvent.click(screen.getByRole("button", { name: "Load next history day" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("account changed");
+  });
+});

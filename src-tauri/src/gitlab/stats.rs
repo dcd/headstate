@@ -63,6 +63,9 @@ pub struct Tree {
     pub source: Source,
     pub viewer: String,
     pub projects: Vec<Project>,
+    pub groups: Vec<String>,
+    pub group_coverage: Option<Coverage>,
+    pub group_error: Option<String>,
     pub coverage: Coverage,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +133,7 @@ pub struct Report {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MergedWindow {
+    pub fetched_at: DateTime<Utc>,
     pub coverage: Coverage,
     pub count: usize,
     pub series: Vec<MergedDay>,
@@ -324,7 +328,7 @@ async fn pages(
     host: &str,
     base: &str,
     budget: Duration,
-) -> Result<(Vec<Value>, Coverage), String> {
+) -> Result<(Vec<Value>, Coverage), RequestFailure> {
     pages_limited(program, host, base, budget, MAX_PAGES).await
 }
 async fn pages_limited(
@@ -333,7 +337,7 @@ async fn pages_limited(
     base: &str,
     budget: Duration,
     max_pages: usize,
-) -> Result<(Vec<Value>, Coverage), String> {
+) -> Result<(Vec<Value>, Coverage), RequestFailure> {
     let started = tokio::time::Instant::now();
     let mut rows = Vec::new();
     let mut page_number = 1;
@@ -362,7 +366,7 @@ async fn pages_limited(
         .await
         {
             Ok(out) => out,
-            Err(failure) if coverage.pages == 0 => return Err(error(&failure.stop)),
+            Err(failure) if coverage.pages == 0 => return Err(failure),
             Err(failure) => {
                 if failure.stop == Stop::RateLimited {
                     // Missing headers on a 429 invalidate prior positive rate
@@ -376,7 +380,7 @@ async fn pages_limited(
         };
         let Some(page_rows) = out.body.as_array() else {
             if coverage.pages == 0 {
-                return Err(error(&Stop::InvalidData));
+                return Err(Stop::InvalidData.into());
             }
             coverage.stop = Stop::InvalidData;
             break;
@@ -431,13 +435,15 @@ pub async fn tree(host: &str) -> Result<Tree, String> {
     let program =
         super::auth::find_glab().ok_or("GitLab CLI (glab) was not found on the desktop")?;
     let viewer = viewer(&program, host).await?;
+    let started = tokio::time::Instant::now();
     let (rows, mut coverage) = pages(
         &program,
         host,
         "projects?membership=true&simple=true&order_by=id&sort=asc",
         BUDGET,
     )
-    .await?;
+    .await
+    .map_err(|failure| error(&failure.stop))?;
     let mut projects = BTreeMap::new();
     for row in rows {
         if let Some(path) = row
@@ -471,10 +477,50 @@ pub async fn tree(host: &str) -> Result<Tree, String> {
         coverage.stop = Stop::InvalidData;
     }
     coverage.received = projects.len();
+    let mut groups = Vec::new();
+    let mut group_coverage = None;
+    let mut group_error = None;
+    if coverage.rate_remaining == Some(0) || started.elapsed() >= BUDGET {
+        group_error = Some("Request budget exhausted before requesting groups".into());
+    } else {
+        match pages(
+            &program,
+            host,
+            "groups?all_available=true&order_by=id&sort=asc",
+            BUDGET.saturating_sub(started.elapsed()),
+        )
+        .await
+        {
+            Ok((rows, mut measured)) => {
+                let mut seen = HashSet::new();
+                for row in rows {
+                    if let Some(path) = row
+                        .get("full_path")
+                        .and_then(Value::as_str)
+                        .filter(|p| path_ok(p))
+                    {
+                        if seen.insert(path.to_owned()) {
+                            groups.push(path.to_owned());
+                            continue;
+                        }
+                    }
+                    measured.complete = false;
+                    measured.stop = Stop::InvalidData;
+                }
+                measured.received = groups.len();
+                groups.sort();
+                group_coverage = Some(measured);
+            }
+            Err(failure) => group_error = Some(error(&failure.stop)),
+        }
+    }
     Ok(Tree {
         source,
         viewer,
         projects: projects.into_values().collect(),
+        groups,
+        group_coverage,
+        group_error,
         coverage,
     })
 }
@@ -686,7 +732,7 @@ pub async fn load(
 async fn load_window(
     program: &Path,
     source: Source,
-    viewer: String,
+    account: String,
     scope: Scope,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
@@ -704,8 +750,10 @@ async fn load_window(
         "{base}&state=all&order_by=created_at&sort=desc&{}",
         dates("created")
     );
-    let (raw, coverage) = pages(program, &source.host, &created_url, BUDGET).await?;
-    let mut report = summarize(source.clone(), viewer, scope, start, end, raw, coverage);
+    let (raw, coverage) = pages(program, &source.host, &created_url, BUDGET)
+        .await
+        .map_err(|failure| error(&failure.stop))?;
+    let mut report = summarize(source.clone(), account, scope, start, end, raw, coverage);
     let merged_url = format!(
         "{base}&state=merged&order_by=merged_at&sort=desc&{}",
         dates("merged")
@@ -727,12 +775,19 @@ async fn load_window(
             Ok((raw, coverage)) => {
                 report.merged_window = Some(summarize_merged(&report, raw, coverage))
             }
-            Err(error) => report.merged_error = Some(error),
+            Err(failure) => {
+                if failure.stop == Stop::RateLimited {
+                    report.coverage.rate_remaining = failure.remaining;
+                    report.coverage.rate_reset = failure.reset;
+                }
+                report.merged_error = Some(error(&failure.stop));
+            }
         }
     } else {
         report.merged_error = Some("Load budget exhausted before requesting merged MRs".into());
     }
-    let limited = report.coverage.rate_remaining == Some(0)
+    let limited = report.merged_error.as_deref() == Some(error(&Stop::RateLimited).as_str())
+        || report.coverage.rate_remaining == Some(0)
         || report
             .merged_window
             .as_ref()
@@ -795,6 +850,7 @@ fn summarize_merged(report: &Report, raw: Vec<Value>, mut coverage: Coverage) ->
     }
     let complete = coverage.complete;
     MergedWindow {
+        fetched_at: Utc::now(),
         coverage,
         count: history.len(),
         history,
@@ -813,7 +869,7 @@ fn summarize_merged(report: &Report, raw: Vec<Value>, mut coverage: Coverage) ->
     }
 }
 
-pub use history::{backfill, Backfill};
+pub use history::{backfill, Backfill, HistoryReceipt};
 
 #[cfg(test)]
 mod tests {
@@ -822,7 +878,7 @@ mod tests {
     pub(super) fn sample(iid: u64) -> Value {
         json!({"iid": iid, "web_url": format!("https://gitlab.com/g/sub/p/-/merge_requests/{iid}"), "title":"change", "author":{"username":"author"}, "state":"merged", "created_at":"2026-09-01T10:00:00Z", "merged_at":"2026-09-02T10:00:00Z", "reviewers":[{"username":"reviewer"}]})
     }
-    fn coverage() -> Coverage {
+    pub(super) fn coverage() -> Coverage {
         Coverage {
             complete: true,
             stop: Stop::Complete,
@@ -833,7 +889,7 @@ mod tests {
             rate_reset: None,
         }
     }
-    fn report(rows: Vec<Value>) -> Report {
+    pub(super) fn report(rows: Vec<Value>) -> Report {
         summarize(
             source("gitlab.com").unwrap(),
             "1".into(),
@@ -844,6 +900,33 @@ mod tests {
             coverage(),
         )
     }
+    #[test]
+    fn merged_window_includes_old_creation_and_rejects_out_of_window_evidence() {
+        let context = report(vec![]);
+        let mut older = sample(1);
+        older["created_at"] = json!("2026-08-01T10:00:00Z");
+        let merged = summarize_merged(&context, vec![older.clone()], coverage());
+        assert_eq!(merged.count, 1);
+        assert_eq!(merged.series[1].merged, 1);
+        assert_eq!(merged.authors[0].mean_merge_hours, Some(32.0 * 24.0));
+        let mut outside = sample(2);
+        outside["merged_at"] = json!("2026-09-05T10:00:00Z");
+        let partial = summarize_merged(&context, vec![older, outside], coverage());
+        assert_eq!(partial.count, 1);
+        assert!(!partial.coverage.complete);
+        assert_eq!(partial.authors[0].mean_merge_hours, None);
+    }
+
+    #[test]
+    fn people_and_nested_scopes_validate_without_query_injection() {
+        assert_eq!(
+            endpoint(&Scope::Person("some.user".into())).unwrap(),
+            "merge_requests?scope=all&author_username=some.user"
+        );
+        assert!(endpoint(&Scope::Person("a&scope=all".into())).is_err());
+        assert!(endpoint(&Scope::Person("group/user".into())).is_err());
+    }
+
     #[test]
     fn missing_timing_and_reviewers_do_not_become_zero() {
         let mut row = sample(1);
@@ -905,7 +988,10 @@ mod tests {
         assert!(!parse(b"HTTP/2 200\n\n[]", true).unwrap().terminal);
     }
     #[cfg(unix)]
-    async fn scripted(script: &str, budget: Duration) -> Result<(Vec<Value>, Coverage), String> {
+    async fn scripted(
+        script: &str,
+        budget: Duration,
+    ) -> Result<(Vec<Value>, Coverage), RequestFailure> {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let program = dir.path().join("glab");
