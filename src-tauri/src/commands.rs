@@ -8958,3 +8958,18 @@ fn finish(app: &AppHandle, done: UpdateRunDone) {
     }
     log::info!("update run opened {url}");
 }
+
+/// Full identity is mandatory: these writes never fall through to GitHub.
+#[tauri::command]
+pub async fn gitlab_action_capabilities(
+    identity: crate::identity::PrIdentity,
+) -> Result<crate::gitlab::actions::Capabilities, String> {
+    crate::gitlab::actions::capabilities(&identity).await
+}
+
+#[tauri::command]
+pub async fn gitlab_action(
+    request: crate::gitlab::actions::ActionRequest,
+) -> Result<crate::gitlab::actions::Receipt, String> {
+    crate::gitlab::actions::execute(&request).await
+}

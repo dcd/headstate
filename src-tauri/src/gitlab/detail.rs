@@ -8,7 +8,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashSet, path::Path, process::Stdio, time::Duration};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DETAIL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -171,7 +171,7 @@ pub async fn fetch(identity: &PrIdentity) -> Result<MergeRequestDetail, DetailIs
     fetch_with_program(&program, identity, DETAIL_TIMEOUT).await
 }
 
-fn validate_identity(identity: &PrIdentity) -> Result<(), DetailIssue> {
+pub(super) fn validate_identity(identity: &PrIdentity) -> Result<(), DetailIssue> {
     if identity.source.provider != Provider::Gitlab || identity.source.host != super::auth::HOST {
         return Err(DetailIssue::UnsupportedHost);
     }
@@ -431,8 +431,8 @@ where
     }
 }
 
-struct Response {
-    body: Value,
+pub(super) struct Response {
+    pub(super) body: Value,
     total: Option<u64>,
     next: Option<usize>,
     terminal_known: bool,
@@ -444,16 +444,49 @@ async fn request(
     endpoint: &str,
     timeout: Duration,
 ) -> Result<Response, DetailIssue> {
+    request_json(program, host, endpoint, "GET", None, timeout).await
+}
+
+/// Shared bounded transport. Request bodies go through stdin, never process
+/// arguments, and glab retains ownership of credentials and OAuth refresh.
+pub(super) async fn request_json(
+    program: &Path,
+    host: &str,
+    endpoint: &str,
+    method: &str,
+    body: Option<Value>,
+    timeout: Duration,
+) -> Result<Response, DetailIssue> {
     let mut command = tokio::process::Command::new(program);
+    command.args(["api", "--hostname", host, "-i", endpoint]);
+    if method != "GET" {
+        command.args(["--method", method]);
+    }
+    if body.is_some() {
+        command.args(["--input", "-", "--header", "Content-Type: application/json"]);
+    }
     command
-        .args(["api", "--hostname", host, "-i", endpoint])
-        .stdin(Stdio::null())
+        .stdin(if body.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
     let mut child = command.spawn().map_err(|_| DetailIssue::Request)?;
     let stdout = child.stdout.take().ok_or(DetailIssue::Request)?;
     let operation = async {
+        if let Some(body) = body {
+            let bytes = serde_json::to_vec(&body).map_err(|_| DetailIssue::InvalidResponse)?;
+            let mut stdin = child.stdin.take().ok_or(DetailIssue::Request)?;
+            stdin
+                .write_all(&bytes)
+                .await
+                .map_err(|_| DetailIssue::Request)?;
+            stdin.shutdown().await.map_err(|_| DetailIssue::Request)?;
+            drop(stdin);
+        }
         let mut raw = Vec::new();
         stdout
             .take(MAX_RESPONSE_BYTES + 1)
@@ -515,14 +548,18 @@ fn parse_response(raw: &[u8], successful: bool) -> Result<Response, DetailIssue>
         }
     }
     Ok(Response {
-        body: serde_json::from_str(body.trim()).map_err(|_| DetailIssue::InvalidResponse)?,
+        body: if body.trim().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(body.trim()).map_err(|_| DetailIssue::InvalidResponse)?
+        },
         total,
         next,
         terminal_known,
     })
 }
 
-fn encode_project(repo: &str) -> String {
+pub(super) fn encode_project(repo: &str) -> String {
     let mut out = String::new();
     for byte in repo.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
@@ -534,7 +571,7 @@ fn encode_project(repo: &str) -> String {
     out
 }
 
-fn map_core(v: &Value, identity: &PrIdentity) -> Option<MrCore> {
+pub(super) fn map_core(v: &Value, identity: &PrIdentity) -> Option<MrCore> {
     let number = v.get("iid")?.as_u64()?;
     if number != identity.number {
         return None;
