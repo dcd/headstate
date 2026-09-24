@@ -129,6 +129,21 @@ describe("GitLab merged and participation coverage", () => {
     expect(screen.queryByText(/3.0 hours/)).toBeNull();
     expect(screen.getByText(/Comment read requests remaining: 0/)).toBeTruthy();
   });
+  it("qualifies partial formal outcomes and never labels approval as first review", () => {
+    const data = report(true);
+    data.review_evidence = {
+      mrs_total: 2, approvals_checked: 1, changes_checked: 0,
+      approvals_complete: false, changes_complete: false,
+      current_approvals: 1, current_change_requests: null,
+      mean_first_current_approval_hours: null, timed_approved_mrs: 1,
+      reviewers: [{ username: "alice", approvals: 1, change_requests: 0 }],
+      failures: ["GitLab rate limit reached; try again later"], rate_remaining: 0, rate_reset: null,
+    };
+    render(<GitLabStatsResults report={data} />);
+    expect(screen.getByText(/At least 1 current approvals/)).toBeTruthy();
+    expect(screen.getByText(/Unavailable current change requests/)).toBeTruthy();
+    expect(screen.getByText(/First formal review: Unavailable/)).toBeTruthy();
+  });
 });
 
 describe("GitLab explicit history", () => {

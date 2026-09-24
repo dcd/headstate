@@ -30,7 +30,12 @@ pub struct ReviewOutcome {
     pub change_requests: usize,
 }
 
-fn approvals(body: &Value, mr: &Record) -> Option<(Vec<(String, DateTime<Utc>)>, DateTime<Utc>)> {
+struct ApprovalRows {
+    entries: Vec<(String, DateTime<Utc>)>,
+    first: DateTime<Utc>,
+}
+
+fn approvals(body: &Value, mr: &Record) -> Option<ApprovalRows> {
     if body.get("iid")?.as_u64()? != mr.iid {
         return None;
     }
@@ -45,7 +50,7 @@ fn approvals(body: &Value, mr: &Record) -> Option<(Vec<(String, DateTime<Utc>)>,
         entries.push((username.to_owned(), at));
     }
     let first = entries.iter().map(|(_, at)| *at).min()?;
-    Some((entries, first))
+    Some(ApprovalRows { entries, first })
 }
 
 fn reviewer_states(body: &Value) -> Option<Vec<String>> {
@@ -119,7 +124,9 @@ pub(super) async fn load(program: &Path, report: &Report, budget: Duration) -> R
                         {
                             result.approvals_checked += 1;
                             result.current_approvals.get_or_insert(0);
-                        } else if let Some((entries, first)) = approvals(&response.body, mr) {
+                        } else if let Some(ApprovalRows { entries, first }) =
+                            approvals(&response.body, mr)
+                        {
                             result.approvals_checked += 1;
                             *result.current_approvals.get_or_insert(0) += entries.len();
                             first_approval_hours
@@ -202,7 +209,7 @@ mod tests {
         )
         .unwrap();
         let value = json!({"iid":1,"approved_by":[{"user":{"username":"alice"},"approved_at":"2026-09-01T12:00:00Z"}]});
-        let (entries, first) = approvals(&value, &mr).unwrap();
+        let ApprovalRows { entries, first } = approvals(&value, &mr).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!((first - mr.created_at).num_hours(), 2);
         let mut bad = value.clone();
