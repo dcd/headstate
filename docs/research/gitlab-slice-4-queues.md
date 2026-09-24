@@ -11,8 +11,9 @@ runs at application startup.
 receipt. Each request has a 15-second ceiling; a list has a 30-second and
 five-page ceiling, with at most 100 rows requested per page. A later timeout,
 failed page, malformed row, repeated identity, or page ceiling retains valid
-earlier rows as `partial`, with the measured total only when its page headers
-agree. A response without conclusive pagination headers has `unknown`
+earlier rows as `partial`. A measured total is kept only when page headers
+agree and it is at least the number of received rows. A response without
+conclusive pagination headers has `unknown`
 coverage. `X-Total: 0` with a terminal page is a measured empty list.
 Credential material remains inside `glab`; subprocess stderr and response
 bodies are never used in error messages or logs.

@@ -188,6 +188,9 @@ async fn fetch_with_program(
     }
     if total.is_some_and(|n| n < mrs.len() as u64) {
         incomplete = true;
+        // The header contradicts the rows already received. It cannot be
+        // presented as a measured total or even a useful lower bound.
+        total = None;
     }
     let coverage = if incomplete || (total.is_some_and(|n| n > mrs.len() as u64)) {
         Coverage::Partial { total }
@@ -223,11 +226,32 @@ async fn request(
 }
 
 fn parse_page(raw: &[u8], successful: bool) -> Result<Page, QueueError> {
-    let text = std::str::from_utf8(raw).map_err(|_| QueueError::InvalidPage)?;
+    let unreadable = if successful {
+        QueueError::InvalidPage
+    } else {
+        QueueError::Request
+    };
+    let text = std::str::from_utf8(raw).map_err(|_| unreadable)?;
     let normalized = text.replace("\r\n", "\n");
-    let (headers, body) = normalized
-        .rsplit_once("\n\n")
-        .ok_or(QueueError::InvalidPage)?;
+    // glab can fail before it prints an HTTP response. In that case the
+    // transport failed, rather than GitLab returning malformed JSON.
+    let explicit_status = normalized
+        .lines()
+        .filter(|line| line.starts_with("HTTP/"))
+        .filter_map(|line| line.split_whitespace().nth(1)?.parse::<u16>().ok())
+        .next_back();
+    match explicit_status {
+        Some(401) => return Err(QueueError::Unauthorized),
+        Some(403) => return Err(QueueError::Forbidden),
+        Some(429) => return Err(QueueError::RateLimited),
+        None if !successful => return Err(QueueError::Request),
+        _ => {}
+    }
+    let (headers, body) = normalized.rsplit_once("\n\n").ok_or(if successful {
+        QueueError::InvalidPage
+    } else {
+        QueueError::Request
+    })?;
     let headers = headers
         .rsplit_once("\n\n")
         .map_or(headers, |(_, last)| last);
@@ -238,15 +262,6 @@ fn parse_page(raw: &[u8], successful: bool) -> Result<Page, QueueError> {
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|n| n.parse::<u16>().ok())
         .ok_or(QueueError::InvalidPage)?;
-    if status == 401 {
-        return Err(QueueError::Unauthorized);
-    }
-    if status == 403 {
-        return Err(QueueError::Forbidden);
-    }
-    if status == 429 {
-        return Err(QueueError::RateLimited);
-    }
     if !successful || !(200..300).contains(&status) {
         return Err(QueueError::Request);
     }
@@ -422,8 +437,17 @@ mod tests {
             Err(QueueError::Unauthorized)
         ));
         assert!(matches!(
+            parse_page(b"HTTP/2 403\n\n{}", false),
+            Err(QueueError::Forbidden)
+        ));
+        assert!(matches!(
             parse_page(b"HTTP/2 429\n\n{}", false),
             Err(QueueError::RateLimited)
+        ));
+        assert!(matches!(parse_page(b"", false), Err(QueueError::Request)));
+        assert!(matches!(
+            parse_page(b"not HTTP", false),
+            Err(QueueError::Request)
         ));
         let no_headers = parse_page(b"HTTP/2 200\n\n[]", true).unwrap();
         assert_eq!(no_headers.total, None);
@@ -492,7 +516,23 @@ esac
     #[tokio::test]
     async fn a_failed_first_page_is_not_a_measured_empty_queue() {
         let result = scripted("exit 1", CachedList::Authored, Duration::from_secs(1)).await;
-        assert!(matches!(result, Err(QueueError::InvalidPage)));
+        assert!(matches!(result, Err(QueueError::Request)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_total_smaller_than_received_rows_is_withheld() {
+        let rows = json!([
+            row("gitlab.com", "group/subgroup/project", 7),
+            row("gitlab.com", "group/subgroup/project", 8)
+        ]);
+        let script = format!("printf 'HTTP/2 200\\nx-total: 1\\nx-next-page:\\n\\n%s' '{rows}'");
+        let result = scripted(&script, CachedList::Authored, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(result.mrs.len(), 2);
+        assert_eq!(result.total, None);
+        assert_eq!(result.coverage, Coverage::Partial { total: None });
     }
 
     #[cfg(unix)]
