@@ -62,11 +62,11 @@ export function SourceRepoSidebar({ github, gitlab, selection }: { github: PullR
       <ViewSwitcher />
       <div className="min-h-0 flex-1 overflow-y-auto">
         <button type="button" onClick={() => setRepoKey(null)} aria-current={current(repoKey === null)} className="flex w-full justify-between rounded px-3 py-2 text-sm hover:bg-[#161b22]">
-          <span>All repositories</span><span>{rows.length}</span>
+          <span>All repositories</span><span>{rows.length} shown</span>
         </button>
         {[...repos].sort((a, b) => b[1].count - a[1].count).map(([key, repo]) => (
           <button type="button" key={key} onClick={() => setRepoKey(key)} aria-current={current(repoKey === key)} className="flex w-full justify-between gap-2 rounded px-3 py-2 text-left text-sm hover:bg-[#161b22]">
-            <span className="truncate">{repo.label}</span><span>{repo.count}</span>
+            <span className="truncate">{repo.label}</span><span>{repo.count} shown</span>
           </button>
         ))}
       </div>
