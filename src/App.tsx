@@ -1023,9 +1023,9 @@ export default function App() {
               github={source}
               gitlab={gitlabQueue.rows}
               githubLoading={view === "to-review" ? reviewingLoading : isLoading}
-              gitlabLoading={gitlabQueue.loading}
+              gitlabLoading={gitlabHost.isPending || (gitlabHost.isSuccess && gitlabQueue.loading)}
               githubError={view === "to-review" ? (reviewingError ? errorMessage(reviewingErr) ?? "Could not refresh GitHub" : null) : (isError ? errorMessage(error) ?? "Could not refresh GitHub" : pollError ?? null)}
-              gitlabError={gitlabQueue.error}
+              gitlabError={gitlabHost.isError ? "Could not read the configured GitLab host. Check the desktop connection or Settings." : gitlabQueue.error}
               githubCoverage={githubCoverage}
               gitlabCoverage={gitlabQueue.coverage}
               githubStaleSecs={view === "to-review" ? reviewingStaleSecs : null}
@@ -1033,7 +1033,7 @@ export default function App() {
               canWriteGitHub={view === "my-prs"}
               onOpen={selectPr}
               onRefreshGitHub={() => void (view === "to-review" ? refetchReviewing() : refreshGitHubFromGesture())}
-              onRefreshGitLab={() => void gitlabQueue.refresh()}
+              onRefreshGitLab={() => { if (gitlabHost.isError) void gitlabHost.refetch(); else void gitlabQueue.refresh(); }}
             />
           </div>
         ) : (

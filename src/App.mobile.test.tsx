@@ -191,6 +191,17 @@ describe("App shell on a phone", () => {
     };
   });
 
+  it("shows a settled GitLab host error when the desktop cannot answer", async () => {
+    useSourceSelection.setState({ selection: "gitlab", repoKey: null, query: "" });
+    mockIPC((command) => {
+      if (command === "get_gitlab_host") throw new Error("desktop offline");
+      return undefined;
+    }, { shouldMockEvents: true });
+    renderApp();
+    expect(await screen.findByText(/Could not read the configured GitLab host/)).toBeTruthy();
+    expect(screen.queryByText(/Loading GitLab/)).toBeNull();
+  });
+
   it("does not show a green or fresh GitHub claim with missing auth and a warm cache", async () => {
     cacheReadAt.value = Date.now();
     mockIPC((cmd) => {

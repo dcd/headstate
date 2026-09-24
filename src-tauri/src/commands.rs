@@ -374,11 +374,11 @@ async fn refresh_source_request(
 ) -> Result<SourceRefresh, String> {
     use crate::source_poll::{self, Failure};
     let attempt = source_poll::begin_request(&app, source.clone(), list, request_id).await;
-    let gitlab_com = source.provider == crate::identity::Provider::Gitlab
-        && source.host == crate::gitlab::auth::HOST;
-    let refusal = if !gitlab_com && source != crate::identity::Source::default() {
+    let gitlab_source = source.provider == crate::identity::Provider::Gitlab
+        && crate::gitlab::host::validate(&source.host).is_ok();
+    let refusal = if !gitlab_source && source != crate::identity::Source::default() {
         Some("headstate:not-asked: fetching is not enabled for this source".to_string())
-    } else if !gitlab_com && client.0.is_none() {
+    } else if !gitlab_source && client.0.is_none() {
         Some(AUTH_ERR.to_string())
     } else {
         None
@@ -396,7 +396,7 @@ async fn refresh_source_request(
         .await;
         return Err(message);
     }
-    if gitlab_com {
+    if gitlab_source {
         return refresh_gitlab_request(app, source, list, attempt).await;
     }
     // Preserve reviewing's existing paged loader: an outer timeout drops
