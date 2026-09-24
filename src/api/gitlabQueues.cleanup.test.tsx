@@ -3,8 +3,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const ipc = vi.hoisted(() => {
   const listeners: Array<{ event: string; handler: (event: { payload: unknown }) => void; resolve: (unlisten: () => void) => void }> = [];
-  return { listeners, unlisten: vi.fn(), refresh: vi.fn(), snapshot: vi.fn() };
+  return { listeners, unlisten: vi.fn(), refresh: vi.fn(), snapshot: vi.fn(), mobile: false };
 });
+vi.mock("../lib/target", () => ({ get IS_MOBILE_BUILD() { return ipc.mobile; } }));
 vi.mock("./transport", () => ({
   listen: (event: string, handler: (event: { payload: unknown }) => void) =>
     new Promise<() => void>((resolve) => ipc.listeners.push({ event, handler, resolve })),
@@ -21,6 +22,8 @@ afterEach(() => {
   ipc.unlisten.mockReset();
   ipc.refresh.mockReset();
   ipc.snapshot.mockReset();
+  ipc.mobile = false;
+  vi.useRealTimers();
 });
 
 describe("GitLab queue listeners", () => {
@@ -36,5 +39,23 @@ describe("GitLab queue listeners", () => {
     expect(ipc.unlisten).toHaveBeenCalledTimes(2);
     ipc.listeners.find(({ event }) => event === "refresh-requested")?.handler({ payload: null });
     expect(ipc.refresh).toHaveBeenCalledTimes(0);
+  });
+
+  it.each([false, true])("uses desktop backend cadence and phone foreground cadence (mobile=%s)", async (mobile) => {
+    ipc.mobile = mobile;
+    ipc.snapshot.mockResolvedValue({ data: null });
+    ipc.refresh.mockResolvedValue({});
+    vi.useFakeTimers();
+    const { unmount } = renderHook(() => useGitLabQueue("authored", true));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(ipc.refresh).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      ipc.listeners.find(({ event }) => event === "refresh-requested")?.handler({ payload: null });
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    // The keyboard refresh event is available on both builds; only the
+    // periodic foreground fetch belongs to the phone.
+    expect(ipc.refresh).toHaveBeenCalledTimes(mobile ? 3 : 2);
+    unmount();
   });
 });
