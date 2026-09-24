@@ -78,6 +78,10 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("tool_versions", Class::Read),
     ("get_auth_state", Class::Read),
     ("get_gitlab_auth_state", Class::Read),
+    ("get_source_snapshot", Class::Read),
+    ("get_source_poll_status", Class::Read),
+    ("refresh_source", Class::Read),
+    ("set_source_selection", Class::Local),
     ("get_cached", Class::Read),
     ("get_cached_reviewing", Class::Read),
     ("refresh_now", Class::Read),
@@ -996,6 +1000,23 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "read_log_tail" => res(commands::read_log_tail(app.clone(), a.get("maxBytes")?).await),
         "get_auth_state" => ok(commands::get_auth_state(app.state())),
         "get_gitlab_auth_state" => ok(commands::get_gitlab_auth_state().await),
+        "get_source_snapshot" => res(commands::get_source_snapshot(
+            app.clone(),
+            a.get("source")?,
+            a.get("list")?,
+        )),
+        "get_source_poll_status" => ok(commands::get_source_poll_status(
+            app.state(),
+            a.get("source")?,
+            a.get("list")?,
+        )),
+        "refresh_source" => res(commands::refresh_source(
+            app.clone(),
+            app.state(),
+            a.get("source")?,
+            a.get("list")?,
+        )
+        .await),
         "get_cached" => res(commands::get_cached(app.clone())),
         "get_cached_reviewing" => res(commands::get_cached_reviewing(app.clone())),
         "refresh_now" => {

@@ -245,6 +245,7 @@ async fn refresh_reply(
 }
 
 /// Source-scoped cache/readback for slice 6. Legacy commands stay GitHub-only.
+#[tauri::command]
 pub fn get_source_snapshot(
     app: AppHandle,
     source: crate::identity::Source,
@@ -255,12 +256,39 @@ pub fn get_source_snapshot(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
 pub fn get_source_poll_status(
     state: State<'_, crate::source_poll::SourcePolls>,
     source: crate::identity::Source,
     list: CachedList,
 ) -> crate::source_poll::Status {
     state.get(&source, list)
+}
+
+/// Persist the desktop's selected network sources independently of auth.
+#[tauri::command]
+pub fn set_source_selection(
+    app: AppHandle,
+    selection: String,
+    enabled: State<'_, crate::poll::GithubSourceEnabled>,
+    waker: State<'_, crate::poll::Waker>,
+) -> Result<(), String> {
+    if !matches!(selection.as_str(), "github" | "gitlab" | "both") {
+        return Err("Unknown source selection".into());
+    }
+    let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
+    crate::store::settings::set(
+        &conn,
+        crate::store::settings::keys::SOURCE_SELECTION,
+        &selection,
+    )
+    .map_err(|e| e.to_string())?;
+    let github = selection != "gitlab";
+    enabled
+        .0
+        .store(github, std::sync::atomic::Ordering::Relaxed);
+    waker.0.notify_one();
+    Ok(())
 }
 
 #[derive(serde::Serialize)]
@@ -273,6 +301,7 @@ pub struct SourceRefresh {
 }
 
 /// Manual refresh targets exactly one source/list.
+#[tauri::command]
 pub async fn refresh_source(
     app: AppHandle,
     client: State<'_, GhClient>,
