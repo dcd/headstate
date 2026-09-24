@@ -1015,6 +1015,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             app.state(),
             a.get("source")?,
             a.get("list")?,
+            a.get("requestId")?,
         )
         .await),
         "get_cached" => res(commands::get_cached(app.clone())),
