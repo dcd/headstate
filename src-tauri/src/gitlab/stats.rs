@@ -164,7 +164,22 @@ struct Response {
     remaining: Option<u64>,
     reset: Option<u64>,
 }
-fn parse(raw: &[u8], success: bool) -> Result<Response, Stop> {
+#[derive(Debug)]
+struct RequestFailure {
+    stop: Stop,
+    remaining: Option<u64>,
+    reset: Option<u64>,
+}
+impl From<Stop> for RequestFailure {
+    fn from(stop: Stop) -> Self {
+        Self {
+            stop,
+            remaining: None,
+            reset: None,
+        }
+    }
+}
+fn parse(raw: &[u8], success: bool) -> Result<Response, RequestFailure> {
     let text = std::str::from_utf8(raw)
         .map_err(|_| Stop::InvalidData)?
         .replace("\r\n", "\n");
@@ -175,20 +190,40 @@ fn parse(raw: &[u8], success: bool) -> Result<Response, Stop> {
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|s| s.parse::<u16>().ok())
         .ok_or(Stop::InvalidData)?;
-    match status {
-        401 => return Err(Stop::Unauthorized),
-        403 => return Err(Stop::Forbidden),
-        429 => return Err(Stop::RateLimited),
-        200..=299 if success => {}
-        _ => return Err(Stop::RequestFailed),
+    // Failure responses carry the newest rate-limit evidence too. Read these
+    // headers before interpreting the status or attempting to decode its body.
+    let mut remaining = None;
+    let mut reset = None;
+    for line in headers.lines().skip(1) {
+        if let Some((key, value)) = line.split_once(':') {
+            match key.to_ascii_lowercase().as_str() {
+                "ratelimit-remaining" => remaining = value.trim().parse().ok(),
+                "ratelimit-reset" => reset = value.trim().parse().ok(),
+                _ => {}
+            }
+        }
+    }
+    let failure = match status {
+        401 => Some(Stop::Unauthorized),
+        403 => Some(Stop::Forbidden),
+        429 => Some(Stop::RateLimited),
+        200..=299 if success => None,
+        _ => Some(Stop::RequestFailed),
+    };
+    if let Some(stop) = failure {
+        return Err(RequestFailure {
+            stop,
+            remaining,
+            reset,
+        });
     }
     let mut out = Response {
         body: serde_json::from_str(body).map_err(|_| Stop::InvalidData)?,
         next: None,
         terminal: false,
         total: None,
-        remaining: None,
-        reset: None,
+        remaining,
+        reset,
     };
     for line in headers.lines().skip(1) {
         if let Some((key, value)) = line.split_once(':') {
@@ -214,7 +249,7 @@ async fn request(
     host: &str,
     endpoint: &str,
     budget: Duration,
-) -> Result<Response, Stop> {
+) -> Result<Response, RequestFailure> {
     let output = tokio::time::timeout(
         budget.min(REQUEST_TIMEOUT),
         tokio::process::Command::new(program)
@@ -243,7 +278,7 @@ fn error(stop: &Stop) -> String {
 async fn viewer(program: &Path, host: &str) -> Result<String, String> {
     let out = request(program, host, "user", REQUEST_TIMEOUT)
         .await
-        .map_err(|s| error(&s))?;
+        .map_err(|failure| error(&failure.stop))?;
     // Numeric id is stable across username changes and isolates accounts.
     out.body
         .get("id")
@@ -285,9 +320,15 @@ async fn pages(
         .await
         {
             Ok(out) => out,
-            Err(stop) if coverage.pages == 0 => return Err(error(&stop)),
-            Err(stop) => {
-                coverage.stop = stop;
+            Err(failure) if coverage.pages == 0 => return Err(error(&failure.stop)),
+            Err(failure) => {
+                if failure.stop == Stop::RateLimited {
+                    // Missing headers on a 429 invalidate prior positive rate
+                    // readings; absence is unknown, never an invented zero.
+                    coverage.rate_remaining = failure.remaining;
+                    coverage.rate_reset = failure.reset;
+                }
+                coverage.stop = failure.stop;
                 break;
             }
         };
@@ -680,7 +721,10 @@ mod tests {
     fn status_and_rate_headers_survive_transport() {
         assert!(matches!(
             parse(b"HTTP/2 429\n\n{}", false),
-            Err(Stop::RateLimited)
+            Err(RequestFailure {
+                stop: Stop::RateLimited,
+                ..
+            })
         ));
         let out = parse(b"HTTP/2 200\nX-Next-Page: 2\nRateLimit-Remaining: 0\nRateLimit-Reset: 42\nX-Total: 3\n\n[]", true).unwrap();
         assert_eq!(out.next, Some(2));
@@ -728,6 +772,39 @@ mod tests {
             .unwrap();
         assert_eq!(coverage.stop, Stop::UnknownPagination);
         assert!(!coverage.complete);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn later_429_replaces_prior_rate_evidence_and_preserves_rows_in_cache() {
+        for (headers, expected_remaining, expected_reset) in [
+            (
+                "ratelimit-remaining: 0\\nratelimit-reset: 200\\n",
+                Some(0),
+                Some(200),
+            ),
+            ("", None, None),
+        ] {
+            let script = format!(
+                "case \"$5\" in *page=1) printf 'HTTP/2 200\\nx-next-page: 2\\nratelimit-remaining: 99\\nratelimit-reset: 100\\n\\n[{{}}]';; *) printf 'HTTP/2 429\\n{headers}\\nrate limit reached'; exit 1;; esac"
+            );
+            let (rows, coverage) = scripted(&script, Duration::from_secs(1)).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(coverage.stop, Stop::RateLimited);
+            assert_eq!(coverage.rate_remaining, expected_remaining);
+            assert_eq!(coverage.rate_reset, expected_reset);
+            assert!(!coverage.complete);
+            let mut out = report(vec![sample(1)]);
+            out.coverage = coverage;
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("cache.sqlite");
+            crate::store::gitlab_stats::put(&db, "rate-test", &out).unwrap();
+            let cached = crate::store::gitlab_stats::get(&db, "rate-test")
+                .unwrap()
+                .unwrap();
+            assert_eq!(cached.coverage.rate_remaining, expected_remaining);
+            assert_eq!(cached.coverage.rate_reset, expected_reset);
+            assert_eq!(cached.history.len(), 1);
+        }
     }
     #[test]
     fn cache_separates_viewers_hosts_scopes_and_retains_coverage() {

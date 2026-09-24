@@ -19,27 +19,48 @@ export function GitLabStatsResults({ report }: { report: GitLabStatsReport }) {
 }
 
 export function GitLabStatsPage({ host = "gitlab.com" }: { host?: string }) {
-  const [scope, setScope] = useState<GitLabScope>({ kind: "mine" });
+  const [selection, setSelection] = useState<{ account: string; scope: GitLabScope }>();
   const [days, setDays] = useState(30);
-  const tree = useGitLabStatsTree(host);
-  const stats = useGitLabStats(host, tree.data?.viewer, scope, days);
-  const groups = [...new Set(tree.data?.projects.map(p => p.namespace).filter(Boolean))];
+  const [revision, setRevision] = useState(0);
+  const tree = useGitLabStatsTree(host, revision);
+  const account = JSON.stringify([host, tree.data?.viewer]);
+  const scope: GitLabScope = selection?.account === account ? selection.scope : { kind: "mine" };
   return <main className="mx-auto w-full max-w-5xl space-y-5 overflow-auto p-4 sm:p-6">
     <h1 className="text-xl font-semibold">GitLab MR Stats · {host}</h1>
+    <button type="button" disabled={tree.isFetching} onClick={() => setRevision(value => value + 1)} className="rounded border px-2">Refresh</button>
+    {tree.isFetching && <p role="status">Loading GitLab scopes…</p>}
+    {tree.isError && <p role="alert">Could not load GitLab scopes: {String(tree.error)}</p>}
+    {/* Refresh always rediscovers the account and retries partial discovery.
+        Unmount statistics while discovery runs, so old scopes/results cannot
+        launch requests or remain visible against a newly selected account. */}
+    {tree.isSuccess && !tree.isFetching && <GitLabStatsScope key={JSON.stringify([account, revision])}
+      host={host} tree={tree.data} scope={scope} days={days} setDays={setDays}
+      setScope={next => setSelection({ account, scope: next })} />}
+  </main>;
+}
+
+function GitLabStatsScope({ host, tree, scope, days, setScope, setDays }: {
+  host: string;
+  tree: NonNullable<ReturnType<typeof useGitLabStatsTree>["data"]>;
+  scope: GitLabScope;
+  days: number;
+  setScope: (scope: GitLabScope) => void;
+  setDays: (days: number) => void;
+}) {
+  const stats = useGitLabStats(host, tree.viewer, scope, days);
+  const groups = [...new Set(tree.projects.map(p => p.namespace).filter(Boolean))];
+  return <>
     <div className="flex flex-wrap gap-3">
       <label>Scope <select aria-label="GitLab statistics scope" value={JSON.stringify(scope)} onChange={e => setScope(JSON.parse(e.target.value) as GitLabScope)} className="rounded border bg-background p-1">
         <option value={JSON.stringify({ kind: "mine" })}>My authored MRs</option>
         {groups.map(path => <option key={`group:${path}`} value={JSON.stringify({ kind: "group", path })}>Group: {path}</option>)}
-        {tree.data?.projects.map(p => <option key={p.path} value={JSON.stringify({ kind: "project", path: p.path })}>Project: {p.path}</option>)}
+        {tree.projects.map(p => <option key={p.path} value={JSON.stringify({ kind: "project", path: p.path })}>Project: {p.path}</option>)}
       </select></label>
       <label>Window <select aria-label="GitLab statistics window" value={days} onChange={e => setDays(Number(e.target.value))} className="rounded border bg-background p-1"><option value={7}>7 days</option><option value={30}>30 days</option><option value={90}>90 days</option></select></label>
-      <button type="button" disabled={stats.isFetching || tree.isFetching} onClick={() => { if (tree.isError) void tree.refetch(); else void stats.refetch(); }} className="rounded border px-2">Refresh</button>
     </div>
-    {tree.isPending && <p role="status">Loading GitLab scopes…</p>}
-    {tree.isError && <p role="alert">Could not load GitLab scopes: {String(tree.error)}</p>}
-    {tree.data && !tree.data.coverage.complete && <p role="status">Project discovery is partial ({tree.data.coverage.stop.replaceAll("_", " ")}); more scopes may exist.</p>}
-    {tree.data && stats.isPending && <p role="status">Loading GitLab statistics…</p>}
+    {!tree.coverage.complete && <p role="status">Project discovery is partial ({tree.coverage.stop.replaceAll("_", " ")}); more scopes may exist.</p>}
+    {stats.isPending && <p role="status">Loading GitLab statistics…</p>}
     {stats.isError && <p role="alert">Could not load GitLab statistics: {String(stats.error)}</p>}
-    {stats.data && <GitLabStatsResults report={stats.data} />}
-  </main>;
+    {stats.data && !stats.isError && <GitLabStatsResults report={stats.data} />}
+  </>;
 }
