@@ -300,6 +300,16 @@ pub struct SourceRefresh {
     pub coverage: crate::store::source_cache::Coverage,
 }
 
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+pub enum SourceRefreshReply {
+    Legacy(SourceRefresh),
+    Correlated {
+        request_id: String,
+        update: Box<crate::source_poll::Update>,
+    },
+}
+
 /// Manual refresh targets exactly one source/list.
 #[tauri::command]
 pub async fn refresh_source(
@@ -307,8 +317,28 @@ pub async fn refresh_source(
     client: State<'_, GhClient>,
     source: crate::identity::Source,
     list: CachedList,
-) -> Result<SourceRefresh, String> {
-    refresh_source_request(app, client, source, list, None).await
+    request_id: Option<String>,
+) -> Result<SourceRefreshReply, String> {
+    let result = refresh_source_request(
+        app.clone(),
+        client,
+        source.clone(),
+        list,
+        request_id.clone(),
+    )
+    .await;
+    if let Some(request_id) = request_id {
+        let update = app
+            .state::<crate::source_poll::SourcePolls>()
+            .snapshot(&source, list)
+            .await;
+        Ok(SourceRefreshReply::Correlated {
+            request_id,
+            update: Box::new(update),
+        })
+    } else {
+        result.map(SourceRefreshReply::Legacy)
+    }
 }
 
 async fn refresh_source_request(
