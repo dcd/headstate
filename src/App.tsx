@@ -1006,7 +1006,7 @@ export default function App() {
                 the `SystemHealthPage` branch above for why the boundary
                 sits inside the padded wrapper. */}
             <Suspense fallback={<ViewLoading />}>
-              <ProviderStatsPage />
+              <ProviderStatsPage selection={selection} />
             </Suspense>
           </div>
         ) : selection !== "github" ? (
