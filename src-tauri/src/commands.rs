@@ -9034,6 +9034,16 @@ pub async fn gitlab_stats_load(
     crate::gitlab::stats::load(&host, scope, days, db_path(&app), refresh).await
 }
 
+#[tauri::command]
+pub async fn gitlab_stats_backfill(
+    app: AppHandle,
+    host: String,
+    scope: crate::gitlab::stats::Scope,
+    days: u32,
+) -> Result<crate::gitlab::stats::Backfill, String> {
+    crate::gitlab::stats::backfill(&host, scope, days, db_path(&app)).await
+}
+
 /// Full identity is mandatory: these writes never fall through to GitHub.
 #[tauri::command]
 pub async fn gitlab_action_capabilities(

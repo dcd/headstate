@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useGitLabStats, useGitLabStatsTree, type GitLabScope, type GitLabStatsReport } from "../api/gitlabStats";
+import { useGitLabStats, useGitLabStatsTree, useGitLabBackfill, type GitLabScope, type GitLabStatsReport } from "../api/gitlabStats";
 
 function qualified(n: number, complete: boolean) { return complete ? String(n) : `At least ${n}`; }
 
@@ -13,7 +13,23 @@ export function GitLabStatsResults({ report }: { report: GitLabStatsReport }) {
     <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">{Object.entries(report.counts).map(([name, count]) => <div key={name}><dt className="capitalize text-sm">{name}</dt><dd className="text-xl font-semibold">{qualified(count, complete)}</dd></div>)}</dl>
     <section><h2 className="font-semibold">Created per day</h2><div className="max-h-64 overflow-auto"><table className="w-full text-left text-sm"><thead><tr><th>Date (UTC)</th><th>Created</th></tr></thead><tbody>{report.series.map(day => <tr key={day.day}><td>{day.day}</td><td>{qualified(day.created, complete)}</td></tr>)}</tbody></table></div></section>
     <section><h2 className="font-semibold">Authors in retrieved MRs</h2><div className="overflow-x-auto"><table className="w-full text-left text-sm"><thead><tr><th>Author</th><th>Created</th><th>Merged</th><th>Mean time to merge</th></tr></thead><tbody>{report.authors.map(author => <tr key={author.username}><td>{author.username}</td><td>{qualified(author.created, complete)}</td><td>{qualified(author.merged, complete)}</td><td>{complete && author.mean_merge_hours !== null && author.timed_merges === author.merged ? `${author.mean_merge_hours.toFixed(1)} hours (${author.timed_merges} MRs)` : "Unavailable"}</td></tr>)}</tbody></table></div></section>
-    <section><h2 className="font-semibold">Current reviewer assignments</h2><p className="text-sm text-muted-foreground">Reviewer lists measured for {report.reviewer_rows_measured} of {report.counts.created} retrieved MRs. Review activity and response times are unavailable from this read.</p><ul className="text-sm">{report.reviewers.map(reviewer => <li key={reviewer.username}>{reviewer.username}: {qualified(reviewer.assigned, assignmentsComplete)} assigned</li>)}</ul></section>
+    <section><h2 className="font-semibold">Current reviewer assignments</h2><p className="text-sm text-muted-foreground">Reviewer lists measured for {report.reviewer_rows_measured} of {report.counts.created} retrieved MRs. Assignments do not measure review activity.</p><ul className="text-sm">{report.reviewers.map(reviewer => <li key={reviewer.username}>{reviewer.username}: {qualified(reviewer.assigned, assignmentsComplete)} assigned</li>)}</ul></section>
+    <section><h2 className="font-semibold">Merged in the window</h2><p className="text-sm text-muted-foreground">Includes MRs created before this window. This is a separate cohort.</p>
+      {report.merged_window ? <>
+        <p>{qualified(report.merged_window.count, report.merged_window.coverage.complete)} merged MRs</p>
+        {!report.merged_window.coverage.complete && <p role="status">Merged data is partial: {report.merged_window.coverage.stop.replaceAll("_", " ")}. Means are unavailable.</p>}
+        <table className="w-full text-left text-sm"><thead><tr><th>Date (UTC)</th><th>Merged</th></tr></thead><tbody>{report.merged_window.series.map(day => <tr key={day.day}><td>{day.day}</td><td>{qualified(day.merged, report.merged_window!.coverage.complete)}</td></tr>)}</tbody></table>
+        <h3>Authors of merged MRs</h3><ul>{report.merged_window.authors.map(author => <li key={author.username}>{author.username}: {qualified(author.merged, report.merged_window!.coverage.complete)} merged; mean creation to merge: {report.merged_window!.coverage.complete && author.mean_merge_hours !== null ? `${author.mean_merge_hours.toFixed(1)} hours` : "Unavailable"}</li>)}</ul>
+      </> : <p>Merged-in-window data unavailable{report.merged_error ? `: ${report.merged_error}` : "."}</p>}
+    </section>
+    <section><h2 className="font-semibold">Comment participation in the created cohort</h2><p className="text-sm text-muted-foreground">Non-author, non-system comments through the snapshot end. Comments may include bots; approvals, changes requested, and formal review outcomes are unavailable. At most 10 MRs and 100 notes per MR are read per load.</p>
+      {report.activity ? <>
+        <p>{report.activity.mrs_checked} of {report.activity.mrs_total} retrieved MRs have complete comment reads. {qualified(report.activity.comments, report.activity.complete)} comments.</p>
+        <p>Mean first response among MRs with a response: {report.activity.complete && report.activity.mean_first_response_hours !== null ? `${report.activity.mean_first_response_hours.toFixed(1)} hours (${report.activity.responded_mrs} MRs)` : "Unavailable"}</p>
+        {report.activity.failures.map((failure, index) => <p role="status" key={index}>{failure}</p>)}
+        <ul>{report.activity.participants.map(person => <li key={person.username}>{person.username}: {qualified(person.comments, report.activity!.complete)} comments on {qualified(person.mrs, report.activity!.complete)} MRs</li>)}</ul>
+      </> : <p>Comment activity and response times unavailable.</p>}
+    </section>
     <section><h2 className="font-semibold">MR history in this window</h2><ul className="space-y-2 text-sm">{report.history.map(mr => <li key={JSON.stringify([mr.source.provider, mr.source.host, mr.project, mr.iid])}><span className="font-medium">{mr.project}!{mr.iid}</span> — {mr.title} <span className="text-muted-foreground">({mr.state}; {mr.source.host})</span></li>)}</ul></section>
   </div>;
 }
@@ -62,5 +78,21 @@ function GitLabStatsScope({ host, tree, scope, days, setScope, setDays }: {
     {stats.isPending && <p role="status">Loading GitLab statistics…</p>}
     {stats.isError && <p role="alert">Could not load GitLab statistics: {String(stats.error)}</p>}
     {stats.data && !stats.isError && <GitLabStatsResults report={stats.data} />}
+    <GitLabHistory key={JSON.stringify([host, tree.viewer, scope, days])} host={host} viewer={tree.viewer} scope={scope} days={days} />
   </>;
+}
+
+function GitLabHistory({ host, viewer, scope, days }: { host: string; viewer: string; scope: GitLabScope; days: number }) {
+  const history = useGitLabBackfill(host, viewer, scope, days);
+  return <section className="space-y-2">
+    <h2 className="font-semibold">Retained daily history</h2>
+    <p className="text-sm text-muted-foreground">Each click retrieves one missing closed UTC day, up to 20 list pages and 10 comment requests within 45 seconds. Completed count receipts are retained and skipped on resume. Historical comment reads can be partial. No background requests run.</p>
+    <button type="button" className="rounded border px-2" disabled={history.isPending} onClick={() => history.mutate()}>{history.isPending ? "Loading history…" : "Load next history day"}</button>
+    {history.isError && <p role="alert">Could not load history: {String(history.error)}</p>}
+    {history.data && <>
+      <p>{history.data.complete_days} of {history.data.requested_days} closed days have complete created and merged counts.</p>
+      {history.data.error && <p role="alert">{history.data.error}</p>}
+      <table className="w-full text-left text-sm"><thead><tr><th>Day (UTC)</th><th>Created</th><th>Merged in day</th><th>Retrieved</th></tr></thead><tbody>{history.data.slices.map(slice => <tr key={slice.start}><td>{slice.start.slice(0,10)}</td><td>{qualified(slice.counts.created,slice.coverage.complete)}</td><td>{slice.merged_window ? qualified(slice.merged_window.count,slice.merged_window.coverage.complete) : "Unavailable"}</td><td>{new Date(slice.fetched_at).toLocaleString()}</td></tr>)}</tbody></table>
+    </>}
+  </section>;
 }

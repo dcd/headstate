@@ -22,7 +22,7 @@ describe("GitLab statistics evidence", () => {
     expect(screen.getAllByText("At least 0")).toHaveLength(2);
     expect(screen.queryByText(/24.0 hours/)).toBeNull();
     expect(screen.getByText("Unavailable")).toBeTruthy();
-    expect(screen.getByText(/Review activity and response times are unavailable/)).toBeTruthy();
+    expect(screen.getByText(/Comment activity and response times unavailable/)).toBeTruthy();
   });
   it("renders a measured zero and a fully measured mean only for complete coverage", () => {
     render(<GitLabStatsResults report={report(true)} />);

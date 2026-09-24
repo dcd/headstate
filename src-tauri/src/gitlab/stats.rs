@@ -1,5 +1,8 @@
 //! GitLab-only created-cohort statistics. Bounds and coverage are part of the
 //! answer, including after persistence. A reviewer assignment is not a review.
+mod activity;
+mod history;
+
 use crate::identity::{Provider, Source};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -22,6 +25,7 @@ pub enum Scope {
     Mine,
     Project(String),
     Group(String),
+    Person(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,6 +120,32 @@ pub struct Report {
     pub reviewer_rows_measured: usize,
     pub review_activity: Option<usize>,
     pub history: Vec<Record>,
+    #[serde(default)]
+    pub merged_window: Option<MergedWindow>,
+    #[serde(default)]
+    pub merged_error: Option<String>,
+    #[serde(default)]
+    pub activity: Option<activity::Activity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergedWindow {
+    pub coverage: Coverage,
+    pub count: usize,
+    pub series: Vec<MergedDay>,
+    pub authors: Vec<MergedAuthor>,
+    pub history: Vec<Record>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergedDay {
+    pub day: String,
+    pub merged: usize,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergedAuthor {
+    pub username: String,
+    pub merged: usize,
+    pub mean_merge_hours: Option<f64>,
 }
 
 fn source(host: &str) -> Result<Source, String> {
@@ -153,7 +183,10 @@ fn endpoint(scope: &Scope) -> Result<String, String> {
         Scope::Group(path) if path_ok(path) => {
             Ok(format!("groups/{}/merge_requests?scope=all", encode(path)))
         }
-        _ => Err("invalid GitLab project or group path".into()),
+        Scope::Person(username) if path_ok(username) && !username.contains('/') => Ok(format!(
+            "merge_requests?scope=all&author_username={username}"
+        )),
+        _ => Err("invalid GitLab project, group or username".into()),
     }
 }
 struct Response {
@@ -292,6 +325,15 @@ async fn pages(
     base: &str,
     budget: Duration,
 ) -> Result<(Vec<Value>, Coverage), String> {
+    pages_limited(program, host, base, budget, MAX_PAGES).await
+}
+async fn pages_limited(
+    program: &Path,
+    host: &str,
+    base: &str,
+    budget: Duration,
+    max_pages: usize,
+) -> Result<(Vec<Value>, Coverage), String> {
     let started = tokio::time::Instant::now();
     let mut rows = Vec::new();
     let mut page_number = 1;
@@ -305,7 +347,7 @@ async fn pages(
         rate_remaining: None,
         rate_reset: None,
     };
-    for _ in 0..MAX_PAGES {
+    for _ in 0..max_pages {
         let remaining = budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             coverage.stop = Stop::Timeout;
@@ -492,6 +534,7 @@ fn summarize(
         if let Some(record) = record(&row, &source) {
             let in_scope = match &scope {
                 Scope::Mine => true,
+                Scope::Person(username) => &record.author == username,
                 Scope::Project(p) => &record.project == p,
                 Scope::Group(g) => record.project.starts_with(&format!("{g}/")),
             };
@@ -583,6 +626,9 @@ fn summarize(
         reviewer_rows_measured,
         review_activity: None,
         history,
+        merged_window: None,
+        merged_error: None,
+        activity: None,
     }
 }
 
@@ -594,7 +640,7 @@ pub async fn load(
     refresh: bool,
 ) -> Result<Report, String> {
     let source = source(host)?;
-    let base = endpoint(&scope)?;
+    endpoint(&scope)?;
     if !(1..=90).contains(&days) {
         return Err("GitLab statistics window must be 1 to 90 days".into());
     }
@@ -629,25 +675,151 @@ pub async fn load(
             return Ok(report);
         }
     }
-    let endpoint = format!(
-        "{base}&state=all&order_by=created_at&sort=desc&created_after={}&created_before={}",
-        start.to_rfc3339().replace('+', "%2B"),
-        end.to_rfc3339().replace('+', "%2B")
-    );
-    let (raw, coverage) = pages(&program, host, &endpoint, BUDGET).await?;
-    let report = summarize(source, viewer, scope, start, end, raw, coverage);
+    let report = load_window(&program, source, viewer, scope, start, end).await?;
     let saved = report.clone();
-    // Cache trouble never discards a measured result. Errors are not logged with data.
+    // Cache trouble never discards a measured result.
     let _ = tokio::task::spawn_blocking(move || crate::store::gitlab_stats::put(&db, &key, &saved))
         .await;
     Ok(report)
 }
 
+async fn load_window(
+    program: &Path,
+    source: Source,
+    viewer: String,
+    scope: Scope,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Report, String> {
+    let started = tokio::time::Instant::now();
+    let base = endpoint(&scope)?;
+    let dates = |prefix: &str| {
+        format!(
+            "{prefix}_after={}&{prefix}_before={}",
+            start.to_rfc3339().replace('+', "%2B"),
+            end.to_rfc3339().replace('+', "%2B")
+        )
+    };
+    let created_url = format!(
+        "{base}&state=all&order_by=created_at&sort=desc&{}",
+        dates("created")
+    );
+    let (raw, coverage) = pages(program, &source.host, &created_url, BUDGET).await?;
+    let mut report = summarize(source.clone(), viewer, scope, start, end, raw, coverage);
+    let merged_url = format!(
+        "{base}&state=merged&order_by=merged_at&sort=desc&{}",
+        dates("merged")
+    );
+    // Each subsequent operation receives only the remaining load budget. No
+    // outer timeout can drop already measured rows.
+    if report.coverage.rate_remaining == Some(0) {
+        report.merged_error =
+            Some("GitLab request budget exhausted; merged MRs were not requested".into());
+    } else if started.elapsed() < BUDGET {
+        match pages(
+            program,
+            &source.host,
+            &merged_url,
+            BUDGET.saturating_sub(started.elapsed()),
+        )
+        .await
+        {
+            Ok((raw, coverage)) => {
+                report.merged_window = Some(summarize_merged(&report, raw, coverage))
+            }
+            Err(error) => report.merged_error = Some(error),
+        }
+    } else {
+        report.merged_error = Some("Load budget exhausted before requesting merged MRs".into());
+    }
+    let limited = report.coverage.rate_remaining == Some(0)
+        || report
+            .merged_window
+            .as_ref()
+            .is_some_and(|m| m.coverage.rate_remaining == Some(0));
+    report.activity = Some(
+        activity::load(
+            program,
+            &report,
+            if limited {
+                Duration::ZERO
+            } else {
+                BUDGET.saturating_sub(started.elapsed())
+            },
+        )
+        .await,
+    );
+    Ok(report)
+}
+
+fn summarize_merged(report: &Report, raw: Vec<Value>, mut coverage: Coverage) -> MergedWindow {
+    let mut seen = HashSet::new();
+    let mut history = Vec::new();
+    for raw in raw {
+        if let Some(row) = record(&raw, &report.source) {
+            let in_scope = match &report.scope {
+                Scope::Mine => true,
+                Scope::Person(p) => &row.author == p,
+                Scope::Project(p) => &row.project == p,
+                Scope::Group(g) => row.project.starts_with(&format!("{g}/")),
+            };
+            if in_scope
+                && row.state == "merged"
+                && row
+                    .merged_at
+                    .is_some_and(|at| at >= report.start && at <= report.end)
+                && seen.insert((row.project.clone(), row.iid))
+            {
+                history.push(row);
+                continue;
+            }
+        }
+        coverage.complete = false;
+        coverage.stop = Stop::InvalidData;
+    }
+    coverage.received = history.len();
+    let mut series = BTreeMap::<String, usize>::new();
+    let mut date = report.start.date_naive();
+    while date <= report.end.date_naive() {
+        series.insert(date.to_string(), 0);
+        date = date.succ_opt().expect("bounded dates");
+    }
+    let mut authors = BTreeMap::<String, Vec<f64>>::new();
+    for row in &history {
+        let at = row.merged_at.expect("validated above");
+        *series.entry(at.date_naive().to_string()).or_default() += 1;
+        authors
+            .entry(row.author.clone())
+            .or_default()
+            .push((at - row.created_at).num_seconds() as f64 / 3600.0);
+    }
+    let complete = coverage.complete;
+    MergedWindow {
+        coverage,
+        count: history.len(),
+        history,
+        series: series
+            .into_iter()
+            .map(|(day, merged)| MergedDay { day, merged })
+            .collect(),
+        authors: authors
+            .into_iter()
+            .map(|(username, times)| MergedAuthor {
+                username,
+                merged: times.len(),
+                mean_merge_hours: complete.then(|| times.iter().sum::<f64>() / times.len() as f64),
+            })
+            .collect(),
+    }
+}
+
+pub use history::{backfill, Backfill};
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-    fn sample(iid: u64) -> Value {
+    pub(super) fn sample(iid: u64) -> Value {
         json!({"iid": iid, "web_url": format!("https://gitlab.com/g/sub/p/-/merge_requests/{iid}"), "title":"change", "author":{"username":"author"}, "state":"merged", "created_at":"2026-09-01T10:00:00Z", "merged_at":"2026-09-02T10:00:00Z", "reviewers":[{"username":"reviewer"}]})
     }
     fn coverage() -> Coverage {
