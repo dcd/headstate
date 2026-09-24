@@ -83,14 +83,22 @@ pub fn constrained_command(
     program: &Path,
     expected_host: &str,
 ) -> Result<tokio::process::Command, HostError> {
-    let host = validate(expected_host)?;
     let mut command = tokio::process::Command::new(program);
+    constrain_command(&mut command, expected_host)?;
+    Ok(command)
+}
+
+fn constrain_command(
+    command: &mut tokio::process::Command,
+    expected_host: &str,
+) -> Result<(), HostError> {
+    let host = validate(expected_host)?;
     command
         .env("GITLAB_HOST", &host)
         .env("GITLAB_API_HOST", &host)
         .env("GLAB_API_PROTOCOL", "https")
         .env("GLAB_SKIP_TLS_VERIFY", "false");
-    Ok(command)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -188,7 +196,13 @@ mod tests {
     async fn glab_config_cannot_redirect_the_synthetic_host_credential() {
         use std::io::{Read, Write};
         use std::os::unix::fs::PermissionsExt;
-        let Some(glab) = crate::gitlab::auth::find_glab() else {
+        let search_path = std::env::var("PATH").ok();
+        let Some(glab) = crate::auth::find_exe_with(
+            "glab",
+            &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"],
+            search_path.as_deref(),
+            None,
+        ) else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -242,9 +256,13 @@ mod tests {
         let direct = tokio::time::timeout(
             std::time::Duration::from_secs(4),
             unguarded
+                .env_clear()
                 .args(["api", "--hostname", "gitlab.example", "version"])
                 .current_dir(dir.path())
+                .env("HOME", dir.path())
                 .env("GLAB_CONFIG_DIR", dir.path())
+                .env("XDG_CONFIG_HOME", dir.path())
+                .env("XDG_CONFIG_DIRS", dir.path())
                 .env("GLAB_CHECK_UPDATE", "false")
                 .env("NO_PROXY", "127.0.0.1")
                 .kill_on_drop(true)
@@ -268,9 +286,13 @@ mod tests {
             ("skip_tls_verify", "true", "false"),
         ] {
             let plain = std::process::Command::new(&glab)
+                .env_clear()
                 .args(["config", "get", key, "--host", "gitlab.example"])
                 .current_dir(dir.path())
+                .env("HOME", dir.path())
                 .env("GLAB_CONFIG_DIR", dir.path())
+                .env("XDG_CONFIG_HOME", dir.path())
+                .env("XDG_CONFIG_DIRS", dir.path())
                 .env("GLAB_CHECK_UPDATE", "false")
                 .output()
                 .unwrap();
@@ -281,11 +303,16 @@ mod tests {
             );
             assert_eq!(String::from_utf8_lossy(&plain.stdout).trim(), unsafe_value);
 
-            let mut guarded = constrained_command(&glab, "gitlab.example").unwrap();
+            let mut guarded = tokio::process::Command::new(&glab);
+            guarded.env_clear();
+            constrain_command(&mut guarded, "gitlab.example").unwrap();
             let out = guarded
                 .args(["config", "get", key, "--host", "gitlab.example"])
                 .current_dir(dir.path())
+                .env("HOME", dir.path())
                 .env("GLAB_CONFIG_DIR", dir.path())
+                .env("XDG_CONFIG_HOME", dir.path())
+                .env("XDG_CONFIG_DIRS", dir.path())
                 .env("GLAB_CHECK_UPDATE", "false")
                 .output()
                 .await

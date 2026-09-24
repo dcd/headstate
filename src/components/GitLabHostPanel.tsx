@@ -9,14 +9,17 @@ export function GitLabHostPanel() {
   const value = draft ?? host.data ?? "";
   const save = useMutation({
     mutationFn: setGitLabHost,
-    onSuccess: (saved) => {
+    onSuccess: async (saved) => {
       setDraft(null);
       queryClient.setQueryData(["gitlab-host"], saved);
-      // Purge receipts for the previous host, including stats keys where
-      // "gitlab" is not the first segment. Keep the saved host query.
-      queryClient.removeQueries({ predicate: ({ queryKey }) =>
-        queryKey[0] !== "gitlab-host" && queryKey.some((part) => typeof part === "string" && part.startsWith("gitlab")),
-      });
+      // Reset active observers as well as cached receipts. removeQueries
+      // alone leaves a mounted AuthGate displaying the previous host's
+      // result indefinitely. A reset clears that result and refetches.
+      const matchesGitLab = ({ queryKey }: { queryKey: readonly unknown[] }) =>
+        queryKey[0] !== "gitlab-host" && queryKey.some((part) => typeof part === "string" && part.startsWith("gitlab"));
+      await queryClient.cancelQueries({ predicate: matchesGitLab });
+      await queryClient.resetQueries({ predicate: matchesGitLab });
+      queryClient.removeQueries({ predicate: (query) => matchesGitLab(query) && !query.isActive() });
     },
   });
 
