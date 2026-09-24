@@ -12,7 +12,11 @@ export function GitLabHostPanel() {
     onSuccess: (saved) => {
       setDraft(null);
       queryClient.setQueryData(["gitlab-host"], saved);
-      void queryClient.invalidateQueries({ queryKey: ["gitlab"] });
+      // Purge receipts for the previous host, including stats keys where
+      // "gitlab" is not the first segment. Keep the saved host query.
+      queryClient.removeQueries({ predicate: ({ queryKey }) =>
+        queryKey[0] !== "gitlab-host" && queryKey.some((part) => typeof part === "string" && part.startsWith("gitlab")),
+      });
     },
   });
 

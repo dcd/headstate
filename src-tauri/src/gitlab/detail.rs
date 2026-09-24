@@ -457,7 +457,8 @@ pub(super) async fn request_json(
     body: Option<Value>,
     timeout: Duration,
 ) -> Result<Response, DetailIssue> {
-    let mut command = tokio::process::Command::new(program);
+    let mut command = super::host::constrained_command(program, host)
+        .map_err(|_| DetailIssue::UnsupportedHost)?;
     command.args(["api", "--hostname", host, "-i", endpoint]);
     if method != "GET" {
         command.args(["--method", method]);

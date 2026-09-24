@@ -1,4 +1,5 @@
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, expect, it, vi } from "vitest";
 import { renderWithQuery } from "@/test-utils";
 
@@ -32,4 +33,22 @@ it("shows a rejected save without claiming the host changed", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Save GitLab host" }));
   expect((await screen.findByRole("alert")).textContent).toContain("Enter a GitLab DNS hostname.");
   expect((input as HTMLInputElement).value).toBe("https://wrong.example");
+});
+
+it("removes stale GitLab receipts across all query-key shapes after changing hosts", async () => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  client.setQueryData(["stats", "gitlab", "gitlab.com"], { old: true });
+  client.setQueryData(["gitlab-detail", "gitlab.com/g/p/1"], { old: true });
+  client.setQueryData(["gitlab-auth", "gitlab.com"], { old: true });
+  client.setQueryData(["github", "octocat"], { keep: true });
+  render(<QueryClientProvider client={client}><GitLabHostPanel /></QueryClientProvider>);
+  const input = await screen.findByRole("textbox", { name: "GitLab host" });
+  await waitFor(() => expect((input as HTMLInputElement).value).toBe("gitlab.com"));
+  fireEvent.change(input, { target: { value: "gitlab-fixture.k3s.dcd.cloud" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save GitLab host" }));
+  await waitFor(() => expect(client.getQueryData(["gitlab-host"])).toBe("gitlab-fixture.k3s.dcd.cloud"));
+  expect(client.getQueryData(["stats", "gitlab", "gitlab.com"])).toBeUndefined();
+  expect(client.getQueryData(["gitlab-detail", "gitlab.com/g/p/1"])).toBeUndefined();
+  expect(client.getQueryData(["gitlab-auth", "gitlab.com"])).toBeUndefined();
+  expect(client.getQueryData(["github", "octocat"])).toEqual({ keep: true });
 });

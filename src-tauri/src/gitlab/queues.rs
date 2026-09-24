@@ -212,7 +212,8 @@ async fn request(
     endpoint: &str,
     timeout: Duration,
 ) -> Result<Page, QueueError> {
-    let mut command = tokio::process::Command::new(program);
+    let mut command =
+        super::host::constrained_command(program, host).map_err(|_| QueueError::UnsupportedHost)?;
     command
         .args(["api", "--hostname", host, "-i", endpoint])
         .stdin(Stdio::null())

@@ -300,9 +300,11 @@ async fn request(
     endpoint: &str,
     budget: Duration,
 ) -> Result<Response, RequestFailure> {
+    let mut command =
+        super::host::constrained_command(program, host).map_err(|_| Stop::InvalidData)?;
     let output = tokio::time::timeout(
         budget.min(REQUEST_TIMEOUT),
-        tokio::process::Command::new(program)
+        command
             .args(["api", "--hostname", host, "-i", endpoint])
             .stdin(Stdio::null())
             .stderr(Stdio::null())

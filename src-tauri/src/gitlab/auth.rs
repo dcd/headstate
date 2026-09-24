@@ -106,7 +106,8 @@ pub async fn check_host(host: &str) -> AuthState {
 }
 
 async fn check_with_program(glab: &std::path::Path, host: &str, timeout: Duration) -> AuthState {
-    let mut command = tokio::process::Command::new(glab);
+    let mut command =
+        super::host::constrained_command(glab, host).expect("host validated by check_host");
     command
         .args(["auth", "status", "--hostname", host])
         .stdout(Stdio::null())
@@ -117,7 +118,8 @@ async fn check_with_program(glab: &std::path::Path, host: &str, timeout: Duratio
         Ok(_) => return AuthState::failed(host, AuthIssue::Unverified),
         Err(_) => return AuthState::failed(host, AuthIssue::TimedOut),
     }
-    let mut command = tokio::process::Command::new(glab);
+    let mut command =
+        super::host::constrained_command(glab, host).expect("host validated by check_host");
     command
         .args(["api", "--hostname", host, "version"])
         .stdout(Stdio::null())
