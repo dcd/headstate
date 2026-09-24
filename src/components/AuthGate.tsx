@@ -8,12 +8,14 @@ import { IS_MOBILE_BUILD } from "@/lib/target";
 import { dismissSplash } from "../splash";
 import { commandError } from "@/lib/errorKind";
 import { GitHubAuthProvider } from "@/api/authAvailability";
+import { useSourceSelection } from "@/store/sourceSelection";
 
 /// Reports provider authentication without hiding local views. GitHub's
 /// startup state and GitLab.com's bounded CLI check have separate queries.
 /// On an offline phone, the desktop's auth is unknown and cached views
 /// remain available.
 export function AuthGate({ children }: { children: ReactNode }) {
+  const selection = useSourceSelection((s) => s.selection);
   const { data, isLoading } = useQuery({
     queryKey: ["auth"],
     queryFn: getAuthState,
@@ -128,7 +130,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
   if (data !== undefined) {
     return (
       <GitHubAuthProvider available={data.ok}>
-        {!data.ok && (
+        {!data.ok && selection !== "gitlab" && (
           <div role="status" className="border-b border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]">
             <span>GitHub is unavailable: {data.message}</span>
             <span className="ml-1">On the desktop, install gh and run <code>gh auth login</code> to enable GitHub.</span>
@@ -164,7 +166,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
             </button>
           </div>
         )}
-        {pollError !== null && (
+        {pollError !== null && selection !== "gitlab" && (
           <div
             // #1124: a poll the app DECLINED to issue is not a failed
             // refresh. The banner said "Background refresh failed" and

@@ -46,6 +46,7 @@ import { WorktreesPage } from "./components/WorktreesPage";
 import { QueryError, errorMessage } from "./components/QueryError";
 import { ViewErrorBoundary } from "./components/ViewErrorBoundary";
 import { RepoSidebar } from "./components/RepoSidebar";
+import { ViewSwitcher } from "./components/ViewSwitcher";
 import { StatsSidebar } from "./components/StatsSidebar";
 import { StatusBar } from "./components/StatusBar";
 import { SystemHealthSidebar } from "./components/SystemHealthSidebar";
@@ -62,6 +63,10 @@ import { activeRowCursor, nextCursor, type RowCursorTarget } from "./lib/rowCurs
 import { useIsMobile } from "./lib/useIsMobile";
 import { relativeSeconds } from "./lib/time";
 import { useGitHubAuthAvailable } from "./api/authAvailability";
+import { setSourceSelection } from "./api/tauri";
+import { useGitLabQueue } from "./api/gitlabQueues";
+import { useSourceSelection } from "./store/sourceSelection";
+import { GitLabSummary, SourceQueue, SourceRepoSidebar } from "./components/SourceQueue";
 import { MOBILE_HIDDEN_VIEWS, useActiveFilters, useFilters, viewLabel } from "./store/filters";
 
 /// The chart-carrying views, split off the launch chunk (#838, #921).
@@ -258,6 +263,18 @@ function ViewLoading() {
 /// `get_auth_state` query and one `usePollError` subscription (and
 /// therefore one error banner) per window.
 export default function App() {
+  const selection = useSourceSelection((s) => s.selection);
+  const setSelection = useSourceSelection((s) => s.setSelection);
+  const githubEnabled = selection !== "gitlab";
+  const gitlabEnabled = selection !== "github";
+  const [sourceSelectionError, setSourceSelectionError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!IS_DESKTOP_BUILD) return;
+    void setSourceSelection(selection).then(
+      () => setSourceSelectionError(null),
+      (error: unknown) => setSourceSelectionError(error instanceof Error ? error.message : String(error)),
+    );
+  }, [selection]);
   const githubAuthAvailable = useGitHubAuthAvailable();
   const {
     data: prs = [],
@@ -266,12 +283,13 @@ export default function App() {
     error,
     refetch,
     dataUpdatedAt,
-  } = usePullRequests();
+  } = usePullRequests(githubEnabled);
   const filters = useActiveFilters();
   const {
     view: storedView,
     selectedPr,
     selectPr,
+    clearChecked,
     applyPreset,
     // Which of the Claude Code view's two pages is showing. Read here
     // rather than inside a page because the SPLIT is the route: sessions
@@ -360,7 +378,15 @@ export default function App() {
   // does it: invalidating `["prs"]` re-reads the SQLite snapshot the
   // poll loop just wrote, so the user would see the rows they were
   // already looking at. Pull to refresh has to mean "ask GitHub now".
-  const refreshFromGesture = useRefreshFromGesture();
+  const refreshGitHubFromGesture = useRefreshFromGesture();
+  const gitlabAuthored = useGitLabQueue("authored", gitlabEnabled);
+  const gitlabReviewing = useGitLabQueue("reviewing", gitlabEnabled);
+  const refreshFromGesture = async () => {
+    await Promise.all([
+      ...(githubEnabled ? [refreshGitHubFromGesture()] : []),
+      ...(gitlabEnabled ? [gitlabAuthored.refresh(), gitlabReviewing.refresh()] : []),
+    ]);
+  };
   const pull = usePullToRefresh(mainRef, refreshFromGesture, IS_MOBILE_BUILD);
   // Publishes the app header's measured height onto `<main>` as
   // `--app-header-h`, which is what the stickies below it use as `top`.
@@ -378,7 +404,7 @@ export default function App() {
 
   // The tray's "Refresh now" menu item only emits `refresh-requested`; this
   // is what actually makes it do anything (see the hook's own comment).
-  useRefreshRequested();
+  useRefreshRequested(githubEnabled);
   useViewCadence(view);
   const truncatedTotal = useTruncation();
   const refusedFields = useIncomplete();
@@ -400,7 +426,7 @@ export default function App() {
   // the time anyone reaches To review -- so switching there showed an
   // empty list with no indication anything was happening, for as long
   // as the request took.
-  const reviewingQuery = useReviewing(view === "to-review");
+  const reviewingQuery = useReviewing(view === "to-review" && githubEnabled);
   const {
     data: reviewing = [],
     isLoading: reviewingLoading,
@@ -418,7 +444,7 @@ export default function App() {
     fetchStatus: reviewingQuery.fetchStatus,
     count: reviewingQuery.data?.length,
   });
-  const { data: reviewingCount = 0 } = useReviewingCount();
+  const { data: reviewingCount = 0 } = useReviewingCount(githubEnabled);
 
   // The app had no keyboard affordances at all. These three need no
   // backend change: `refresh-requested` already exists and the window
@@ -436,6 +462,12 @@ export default function App() {
   // sidebar counts, filters, the strip -- reads this rather than `prs`,
   // so the two views share every component instead of duplicating them.
   const source = view === "to-review" ? reviewing : prs;
+  const gitlabQueue = view === "to-review" ? gitlabReviewing : gitlabAuthored;
+  const githubCoverage = view === "to-review"
+    ? reviewShortfall === null ? "unknown" as const : reviewShortfall > 0
+      ? { partial: { total: source.length + reviewShortfall } } : "complete" as const
+    : truncatedTotal == null ? "unknown" as const : truncatedTotal > source.length
+      ? { partial: { total: truncatedTotal } } : "complete" as const;
   const visible = sortPrs(applyFilters(source, filters), filters.sort);
 
   // A cursor past the end of a newly-filtered list points at nothing.
@@ -662,12 +694,15 @@ export default function App() {
       // organisation or a person -- so #823's second audience ("how is
       // my team doing?") had nowhere to be asked from. This one is
       // sourced from GitHub and consults nothing on disk.
-      <StatsSidebar viewCounts={{ "to-review": reviewingCount }} />
+      selection === "gitlab" ? (
+        <nav className="flex w-64 shrink-0 flex-col border-r border-[#30363d] p-3"><ViewSwitcher /></nav>
+      ) : <StatsSidebar viewCounts={{ "to-review": reviewingCount }} />
     ) : (
       // My PRs, and any future view that falls through. The repo rows
       // are a live filter here -- this is the view they were always
       // about.
-      <RepoSidebar prs={source} viewCounts={{ "to-review": reviewingCount }} />
+      selection === "github" ? <RepoSidebar prs={source} viewCounts={{ "to-review": reviewingCount }} />
+        : <SourceRepoSidebar github={source} gitlab={gitlabQueue.rows ?? []} selection={selection} />
     );
 
   return (
@@ -676,6 +711,7 @@ export default function App() {
           desktop the whole screen is describing. Renders nothing on
           the desktop itself. */}
       <ConnectionBanner updatedAt={dataUpdatedAt} githubAuthAvailable={githubAuthAvailable} />
+      {sourceSelectionError ? <p role="alert" className="border-b border-[#d29922]/40 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]">The source choice could not be saved: {sourceSelectionError}</p> : null}
       {/* Below the banner and above everything else: the banner says
           which desktop, this says the rows underneath may be old. The
           banner alone was not enough -- it is one line that scrolls out
@@ -749,6 +785,25 @@ export default function App() {
               "Pull requests" -- which is what the chain's default arm
               did. */}
           <h1 className="text-sm font-semibold">{viewLabel(view)}</h1>
+          {(view === "my-prs" || view === "to-review" || view === "pr-stats") ? (
+            <label className="ml-3 flex items-center gap-2 text-xs text-[#8b949e]">
+              Source
+              <select
+                aria-label="Source"
+                value={selection}
+                onChange={(event) => {
+                  setSelection(event.target.value as "github" | "gitlab" | "both");
+                  selectPr(null);
+                  clearChecked();
+                }}
+                className="rounded border border-[#30363d] bg-[#161b22] px-2 py-1 text-sm text-[#e6edf3]"
+              >
+                <option value="github">GitHub</option>
+                <option value="gitlab">GitLab</option>
+                <option value="both">Both</option>
+              </select>
+            </label>
+          ) : null}
           <div className="ml-auto">
             {/* My pull requests ONLY. The wizard composes a nudge for
                 pull requests YOU authored, so it means nothing on
@@ -814,11 +869,14 @@ export default function App() {
         view !== "claude-code" &&
         view !== "system-health" ? (
           <div className="p-4">
-            <PrDetailView
+            {selectedPr.source?.provider === "gitlab" ? <GitLabSummary
+              mr={[...(gitlabAuthored.rows ?? []), ...(gitlabReviewing.rows ?? [])].find((mr) => prKey(mr) === prKey(selectedPr))}
+              onBack={() => selectPr(null)}
+            /> : <PrDetailView
               repo={selectedPr.repo}
               number={selectedPr.number}
               onBack={() => selectPr(null)}
-            />
+            />}
           </div>
         ) : view === "claude-md" ? (
           <ClaudeMdPage />
@@ -949,9 +1007,29 @@ export default function App() {
             {/* Suspense because the page is now a lazy chunk (#838); see
                 the `SystemHealthPage` branch above for why the boundary
                 sits inside the padded wrapper. */}
-            <Suspense fallback={<ViewLoading />}>
-              <StatsPage />
-            </Suspense>
+            {selection === "gitlab" ? <p className="rounded-md border border-[#30363d] p-4 text-sm text-[#8b949e]">GitLab PR Stats are not available yet.</p> : <>
+              {selection === "both" ? <p className="mb-3 text-sm text-[#8b949e]">GitHub stats only. GitLab stats are separate and not available yet.</p> : null}
+              <Suspense fallback={<ViewLoading />}><StatsPage /></Suspense>
+            </>}
+          </div>
+        ) : selection !== "github" ? (
+          <div className="p-4">
+            <SourceQueue
+              selection={selection}
+              github={source}
+              gitlab={gitlabQueue.rows}
+              githubLoading={view === "to-review" ? reviewingLoading : isLoading}
+              gitlabLoading={gitlabQueue.loading}
+              githubError={view === "to-review" ? (reviewingError ? errorMessage(reviewingErr) ?? "Could not refresh GitHub" : null) : (isError ? errorMessage(error) ?? "Could not refresh GitHub" : pollError ?? null)}
+              gitlabError={gitlabQueue.error}
+              githubCoverage={githubCoverage}
+              gitlabCoverage={gitlabQueue.coverage}
+              gitlabStaleSecs={gitlabQueue.staleSecs}
+              canWriteGitHub={view === "my-prs"}
+              onOpen={selectPr}
+              onRefreshGitHub={() => void (view === "to-review" ? refetchReviewing() : refetch())}
+              onRefreshGitLab={() => void gitlabQueue.refresh()}
+            />
           </div>
         ) : (
           <div className="p-4">

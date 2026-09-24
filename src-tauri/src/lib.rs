@@ -292,6 +292,10 @@ pub fn run() {
             commands::background_health,
             commands::tool_versions,
             commands::get_gitlab_auth_state,
+            commands::get_source_snapshot,
+            commands::get_source_poll_status,
+            commands::refresh_source,
+            commands::set_source_selection,
             commands::read_log_tail,
             commands::reveal_log,
             commands::pull_checkout,
@@ -549,6 +553,12 @@ pub fn run() {
             // Starts true: the app opens on a PR view.
             let needs_gh = Arc::new(AtomicBool::new(true));
             app.manage(poll::ViewNeedsGithub(needs_gh.clone()));
+            let github_source_enabled = Arc::new(AtomicBool::new(
+                store::open_db(&commands::db_path(&handle)).ok()
+                    .and_then(|c| store::settings::get::<String>(&c, store::settings::keys::SOURCE_SELECTION).ok().flatten())
+                    .as_deref() != Some("gitlab"),
+            ));
+            app.manage(poll::GithubSourceEnabled(github_source_enabled.clone()));
             // Which repositories have a background update run going,
             // and how the last one ended. Default-constructed: it is
             // empty until someone starts a run.
@@ -1019,7 +1029,7 @@ pub fn run() {
                 poll::spawn_backfill(handle.clone(), client.clone());
                 let focused = Arc::new(AtomicBool::new(true));
                 app.manage(Focused(focused.clone()));
-                poll::spawn(handle, client, focused, waker, interval, needs_gh);
+                poll::spawn(handle, client, focused, waker, interval, needs_gh, github_source_enabled);
             }
 
             tray::setup_tray(&app.handle().clone())?;

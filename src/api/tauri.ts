@@ -12,6 +12,8 @@
 /// `invoke`; see `transport.ts`.
 
 import { call } from "./transport";
+import type { Source } from "../types/identity";
+import type { MergeRequest } from "../types/gitlab";
 import type {
   ClaudeMdAdviceMode,
   ClaudeMdAdviceResult,
@@ -93,6 +95,30 @@ export interface GitLabAuthState {
 /// nothing has ever been polled and when auth failed at startup -- callers
 /// must consult `getAuthState` to tell those apart.
 export const getCached = () => call<PullRequest[]>("get_cached");
+
+export type SourceList = "authored" | "reviewing";
+export type SourceCoverage = "complete" | "unknown" | { partial: { total: number | null } };
+export type SourceSnapshot = {
+  source: Source;
+  list: SourceList;
+  data:
+    | { state: "missing" | "unreadable" }
+    | { state: "available"; prs: PullRequest[]; fetched_at: string; stale_secs: number | null; coverage: SourceCoverage }
+    | { state: "git_lab_available"; mrs: MergeRequest[]; fetched_at: string; stale_secs: number | null; coverage: SourceCoverage };
+};
+export type SourceRefreshResult = {
+  source: Source;
+  list: SourceList;
+  prs: PullRequest[] | null;
+  mrs: MergeRequest[] | null;
+  coverage: SourceCoverage;
+};
+export const getSourceSnapshot = (source: Source, list: SourceList) =>
+  call<SourceSnapshot>("get_source_snapshot", { source, list });
+export const refreshSelectedSource = (source: Source, list: SourceList) =>
+  call<SourceRefreshResult>("refresh_source", { source, list });
+export const setSourceSelection = (selection: "github" | "gitlab" | "both") =>
+  call<void>("set_source_selection", { selection });
 
 /// A user-initiated, out-of-band fetch. Does not persist to SQLite and does
 /// not affect the poll loop's cadence.

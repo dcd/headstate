@@ -1074,6 +1074,7 @@ pub struct PollInterval(pub Arc<AtomicU64>);
 /// on another view, and the badge staying honest is the stated reason
 /// polling lives in Rust at all.
 pub struct ViewNeedsGithub(pub Arc<AtomicBool>);
+pub struct GithubSourceEnabled(pub Arc<AtomicBool>);
 
 /// How many consecutive transient failures before the banner appears.
 ///
@@ -1123,6 +1124,7 @@ pub fn spawn(
     waker: Arc<Notify>,
     interval_secs: Arc<AtomicU64>,
     view_needs_github: Arc<AtomicBool>,
+    github_source_enabled: Arc<AtomicBool>,
 ) {
     tauri::async_runtime::spawn(async move {
         let mut previous: Vec<PullRequest> = Vec::new();
@@ -1148,6 +1150,12 @@ pub fn spawn(
         // `should_surface`.
         let mut consecutive_failures: u32 = 0;
         loop {
+            if !github_source_enabled.load(Ordering::Relaxed) {
+                // Source selection pauses GitHub network work, including the
+                // initial tick after a relaunch. Switching back wakes us.
+                waker.notified().await;
+                continue;
+            }
             // `timeout` collapses a hang into the Err arm the loop already
             // handles, so a wedged request costs one tick instead of the
             // rest of the session.
