@@ -494,6 +494,108 @@ mod tests {
         }
     }
 
+    fn gitlab_mr(source: &Source) -> crate::gitlab::queues::MergeRequest {
+        serde_json::from_value(serde_json::json!({
+            "source": source, "id": 17, "number": 7, "title": "fixture",
+            "url": format!("https://{}/group/subgroup/project/-/merge_requests/7", source.host),
+            "repo": "group/subgroup/project", "author": "fixture", "is_draft": true,
+            "head_ref": "topic", "base_ref": "main",
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+            "labels": [], "reviewers": [], "assignees": [], "comment_count": 0,
+            "detailed_merge_status": "draft_status", "ci": null,
+            "review": null, "unresolved_threads": null
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn background_gitlab_pages_survive_a_newer_pending_then_failed_foreground_request() {
+        let polls = SourcePolls::default();
+        let source = Source {
+            provider: Provider::Gitlab,
+            host: "gitlab.com".into(),
+        };
+        let (background, _) = polls
+            .begin_attempt(source.clone(), CachedList::Authored)
+            .await;
+        let foreground = polls
+            .begin_and_emit(
+                source.clone(),
+                CachedList::Authored,
+                Some("foreground".into()),
+                |_| {},
+            )
+            .await;
+        let published = polls.success_publication(&background).await.unwrap();
+        polls.complete_gitlab(
+            published,
+            Ok(crate::gitlab::queues::FetchedList {
+                mrs: vec![gitlab_mr(&source)],
+                total: None,
+                coverage: Coverage::Partial { total: None },
+            }),
+            |status| {
+                assert_eq!(status.phase, Phase::Fetching);
+                assert_eq!(status.request_id.as_deref(), Some("foreground"));
+                assert_eq!(status.coverage, Some(Coverage::Partial { total: None }));
+                assert!(status.receipt_revision.is_some());
+            },
+        );
+        let receipt_at = polls.get(&source, CachedList::Authored).last_received_at;
+        let published = polls.publication(&foreground).await.unwrap();
+        polls.complete_gitlab(published, Err(failure()), |_| {});
+        let snapshot = polls.snapshot(&source, CachedList::Authored).await;
+        assert_eq!(snapshot.status.phase, Phase::Retrying);
+        assert_eq!(snapshot.status.last_received_at, receipt_at);
+        assert_eq!(
+            snapshot.status.coverage,
+            Some(Coverage::Partial { total: None })
+        );
+        assert_eq!(snapshot.mrs, Some(vec![gitlab_mr(&source)]));
+        assert!(snapshot.prs.is_none());
+    }
+
+    #[tokio::test]
+    async fn newer_gitlab_foreground_success_rejects_old_background_publication_only_for_its_key() {
+        let polls = SourcePolls::default();
+        let source = Source {
+            provider: Provider::Gitlab,
+            host: "gitlab.com".into(),
+        };
+        let (background, _) = polls
+            .begin_attempt(source.clone(), CachedList::Authored)
+            .await;
+        let (reviewing, _) = polls
+            .begin_attempt(source.clone(), CachedList::Reviewing)
+            .await;
+        let (other_host, _) = polls
+            .begin_attempt(
+                Source {
+                    host: "gitlab.example".into(),
+                    ..source.clone()
+                },
+                CachedList::Authored,
+            )
+            .await;
+        let (foreground, _) = polls.begin_attempt(source, CachedList::Authored).await;
+        let receipt = crate::gitlab::queues::FetchedList {
+            mrs: vec![],
+            total: Some(0),
+            coverage: Coverage::Complete,
+        };
+        let publication = polls.success_publication(&foreground).await.unwrap();
+        polls.complete_gitlab(publication, Ok(receipt.clone()), |_| {});
+        assert!(polls.success_publication(&background).await.is_none());
+        assert_eq!(
+            polls
+                .winner_gitlab(&background, Err("older failed".into()))
+                .unwrap(),
+            receipt
+        );
+        assert!(polls.success_publication(&reviewing).await.is_some());
+        assert!(polls.success_publication(&other_host).await.is_some());
+    }
+
     #[tokio::test]
     async fn gitlab_receipt_has_its_own_rows_and_partial_coverage() {
         let polls = SourcePolls::default();
@@ -504,19 +606,8 @@ mod tests {
         let (attempt, _) = polls
             .begin_attempt(source.clone(), CachedList::Authored)
             .await;
-        let mr = serde_json::from_value(serde_json::json!({
-            "source": source, "id": 17, "number": 7, "title": "fixture",
-            "url": "https://gitlab.com/group/subgroup/project/-/merge_requests/7",
-            "repo": "group/subgroup/project", "author": "fixture", "is_draft": true,
-            "head_ref": "topic", "base_ref": "main",
-            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
-            "labels": [], "reviewers": [], "assignees": [], "comment_count": 0,
-            "detailed_merge_status": "draft_status", "ci": null,
-            "review": null, "unresolved_threads": null
-        }))
-        .unwrap();
         let receipt = crate::gitlab::queues::FetchedList {
-            mrs: vec![mr],
+            mrs: vec![gitlab_mr(&source)],
             total: Some(2),
             coverage: Coverage::Partial { total: Some(2) },
         };
