@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import type { PullRequest } from "../types/pr";
 import type { MergeRequest } from "../types/gitlab";
 import type { PrIdentity } from "../types/identity";
@@ -15,6 +16,7 @@ import { useFilters } from "../store/filters";
 import { useRowCursor } from "../lib/useRowCursor";
 import { GitLabDetail } from "./GitLabDetail";
 import { GitLabBulkActions } from "./GitLabBulkActions";
+import { getGitLabDetail } from "../api/tauri";
 
 type Row = { kind: "github"; value: PullRequest } | { kind: "gitlab"; value: MergeRequest };
 
@@ -93,18 +95,25 @@ function GitLabRow({ mr, onOpen, opened, cursored }: { mr: MergeRequest; onOpen:
 }
 
 export function GitLabSummary({ identity, mr, onBack }: { identity: PrIdentity; mr?: MergeRequest; onBack: () => void }) {
+  // Closing removes the MR from the open queue. Share the detail query with
+  // GitLabDetail so its title and link survive that queue change and follow
+  // the authoritative readback after reopen.
+  const detail = useQuery({ queryKey: ["gitlab-detail", prKey(identity)], queryFn: () => getGitLabDetail(identity), retry: false });
+  const core = detail.data?.core;
+  const title = core?.title ?? mr?.title;
+  const url = core?.url ?? mr?.url;
   return (
     <div className="rounded-md border border-[#30363d] bg-[#161b22] p-4">
       <button type="button" onClick={onBack} className="mb-3 text-sm text-[#4493f8]">← Back to list</button>
       <div className="text-xs text-[#8b949e]">GitLab · {identity.source?.host} · {identity.repo} !{identity.number}</div>
-      {mr ? <>
-        <h2 className="mt-1 text-lg font-semibold">{mr.title}</h2>
-        <p className="mt-2 text-sm text-[#8b949e]">{mr.author} · {mr.head_ref} → {mr.base_ref}{mr.is_draft ? " · Draft" : ""}</p>
+      {title ? <>
+        <h2 className="mt-1 text-lg font-semibold">{title}</h2>
+        <p className="mt-2 text-sm text-[#8b949e]">{core?.author ?? mr?.author ?? "Unknown author"} · {core?.head_ref ?? mr?.head_ref} → {core?.base_ref ?? mr?.base_ref}{(core?.is_draft ?? mr?.is_draft) ? " · Draft" : ""}</p>
       </> : null}
       {/* The open queue may omit a selected MR after a close or partial poll.
           Identity keeps detail, drafts and action receipts mounted until Back. */}
       <GitLabDetail key={prKey(identity)} identity={identity} />
-      {mr ? <ExternalLink href={mr.url} className="mt-3 inline-block text-sm text-[#4493f8] hover:underline">Open on GitLab</ExternalLink> : null}
+      {url ? <ExternalLink href={url} className="mt-3 inline-block text-sm text-[#4493f8] hover:underline">Open on GitLab</ExternalLink> : null}
     </div>
   );
 }

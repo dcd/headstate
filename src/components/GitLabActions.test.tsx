@@ -152,6 +152,8 @@ it("keeps the selected detail draft and action receipt after the open queue drop
   const comment = await screen.findByLabelText("MR comment");
   fireEvent.change(comment, { target: { value: "Keep this unsent draft" } });
   view.rerender(summary(false));
+  expect(screen.getByRole("heading", { name: "A change" })).toBeTruthy();
+  expect(screen.getByText("Open on GitLab")).toBeTruthy();
   expect((screen.getByLabelText("MR comment") as HTMLTextAreaElement).value).toBe("Keep this unsent draft");
   fireEvent.click(screen.getByRole("button", { name: "Close MR" }));
   fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
