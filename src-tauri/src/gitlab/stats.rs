@@ -2,6 +2,7 @@
 //! answer, including after persistence. A reviewer assignment is not a review.
 mod activity;
 mod history;
+mod review_evidence;
 
 use crate::identity::{Provider, Source};
 use chrono::{DateTime, Utc};
@@ -142,6 +143,8 @@ pub struct Report {
     pub merged_error: Option<String>,
     #[serde(default)]
     pub activity: Option<activity::Activity>,
+    #[serde(default)]
+    pub review_evidence: Option<review_evidence::ReviewEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -494,7 +497,11 @@ pub async fn tree(host: &str) -> Result<Tree, String> {
         match pages(
             &program,
             host,
-            "groups?all_available=true&order_by=id&sort=asc",
+            // all_available=true scans every accessible group on GitLab.com;
+            // it can return HTTP 500 after our request deadline. Member groups
+            // are the scopes this account can act on, and project namespaces
+            // still supply groups reached through project membership.
+            "groups?all_available=false&order_by=id&sort=asc",
             BUDGET.saturating_sub(started.elapsed()),
         )
         .await
@@ -681,6 +688,7 @@ fn summarize(
         merged_window: None,
         merged_error: None,
         activity: None,
+        review_evidence: None,
     }
 }
 
@@ -800,6 +808,22 @@ async fn load_window(
         .is_some_and(|m| m.coverage.rate_limited());
     report.activity = Some(
         activity::load(
+            program,
+            &report,
+            if limited {
+                Duration::ZERO
+            } else {
+                BUDGET.saturating_sub(started.elapsed())
+            },
+        )
+        .await,
+    );
+    limited |= report
+        .activity
+        .as_ref()
+        .is_some_and(|a| a.rate_remaining == Some(0));
+    report.review_evidence = Some(
+        review_evidence::load(
             program,
             &report,
             if limited {

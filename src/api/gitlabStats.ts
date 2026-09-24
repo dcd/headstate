@@ -46,6 +46,14 @@ export interface GitLabStatsReport {
     mean_first_response_hours: number | null; responded_mrs: number;
     failures: string[]; rate_remaining: number | null; rate_reset: number | null;
   } | null;
+  review_evidence?: {
+    mrs_total: number; approvals_checked: number; changes_checked: number;
+    approvals_complete: boolean; changes_complete: boolean;
+    current_approvals: number | null; current_change_requests: number | null;
+    mean_first_current_approval_hours: number | null; timed_approved_mrs: number;
+    reviewers: { username: string; approvals: number; change_requests: number }[];
+    failures: string[]; rate_remaining: number | null; rate_reset: number | null;
+  } | null;
   history: { source: Source; project: string; iid: number; title: string; url: string; author: string; state: string; created_at: string; merged_at: string | null }[];
 }
 export function useGitLabStatsTree(host: string, revision: number) {

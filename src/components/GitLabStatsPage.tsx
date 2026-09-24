@@ -23,7 +23,7 @@ export function GitLabStatsResults({ report }: { report: GitLabStatsReport }) {
         <h3>Authors of merged MRs</h3><ul>{report.merged_window.authors.map(author => <li key={author.username}>{author.username}: {qualified(author.merged, report.merged_window!.coverage.complete)} merged; mean creation to merge: {report.merged_window!.coverage.complete && author.mean_merge_hours !== null ? `${author.mean_merge_hours.toFixed(1)} hours` : "Unavailable"}</li>)}</ul>
       </> : <p>Merged-in-window data unavailable{report.merged_error ? `: ${report.merged_error}` : "."}</p>}
     </section>
-    <section><h2 className="font-semibold">Comment participation in the created cohort</h2><p className="text-sm text-muted-foreground">Non-author, non-system comments through the snapshot end. Comments may include bots; approvals, changes requested, and formal review outcomes are unavailable. At most 10 MRs and 100 notes per MR are read per load.</p>
+    <section><h2 className="font-semibold">Comment participation in the created cohort</h2><p className="text-sm text-muted-foreground">Non-author, non-system comments through the snapshot end. Comments may include bots. At most 10 MRs and 100 notes per MR are read per load.</p>
       {report.activity ? <>
         <p>{report.activity.mrs_checked} of {report.activity.mrs_total} retrieved MRs have complete comment reads. {report.activity.comments === null ? "Unavailable" : qualified(report.activity.comments, report.activity.complete)} comments.</p>
         <p>Mean first response among MRs with a response: {report.activity.complete && report.activity.mean_first_response_hours !== null ? `${report.activity.mean_first_response_hours.toFixed(1)} hours (${report.activity.responded_mrs} MRs)` : "Unavailable"}</p>
@@ -31,6 +31,16 @@ export function GitLabStatsResults({ report }: { report: GitLabStatsReport }) {
         {report.activity.failures.map((failure, index) => <p role="status" key={index}>{failure}</p>)}
         <ul>{report.activity.participants.map(person => <li key={person.username}>{person.username}: {qualified(person.comments, report.activity!.complete)} comments on {qualified(person.mrs, report.activity!.complete)} MRs</li>)}</ul>
       </> : <p>Comment activity and response times unavailable.</p>}
+    </section>
+    <section><h2 className="font-semibold">Current formal review outcomes</h2>
+      <p className="text-sm text-muted-foreground">Current approval and reviewer states for up to 10 retrieved MRs. These are a snapshot, not a history of review actions. GitLab does not provide the time of the first submitted review through these endpoints.</p>
+      {report.review_evidence ? <>
+        <p>{report.review_evidence.approvals_checked} of {report.review_evidence.mrs_total} MRs checked for approvals; {report.review_evidence.current_approvals === null ? "Unavailable" : qualified(report.review_evidence.current_approvals, report.review_evidence.approvals_complete)} current approvals.</p>
+        <p>{report.review_evidence.changes_checked} of {report.review_evidence.mrs_total} MRs checked for change requests; {report.review_evidence.current_change_requests === null ? "Unavailable" : qualified(report.review_evidence.current_change_requests, report.review_evidence.changes_complete)} current change requests.</p>
+        <p>Mean time to first current approval among approved MRs: {report.review_evidence.mean_first_current_approval_hours === null ? "Unavailable" : `${report.review_evidence.mean_first_current_approval_hours.toFixed(1)} hours (${report.review_evidence.timed_approved_mrs} MRs)`}. First formal review: Unavailable.</p>
+        {report.review_evidence.failures.map((failure, index) => <p role="status" key={index}>{failure}</p>)}
+        <ul>{report.review_evidence.reviewers.map(person => <li key={person.username}>{person.username}: {qualified(person.approvals, report.review_evidence!.approvals_complete)} current approvals; {qualified(person.change_requests, report.review_evidence!.changes_complete)} current change requests</li>)}</ul>
+      </> : <p>Current formal review outcomes unavailable.</p>}
     </section>
     <section><h2 className="font-semibold">MR history in this window</h2><ul className="space-y-2 text-sm">{report.history.map(mr => <li key={JSON.stringify([mr.source.provider, mr.source.host, mr.project, mr.iid])}><span className="font-medium">{mr.project}!{mr.iid}</span> — {mr.title} <span className="text-muted-foreground">({mr.state}; {mr.source.host})</span></li>)}</ul></section>
   </div>;
