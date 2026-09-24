@@ -65,6 +65,7 @@ import { relativeSeconds } from "./lib/time";
 import { useGitHubAuthAvailable } from "./api/authAvailability";
 import { setSourceSelection } from "./api/tauri";
 import { useGitLabQueue } from "./api/gitlabQueues";
+import { useSourceRefresh } from "./api/sourceRefreshHooks";
 import { useSourceSelection } from "./store/sourceSelection";
 import { GitLabSummary, SourceQueue, SourceRepoSidebar } from "./components/SourceQueue";
 import { MOBILE_HIDDEN_VIEWS, useActiveFilters, useFilters, viewLabel } from "./store/filters";
@@ -463,11 +464,8 @@ export default function App() {
   // so the two views share every component instead of duplicating them.
   const source = view === "to-review" ? reviewing : prs;
   const gitlabQueue = view === "to-review" ? gitlabReviewing : gitlabAuthored;
-  const githubCoverage = view === "to-review"
-    ? reviewShortfall === null ? "unknown" as const : reviewShortfall > 0
-      ? { partial: { total: source.length + reviewShortfall } } : "complete" as const
-    : truncatedTotal == null ? "unknown" as const : truncatedTotal > source.length
-      ? { partial: { total: truncatedTotal } } : "complete" as const;
+  const githubReceipt = useSourceRefresh(view === "to-review" ? "reviewing" : "authored");
+  const githubCoverage = githubReceipt.coverage ?? "unknown";
   const visible = sortPrs(applyFilters(source, filters), filters.sort);
 
   // A cursor past the end of a newly-filtered list points at nothing.
