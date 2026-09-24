@@ -1,5 +1,5 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { call } from "./transport";
+import { gitlabStatsTree, gitlabStatsLoad, gitlabStatsBackfill } from "./tauri";
 import type { Source } from "../types/identity";
 
 export type GitLabScope = { kind: "mine" } | { kind: "project" | "group" | "person"; path: string };
@@ -12,7 +12,7 @@ interface Coverage {
   rate_remaining: number | null;
   rate_reset: number | null;
 }
-interface Tree {
+export interface GitLabStatsTree {
   source: Source;
   viewer: string;
   projects: { path: string; namespace: string }[];
@@ -49,13 +49,13 @@ export interface GitLabStatsReport {
   history: { source: Source; project: string; iid: number; title: string; url: string; author: string; state: string; created_at: string; merged_at: string | null }[];
 }
 export function useGitLabStatsTree(host: string, revision: number) {
-  return useQuery({ queryKey: ["stats", "gitlab", host, "tree", revision], queryFn: () => call<Tree>("gitlab_stats_tree", { host }), staleTime: 0, gcTime: 0, retry: false });
+  return useQuery({ queryKey: ["stats", "gitlab", host, "tree", revision], queryFn: () => gitlabStatsTree(host), staleTime: 0, gcTime: 0, retry: false });
 }
 export function useGitLabStats(host: string, viewer: string | undefined, scope: GitLabScope, days: number) {
   return useQuery({
     queryKey: ["stats", "gitlab", host, viewer, scope, days],
     queryFn: async () => {
-      const report = await call<GitLabStatsReport>("gitlab_stats_load", { host, scope, days, refresh: true });
+      const report = await gitlabStatsLoad(host, scope, days, true);
       // glab credentials can change between discovery and this request. Never
       // put the new account's result into the previous account's query key.
       if (report.viewer !== viewer || report.source.provider !== "gitlab" || report.source.host !== host) {
@@ -67,14 +67,14 @@ export function useGitLabStats(host: string, viewer: string | undefined, scope: 
   });
 }
 
-interface GitLabBackfill {
+export interface GitLabBackfill {
   source: Source; viewer: string; scope: GitLabScope; requested_days: number;
   complete_days: number; attempted_days: number; slices: (Pick<GitLabStatsReport, "start" | "fetched_at" | "counts" | "coverage"> & { merged_window: Pick<NonNullable<GitLabStatsReport["merged_window"]>, "count" | "coverage" | "fetched_at"> | null })[]; error: string | null;
 }
 export function useGitLabBackfill(host: string, viewer: string, scope: GitLabScope, days: number) {
   return useMutation({
     mutationFn: async () => {
-      const result = await call<GitLabBackfill>("gitlab_stats_backfill", { host, scope, days });
+      const result = await gitlabStatsBackfill(host, scope, days);
       if (result.viewer !== viewer || result.source.host !== host || result.source.provider !== "gitlab") {
         throw new Error("GitLab account changed while loading history. Refresh to reload the account and scopes.");
       }

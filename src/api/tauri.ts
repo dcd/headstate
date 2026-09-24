@@ -12,6 +12,7 @@
 /// `invoke`; see `transport.ts`.
 
 import { call } from "./transport";
+import type { GitLabScope, GitLabStatsTree, GitLabStatsReport, GitLabBackfill } from "./gitlabStats";
 import type { Source } from "../types/identity";
 import type { MergeRequest } from "../types/gitlab";
 import type {
@@ -325,6 +326,10 @@ export const getStats = () => call<Stats>("get_stats");
 /// Sourced from GitHub, never from a local checkout. Carries NO statistics --
 /// two requests, 2 rate-limit points total, measured -- because discovery is
 /// cheap and measurement waits for a click (`hooks.ts:712-717`).
+export const gitlabStatsTree = (host: string) => call<GitLabStatsTree>("gitlab_stats_tree", { host });
+export const gitlabStatsLoad = (host: string, scope: GitLabScope, days: number, refresh: boolean) => call<GitLabStatsReport>("gitlab_stats_load", { host, scope, days, refresh });
+export const gitlabStatsBackfill = (host: string, scope: GitLabScope, days: number) => call<GitLabBackfill>("gitlab_stats_backfill", { host, scope, days });
+
 export const statsTree = () => call<StatsTree>("stats_tree");
 
 /// A COMPLETE count of pull requests for one subject and scope (#824).

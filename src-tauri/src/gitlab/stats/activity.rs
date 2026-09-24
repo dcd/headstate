@@ -84,7 +84,7 @@ pub(super) async fn load(program: &Path, report: &Report, budget: Duration) -> A
         if let Some(first) = first {
             times.push((first - mr.created_at).num_seconds() as f64 / 3600.0);
         }
-        if coverage.rate_remaining == Some(0) {
+        if coverage.rate_limited() {
             result
                 .failures
                 .push("GitLab rate limit reached while reading comments".into());

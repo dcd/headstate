@@ -53,6 +53,43 @@ pub struct HistoryReceipt {
     pub error: Option<String>,
 }
 
+impl HistoryReceipt {
+    /// Keep useful cohorts from a prior receipt. Called under the SQLite write
+    /// transaction as well as after a read failure, so stale callers cannot
+    /// replace a completed day with their older partial/failed attempt.
+    pub fn retain_prior(&mut self, prior: &Self) {
+        if prior.attempted_at > self.attempted_at {
+            self.attempted_at = prior.attempted_at;
+            self.error = prior.error.clone();
+        }
+        let Some(old) = &prior.report else {
+            return;
+        };
+        let Some(report) = &mut self.report else {
+            self.report = Some(old.clone());
+            return;
+        };
+        if old.coverage.complete
+            || (!report.coverage.complete && old.counts.created > report.counts.created)
+        {
+            let merged = report.merged_window.take();
+            let error = report.merged_error.take();
+            *report = old.clone();
+            report.merged_window = merged;
+            report.merged_error = error;
+        }
+        if old.merged_window.as_ref().is_some_and(|m| {
+            m.coverage.complete
+                || report
+                    .merged_window
+                    .as_ref()
+                    .is_none_or(|fresh| !fresh.coverage.complete && m.count > fresh.count)
+        }) {
+            report.merged_window = old.merged_window.clone();
+        }
+    }
+}
+
 pub async fn backfill(
     host: &str,
     scope: Scope,
@@ -156,32 +193,15 @@ async fn backfill_with(
             error: None,
         };
         match load_window(program, source, viewer, scope, start, end).await {
-            Ok(mut report) => {
-                // Created and merged cohorts have separate timestamps/coverage.
-                // A failed retry must not erase either prior measurement.
-                if let Some(old) = &receipt.report {
-                    if old.coverage.complete || old.counts.created > report.counts.created {
-                        let new_merged = report.merged_window.take();
-                        let new_error = report.merged_error.take();
-                        report = old.clone();
-                        report.merged_window = new_merged;
-                        report.merged_error = new_error;
-                    }
-                    if old.merged_window.as_ref().is_some_and(|m| {
-                        m.coverage.complete
-                            || report
-                                .merged_window
-                                .as_ref()
-                                .is_none_or(|fresh| m.count > fresh.count)
-                    }) {
-                        report.merged_window = old.merged_window.clone();
-                    }
-                }
+            Ok(report) => {
                 receipt.report = Some(report);
             }
             Err(error) => {
                 receipt.error = Some(error);
             }
+        }
+        if let Some(old) = prior {
+            receipt.retain_prior(old);
         }
         result.error = receipt.error.clone();
         let path = db.clone();
@@ -192,10 +212,16 @@ async fn backfill_with(
             crate::store::gitlab_stats::history_put(&path, &key, &date, &saved)
         })
         .await;
-        if !matches!(saved_result, Ok(Ok(()))) {
-            result.error = Some(
-                "Retrieved history could not be saved; retry may request this day again".into(),
-            );
+        match saved_result {
+            Ok(Ok(saved)) => {
+                receipt = saved;
+                result.error = receipt.error.clone();
+            }
+            _ => {
+                result.error = Some(
+                    "Retrieved history could not be saved; retry may request this day again".into(),
+                )
+            }
         }
         *prior = Some(receipt);
     }
@@ -347,5 +373,49 @@ mod tests {
         assert_eq!(second.complete_days, 0);
         assert_eq!(second.attempted_days, 2);
         assert!(second.slices.iter().all(|r| !r.coverage.complete));
+    }
+    #[test]
+    fn slower_concurrent_failure_cannot_erase_completed_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.sqlite");
+        let partition = "partition";
+        let day = "2026-09-01";
+        // Both callers initially observe no receipt; hold the failing writer
+        // until the successful writer commits, reproducing the lost update.
+        assert!(crate::store::gitlab_stats::history_get(&db, partition, day)
+            .unwrap()
+            .is_none());
+        let failed = HistoryReceipt {
+            attempted_at: Utc::now(),
+            report: None,
+            error: Some("request failed".into()),
+        };
+        let path = db.clone();
+        let (release, wait) = std::sync::mpsc::channel();
+        let slow = std::thread::spawn(move || {
+            wait.recv().unwrap();
+            crate::store::gitlab_stats::history_put(&path, partition, day, &failed).unwrap()
+        });
+        let mut report = super::super::tests::report(vec![super::super::tests::sample(1)]);
+        report.merged_window = Some(summarize_merged(
+            &report,
+            vec![super::super::tests::sample(1)],
+            super::super::tests::coverage(),
+        ));
+        let success = HistoryReceipt {
+            attempted_at: Utc::now(),
+            report: Some(report),
+            error: None,
+        };
+        crate::store::gitlab_stats::history_put(&db, partition, day, &success).unwrap();
+        release.send(()).unwrap();
+        let returned = slow.join().unwrap();
+        assert!(complete(returned.report.as_ref().unwrap()));
+        assert!(returned.error.is_none());
+        let saved = crate::store::gitlab_stats::history_get(&db, partition, day)
+            .unwrap()
+            .unwrap();
+        assert!(complete(saved.report.as_ref().unwrap()));
+        assert_eq!(saved.report.unwrap().counts.created, 1);
     }
 }
