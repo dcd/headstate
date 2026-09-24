@@ -4,7 +4,7 @@ import { getSourceSnapshot, refreshSelectedSource, type SourceList, type SourceP
 import { GitLabQueueState } from "./gitlabQueueState";
 import { safeUnlisten } from "./unlisten";
 
-export const GITLAB_COM = { provider: "gitlab", host: "gitlab.com" } as const;
+const GITLAB_COM = { provider: "gitlab", host: "gitlab.com" } as const;
 
 export function useGitLabQueue(list: SourceList, enabled: boolean) {
   const [model] = useState(() => new GitLabQueueState());
