@@ -31,7 +31,7 @@ function Discussion({ discussion, capabilities, busy, act }: {
       <p className="whitespace-pre-wrap break-words text-sm">{comment.body ?? "Comment text unavailable"}</p>
     </div>)}
     {permission?.can_resolve ? <button className={BUTTON} type="button" disabled={busy} onClick={() => act(permission.resolved ? "unresolve" : "resolve", undefined, discussion.id)}>{permission.resolved ? "Reopen discussion" : "Resolve discussion"}</button> : null}
-    {permission && permitted(capabilities, "reply") ? <div>
+    {permission?.can_reply && permitted(capabilities, "reply") ? <div>
       <textarea aria-label="Discussion reply" value={reply} onChange={(e) => setReply(e.target.value)} maxLength={32768} className="w-full rounded border border-[#30363d] bg-[#0d1117] p-2 text-sm" />
       <button className={BUTTON} type="button" disabled={busy || !reply.trim()} onClick={() => act("reply", reply, discussion.id)}>Reply</button>
     </div> : null}

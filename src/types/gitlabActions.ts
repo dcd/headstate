@@ -7,7 +7,7 @@ export interface GitLabCapabilities {
   identity: PrIdentity;
   head_oid: string | null;
   actions: { action: GitLabAction; allowed: boolean; reason: string | null }[];
-  discussions: { id: string; can_resolve: boolean; resolved: boolean }[];
+  discussions: { id: string; can_reply: boolean; can_resolve: boolean; resolved: boolean }[];
   discussions_complete: boolean;
 }
 
