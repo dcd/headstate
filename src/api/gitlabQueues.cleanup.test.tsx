@@ -1,4 +1,4 @@
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const ipc = vi.hoisted(() => {
@@ -56,6 +56,21 @@ describe("GitLab queue listeners", () => {
     // The keyboard refresh event is available on both builds; only the
     // periodic foreground fetch belongs to the phone.
     expect(ipc.refresh).toHaveBeenCalledTimes(mobile ? 3 : 2);
+    unmount();
+  });
+
+  it("hides the previous host's rows as soon as the configured host changes", async () => {
+    ipc.snapshot.mockImplementation((source: { host: string }) => source.host === "gitlab.com"
+      ? Promise.resolve({ data: { state: "git_lab_available", mrs: [{ title: "Old host" }], coverage: { kind: "complete" }, fetched_at: "2026-09-24T00:00:00Z", stale_secs: null } })
+      : new Promise(() => {}));
+    ipc.refresh.mockResolvedValue({});
+    const { result, rerender, unmount } = renderHook(
+      ({ host }) => useGitLabQueue("authored", true, host),
+      { initialProps: { host: "gitlab.com" } },
+    );
+    await waitFor(() => expect(result.current.rows).toEqual([{ title: "Old host" }]));
+    rerender({ host: "self.example" });
+    expect(result.current.rows).toBeUndefined();
     unmount();
   });
 });

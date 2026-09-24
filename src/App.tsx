@@ -3,6 +3,7 @@ import { emit } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Menu } from "lucide-react";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import {
   usePullRequests,
   useRefreshFromGesture,
@@ -65,6 +66,7 @@ import { relativeSeconds } from "./lib/time";
 import { useGitHubAuthAvailable } from "./api/authAvailability";
 import { setSourceSelection } from "./api/tauri";
 import { useGitLabQueue } from "./api/gitlabQueues";
+import { getGitLabHost } from "./api/gitlabHost";
 import { usePhoneGitHubRefresh, useSourceRefresh } from "./api/sourceRefreshHooks";
 import { useSourceSelection } from "./store/sourceSelection";
 import { GitLabSummary, SourceQueue, SourceRepoSidebar } from "./components/SourceQueue";
@@ -271,6 +273,7 @@ export default function App() {
   const statsProvider = selection === "both" ? statsTab : selection;
   const githubEnabled = selection !== "gitlab";
   const gitlabEnabled = selection !== "github";
+  const gitlabHost = useQuery({ queryKey: ["gitlab-host"], queryFn: getGitLabHost, retry: false });
   const [sourceSelectionError, setSourceSelectionError] = useState<string | null>(null);
   useEffect(() => {
     if (!IS_DESKTOP_BUILD) return;
@@ -384,8 +387,8 @@ export default function App() {
   // poll loop just wrote, so the user would see the rows they were
   // already looking at. Pull to refresh has to mean "ask GitHub now".
   const refreshGitHubFromGesture = useRefreshFromGesture();
-  const gitlabAuthored = useGitLabQueue("authored", gitlabEnabled);
-  const gitlabReviewing = useGitLabQueue("reviewing", gitlabEnabled);
+  const gitlabAuthored = useGitLabQueue("authored", gitlabEnabled && !!gitlabHost.data, gitlabHost.data ?? "");
+  const gitlabReviewing = useGitLabQueue("reviewing", gitlabEnabled && !!gitlabHost.data, gitlabHost.data ?? "");
   const refreshFromGesture = async () => {
     await Promise.all([
       ...(githubEnabled ? [refreshGitHubFromGesture()] : []),
@@ -1010,7 +1013,7 @@ export default function App() {
                 the `SystemHealthPage` branch above for why the boundary
                 sits inside the padded wrapper. */}
             <Suspense fallback={<ViewLoading />}>
-              <ProviderStatsPage selection={selection} provider={statsProvider} onProviderChange={setStatsTab} />
+              <ProviderStatsPage selection={selection} provider={statsProvider} onProviderChange={setStatsTab} gitlabHost={gitlabHost.data} />
             </Suspense>
           </div>
         ) : selection !== "github" ? (

@@ -9,9 +9,10 @@ import { dismissSplash } from "../splash";
 import { commandError } from "@/lib/errorKind";
 import { GitHubAuthProvider } from "@/api/authAvailability";
 import { useSourceSelection } from "@/store/sourceSelection";
+import { getGitLabHost } from "@/api/gitlabHost";
 
 /// Reports provider authentication without hiding local views. GitHub's
-/// startup state and GitLab.com's bounded CLI check have separate queries.
+/// startup state and the configured GitLab host's bounded CLI check have separate queries.
 /// On an offline phone, the desktop's auth is unknown and cached views
 /// remain available.
 export function AuthGate({ children }: { children: ReactNode }) {
@@ -47,11 +48,13 @@ export function AuthGate({ children }: { children: ReactNode }) {
     // because it asserts on the desktop path too.
     ...(IS_MOBILE_BUILD ? { retry: false } : {}),
   });
+  const gitlabHost = useQuery({ queryKey: ["gitlab-host"], queryFn: getGitLabHost, retry: false });
   const gitlab = useQuery({
-    queryKey: ["gitlab-auth", "gitlab.com"],
+    queryKey: ["gitlab-auth", gitlabHost.data ?? "invalid"],
     queryFn: getGitLabAuthState,
     staleTime: 60_000,
     retry: false,
+    enabled: gitlabHost.isSuccess || gitlabHost.isError,
   });
   const pollError = usePollError();
   // Classified ONCE (#1230). Three call sites used to ask `isNotAsked`
@@ -137,7 +140,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
             <span className="ml-1">Headstate watches GitHub pull requests you opened and the ones waiting on your review.</span>
             <span className="ml-1">Your GitHub token is kept in memory only.</span>
             {gitlab.data?.ok ? (
-              <span className="ml-1">GitLab.com sign-in is verified.</span>
+              <span className="ml-1">GitLab sign-in for {gitlab.data.host} is verified.</span>
             ) : gitlab.data ? (
               <span className="ml-1">{gitlab.data.message}</span>
             ) : null}

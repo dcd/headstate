@@ -300,7 +300,10 @@ pub fn set_source_selection(
     if selection == "github" {
         gitlab.select(None);
     } else {
-        let host = configured_gitlab_host(&app)?;
+        let host = configured_gitlab_host(&app).map_err(|error| {
+            gitlab.select(None);
+            error
+        })?;
         gitlab.select(Some(crate::identity::Source {
             provider: crate::identity::Provider::Gitlab,
             host,

@@ -1,4 +1,4 @@
-//! Bounded GitLab.com merge-request lists. `glab` owns credentials; neither
+//! Bounded GitLab merge-request lists. `glab` owns credentials; neither
 //! the credential nor raw CLI diagnostics leave this module.
 use crate::{
     github::model::{CiState, Label, ReviewState},
@@ -63,17 +63,19 @@ pub struct FetchedList {
 pub enum QueueError {
     #[error("GitLab CLI (glab) was not found on the desktop")]
     MissingCli,
-    #[error("GitLab.com rejected the credential; check `glab auth status --hostname gitlab.com`")]
+    #[error(
+        "GitLab rejected the configured host's credential; check glab authentication for that host"
+    )]
     Unauthorized,
-    #[error("GitLab.com denied this merge-request list request")]
+    #[error("GitLab denied this merge-request list request")]
     Forbidden,
-    #[error("GitLab.com rate limit reached; try again later")]
+    #[error("GitLab rate limit reached; try again later")]
     RateLimited,
-    #[error("GitLab.com request timed out")]
+    #[error("GitLab request timed out")]
     Timeout,
-    #[error("GitLab.com request failed")]
+    #[error("GitLab request failed")]
     Request,
-    #[error("GitLab.com returned an unreadable merge-request page")]
+    #[error("GitLab returned an unreadable merge-request page")]
     InvalidPage,
     #[error("this GitLab host is not configured for fetching")]
     UnsupportedHost,

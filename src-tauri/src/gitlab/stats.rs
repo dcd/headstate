@@ -1085,7 +1085,8 @@ esac
             endpoint(&Scope::Project("g/sub/p".into())).unwrap(),
             "projects/g%2Fsub%2Fp/merge_requests?scope=all"
         );
-        assert!(source("local.example").is_err());
+        assert!(source("local.example").is_ok());
+        assert!(source("local.example/path").is_err());
         let out = summarize(
             source("gitlab.com").unwrap(),
             "1".into(),

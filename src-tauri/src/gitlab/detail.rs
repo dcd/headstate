@@ -1,4 +1,4 @@
-//! Bounded GitLab.com MR detail reads. Every optional endpoint has its own
+//! Bounded GitLab MR detail reads. Every optional endpoint has its own
 //! receipt: a failed read cannot become zero approvals, zero discussions, or
 //! green CI. No merge-readiness verdict is derived from these fields.
 use crate::{

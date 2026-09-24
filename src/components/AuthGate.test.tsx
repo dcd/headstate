@@ -16,6 +16,7 @@ afterEach(() => {
 function renderGated(authState: { ok: boolean; message: string }, gitlabOk = false) {
   mockIPC((cmd) => {
     if (cmd === "get_auth_state") return authState;
+    if (cmd === "get_gitlab_host") return "gitlab.com";
     if (cmd === "get_gitlab_auth_state") return {
       host: "gitlab.com", ok: gitlabOk,
       issue: gitlabOk ? null : "unverified",
@@ -56,7 +57,7 @@ describe("AuthGate", () => {
   it("allows GitLab sign-in when gh is missing", async () => {
     renderGated({ ok: false, message: "gh was not found" }, true);
     expect(await screen.findByText("protected content")).toBeTruthy();
-    expect(await screen.findByText(/GitLab.com sign-in is verified/)).toBeTruthy();
+    expect(await screen.findByText(/GitLab sign-in for gitlab.com is verified/)).toBeTruthy();
   });
 
   it("does not let missing GitLab authentication hide GitHub", async () => {

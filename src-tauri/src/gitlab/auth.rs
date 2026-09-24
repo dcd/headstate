@@ -86,9 +86,8 @@ pub fn find_glab() -> Option<PathBuf> {
     )
 }
 
-/// Check exactly GitLab.com. A self-managed host requires an explicit
-/// configured-host and fixture contract in a later slice. No ambient git
-/// remote or GITLAB_HOST may silently change the host being checked.
+/// Default-host probe retained for callers and tests. No ambient git remote
+/// or GITLAB_HOST may silently change the host being checked.
 pub async fn check() -> AuthState {
     check_host(HOST).await
 }
