@@ -12,7 +12,7 @@ import type { PullRequest } from "@/types/pr";
 import { current } from "@/lib/ariaCurrent";
 import { labelForeground } from "@/lib/labels";
 import { PrKebab } from "@/components/PrKebab";
-import { prKey } from "@/components/BulkBar";
+import { prKey } from "@/lib/prIdentity";
 import { useFilters } from "@/store/filters";
 import { needsAttention, pendingReview } from "@/lib/derive";
 import { relativeTime } from "@/lib/time";

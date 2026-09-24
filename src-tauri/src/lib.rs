@@ -12,6 +12,7 @@ pub mod diag;
 pub mod docker;
 pub mod github;
 pub mod health;
+pub mod identity;
 /// Rules stated elsewhere in this codebase, asserted over its own source
 /// (#854). Test-only: the module holds no shipped code, and is declared
 /// here so `cargo test` compiles it.

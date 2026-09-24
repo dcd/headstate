@@ -1,3 +1,4 @@
+import { prIdentity, prKey } from "./lib/prIdentity";
 import { emit } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Menu } from "lucide-react";
@@ -370,7 +371,7 @@ export default function App() {
   // never have been one of the axes this key exists to watch.
   useScrollReset(
     mainRef,
-    `${view}|${filters.repo ?? ""}|${selectedPr ? `${selectedPr.repo}#${selectedPr.number}` : ""}`,
+    `${view}|${filters.repo ?? ""}|${selectedPr ? prKey(selectedPr) : ""}`,
   );
 
   // The tray's "Refresh now" menu item only emits `refresh-requested`; this
@@ -514,11 +515,11 @@ export default function App() {
           rows: () => visible.length,
           open: (i) => {
             const pr = visible[i];
-            if (pr) selectPr({ repo: pr.repo, number: pr.number });
+            if (pr) selectPr(prIdentity(pr));
           },
           toggle: (i) => {
             const pr = visible[i];
-            if (pr) useFilters.getState().toggleChecked(`${pr.repo}#${pr.number}`);
+            if (pr) useFilters.getState().toggleChecked(prKey(pr));
           },
         };
         const rows = target.rows();
@@ -975,7 +976,7 @@ export default function App() {
             {view === "my-prs" ? (
               <PrioritiesStrip
                 prs={scopedForStrip}
-                onOpen={(pr) => selectPr({ repo: pr.repo, number: pr.number })}
+                onOpen={(pr) => selectPr(prIdentity(pr))}
               />
             ) : null}
             {/* The review queue's counterpart to the attention strip:
@@ -986,7 +987,7 @@ export default function App() {
             {view === "to-review" ? (
               <ReadyStrip
                 prs={scopedForStrip}
-                onOpen={(pr) => selectPr({ repo: pr.repo, number: pr.number })}
+                onOpen={(pr) => selectPr(prIdentity(pr))}
               />
             ) : null}
             {/* Counts come from the same predicates the chips apply, so a
@@ -1090,7 +1091,7 @@ export default function App() {
                 // against GitHub's unfiltered count, so the number beside
                 // it has to be unfiltered too (#745).
                 fetched={source.length}
-                onOpen={(pr) => selectPr({ repo: pr.repo, number: pr.number })}
+                onOpen={(pr) => selectPr(prIdentity(pr))}
                 canWrite={view === "my-prs"}
                 selectable={view === "my-prs"}
                 // A poll failure with a SUCCESSFUL but empty cache read
