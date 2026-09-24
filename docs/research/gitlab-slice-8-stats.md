@@ -95,3 +95,73 @@ Follow-up focused evidence: 8 Rust stats tests and 9 Vitest tests (6 GitLab
 statistics component tests plus 3 surface guards) passed. Full release gates
 and independent re-review remain separate requirements; this correction does
 not close the broader slice 8 work listed above.
+
+## Remaining Stats implementation, 2026-09-24
+
+Implementation: Astra/high, based on integration `b949583`. The following
+supersedes the implementation gaps above; independent review and full gates
+remain required.
+
+The original created cohort remains intact. A second bounded request loads
+`state=merged` with `merged_after` and `merged_before`, independent of creation
+time. It supplies its own count, daily series, author board, coverage, timestamp,
+and retained MR records. The UI never adds these counts to created-cohort
+counts. Invalid/missing merge timestamps reduce coverage and suppress means.
+A failed merged read preserves the already measured created cohort.
+
+Comment participation reads at most ten created-cohort MRs, one page of up to
+100 notes per MR. Non-system comments by someone other than the MR author count
+as participation; these can include bots. It reports comment and participating
+MR counts and first-response time among MRs with a response. Pagination, skipped
+MRs, malformed/duplicate notes, missing timestamps and unavailable endpoints
+qualify counts and suppress latency. No successful note request means unknown,
+not zero. First-page 429 evidence survives and stops further comment requests.
+Approvals, changes requested and formal review outcomes remain explicitly
+unavailable: comment activity cannot establish these measures.
+
+Created, merged and comment reads share a 45-second paging budget. Requests
+retain the ten-second timeout. The maximum is twenty MR-list pages plus ten
+note pages; `/user` remains a separate account-discovery request. Authentication
+and rate-limit errors use static messages. An account switch between scope
+discovery and a stats/history response is rejected by the frontend key check.
+The adapter does not freeze glab's external credential store during a load.
+
+Group discovery now separately pages the token-visible groups endpoint,
+including nested group paths, and retains its own partial/error evidence.
+Membership projects and discovered groups are combined in the scope selector;
+a validated username can be queried as a person scope. Project and group
+paging share the discovery budget. Self-managed hosts remain disabled by the
+integration's GitLab.com-only auth/capability gate.
+
+History is now an explicit user request, `gitlab_stats_backfill`, available on
+desktop and phone. Each click visits one closed UTC day. A new additive SQLite
+ledger partitions receipts by provider, host, numeric viewer, scope and day.
+Failed attempts have a timestamp and error with no fabricated report. Untouched
+days take priority; afterward the oldest incomplete receipt is retried. Complete
+created/merged day receipts are skipped on resume. A less successful retry
+preserves prior measured cohorts with their own snapshot timestamps. Full MR
+records persist, while the phone receives at most ninety day summaries rather
+than retransmitting all retained MR rows. No automatic/background API spend is
+enabled. Historical comment coverage is separate from count completeness.
+
+Completed receipts are historical snapshots, not a claim that GitLab's search
+index or MR state can never change. There is no automatic revalidation policy
+or page cursor persisted inside a dense day. A day exceeding the ten-page bound
+remains partial; the ledger can continue through other dates. Concurrent calls
+may redundantly request the same incomplete day. Live large-cohort paging,
+mutable-index behavior, populated comment samples, throttling, and self-managed
+versions still need fixture evidence before the broad slice exit is claimed.
+
+Focused evidence before final documentation/summarization changes: fourteen
+Rust Stats tests passed (zero failed); thirteen Vitest tests passed across the
+GitLab Stats component and desktop/phone surface guards. TypeScript, targeted
+ESLint, knip, formatting and diff whitespace checks passed. An additional
+zero-budget/429 comment regression and bounded history wire summaries were
+added afterward and still need a Rust rerun. Heavy Rust builds were paused at
+the driver's request because the shared Mac had 1.9 GiB free. Full `cargo test
+--lib`, `yarn vitest run`, `make lint`, `make test-mobile`, CI, and independent
+Astra/xhigh review remain gates; none is implied by this checkpoint.
+
+API contracts checked against the official [merge requests API](https://docs.gitlab.com/api/merge_requests/)
+and [discussions API](https://docs.gitlab.com/api/discussions/). Tests added here
+use synthetic fixtures and do not claim live permission or tier validation.

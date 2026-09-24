@@ -16,6 +16,7 @@ export function GitLabStatsResults({ report }: { report: GitLabStatsReport }) {
     <section><h2 className="font-semibold">Current reviewer assignments</h2><p className="text-sm text-muted-foreground">Reviewer lists measured for {report.reviewer_rows_measured} of {report.counts.created} retrieved MRs. Assignments do not measure review activity.</p><ul className="text-sm">{report.reviewers.map(reviewer => <li key={reviewer.username}>{reviewer.username}: {qualified(reviewer.assigned, assignmentsComplete)} assigned</li>)}</ul></section>
     <section><h2 className="font-semibold">Merged in the window</h2><p className="text-sm text-muted-foreground">Includes MRs created before this window. This is a separate cohort.</p>
       {report.merged_window ? <>
+        <p>Snapshot {new Date(report.merged_window.fetched_at).toLocaleString()}.</p>
         <p>{qualified(report.merged_window.count, report.merged_window.coverage.complete)} merged MRs</p>
         {!report.merged_window.coverage.complete && <p role="status">Merged data is partial: {report.merged_window.coverage.stop.replaceAll("_", " ")}. Means are unavailable.</p>}
         <table className="w-full text-left text-sm"><thead><tr><th>Date (UTC)</th><th>Merged</th></tr></thead><tbody>{report.merged_window.series.map(day => <tr key={day.day}><td>{day.day}</td><td>{qualified(day.merged, report.merged_window!.coverage.complete)}</td></tr>)}</tbody></table>
@@ -24,8 +25,9 @@ export function GitLabStatsResults({ report }: { report: GitLabStatsReport }) {
     </section>
     <section><h2 className="font-semibold">Comment participation in the created cohort</h2><p className="text-sm text-muted-foreground">Non-author, non-system comments through the snapshot end. Comments may include bots; approvals, changes requested, and formal review outcomes are unavailable. At most 10 MRs and 100 notes per MR are read per load.</p>
       {report.activity ? <>
-        <p>{report.activity.mrs_checked} of {report.activity.mrs_total} retrieved MRs have complete comment reads. {qualified(report.activity.comments, report.activity.complete)} comments.</p>
+        <p>{report.activity.mrs_checked} of {report.activity.mrs_total} retrieved MRs have complete comment reads. {report.activity.comments === null ? "Unavailable" : qualified(report.activity.comments, report.activity.complete)} comments.</p>
         <p>Mean first response among MRs with a response: {report.activity.complete && report.activity.mean_first_response_hours !== null ? `${report.activity.mean_first_response_hours.toFixed(1)} hours (${report.activity.responded_mrs} MRs)` : "Unavailable"}</p>
+        {report.activity.rate_remaining !== null && <p>Comment read requests remaining: {report.activity.rate_remaining}{report.activity.rate_reset === null ? "" : `; reset ${new Date(report.activity.rate_reset * 1000).toLocaleString()}`}</p>}
         {report.activity.failures.map((failure, index) => <p role="status" key={index}>{failure}</p>)}
         <ul>{report.activity.participants.map(person => <li key={person.username}>{person.username}: {qualified(person.comments, report.activity!.complete)} comments on {qualified(person.mrs, report.activity!.complete)} MRs</li>)}</ul>
       </> : <p>Comment activity and response times unavailable.</p>}
@@ -64,16 +66,23 @@ function GitLabStatsScope({ host, tree, scope, days, setScope, setDays }: {
   setDays: (days: number) => void;
 }) {
   const stats = useGitLabStats(host, tree.viewer, scope, days);
-  const groups = [...new Set(tree.projects.map(p => p.namespace).filter(Boolean))];
+  const [person, setPerson] = useState("");
+  const groups = [...new Set([...(tree.groups ?? []), ...tree.projects.map(p => p.namespace).filter(Boolean)])].sort();
   return <>
     <div className="flex flex-wrap gap-3">
       <label>Scope <select aria-label="GitLab statistics scope" value={JSON.stringify(scope)} onChange={e => setScope(JSON.parse(e.target.value) as GitLabScope)} className="rounded border bg-background p-1">
         <option value={JSON.stringify({ kind: "mine" })}>My authored MRs</option>
+        {scope.kind === "person" && <option value={JSON.stringify(scope)}>Author: {scope.path}</option>}
         {groups.map(path => <option key={`group:${path}`} value={JSON.stringify({ kind: "group", path })}>Group: {path}</option>)}
         {tree.projects.map(p => <option key={p.path} value={JSON.stringify({ kind: "project", path: p.path })}>Project: {p.path}</option>)}
       </select></label>
       <label>Window <select aria-label="GitLab statistics window" value={days} onChange={e => setDays(Number(e.target.value))} className="rounded border bg-background p-1"><option value={7}>7 days</option><option value={30}>30 days</option><option value={90}>90 days</option></select></label>
     </div>
+    <form className="flex flex-wrap gap-2" onSubmit={e => { e.preventDefault(); if (/^[a-zA-Z0-9_.-]+$/.test(person) && person !== "." && person !== "..") setScope({ kind: "person", path: person }); }}>
+      <label>Author username <input aria-label="GitLab author username" value={person} onChange={e => setPerson(e.target.value)} className="rounded border bg-background p-1" required /></label><button type="submit" className="rounded border px-2">View author</button>
+    </form>
+    {tree.group_error && <p role="status">Group discovery unavailable: {tree.group_error}</p>}
+    {tree.group_coverage && !tree.group_coverage.complete && <p role="status">Group discovery is partial ({tree.group_coverage.stop.replaceAll("_", " ")}); more groups may exist.</p>}
     {!tree.coverage.complete && <p role="status">Project discovery is partial ({tree.coverage.stop.replaceAll("_", " ")}); more scopes may exist.</p>}
     {stats.isPending && <p role="status">Loading GitLab statistics…</p>}
     {stats.isError && <p role="alert">Could not load GitLab statistics: {String(stats.error)}</p>}
@@ -90,9 +99,9 @@ function GitLabHistory({ host, viewer, scope, days }: { host: string; viewer: st
     <button type="button" className="rounded border px-2" disabled={history.isPending} onClick={() => history.mutate()}>{history.isPending ? "Loading history…" : "Load next history day"}</button>
     {history.isError && <p role="alert">Could not load history: {String(history.error)}</p>}
     {history.data && <>
-      <p>{history.data.complete_days} of {history.data.requested_days} closed days have complete created and merged counts.</p>
+      <p>{history.data.complete_days} of {history.data.requested_days} closed days have complete created and merged counts; {history.data.attempted_days} days attempted.</p>
       {history.data.error && <p role="alert">{history.data.error}</p>}
-      <table className="w-full text-left text-sm"><thead><tr><th>Day (UTC)</th><th>Created</th><th>Merged in day</th><th>Retrieved</th></tr></thead><tbody>{history.data.slices.map(slice => <tr key={slice.start}><td>{slice.start.slice(0,10)}</td><td>{qualified(slice.counts.created,slice.coverage.complete)}</td><td>{slice.merged_window ? qualified(slice.merged_window.count,slice.merged_window.coverage.complete) : "Unavailable"}</td><td>{new Date(slice.fetched_at).toLocaleString()}</td></tr>)}</tbody></table>
+      <table className="w-full text-left text-sm"><thead><tr><th>Day (UTC)</th><th>Created</th><th>Merged in day</th><th>Snapshots</th></tr></thead><tbody>{history.data.slices.map(slice => <tr key={slice.start}><td>{slice.start.slice(0,10)}</td><td>{qualified(slice.counts.created,slice.coverage.complete)}</td><td>{slice.merged_window ? qualified(slice.merged_window.count,slice.merged_window.coverage.complete) : "Unavailable"}</td><td>Created: {new Date(slice.fetched_at).toLocaleString()}{slice.merged_window && <>; merged: {new Date(slice.merged_window.fetched_at).toLocaleString()}</>}</td></tr>)}</tbody></table>
     </>}
   </section>;
 }

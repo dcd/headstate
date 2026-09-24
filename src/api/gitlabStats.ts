@@ -16,6 +16,7 @@ interface Tree {
   source: Source;
   viewer: string;
   projects: { path: string; namespace: string }[];
+  groups?: string[]; group_coverage?: Coverage | null; group_error?: string | null;
   coverage: Coverage;
 }
 export interface GitLabStatsReport {
@@ -33,14 +34,14 @@ export interface GitLabStatsReport {
   reviewer_rows_measured: number;
   review_activity: number | null;
   merged_window?: {
-    coverage: Coverage; count: number;
+    fetched_at: string; coverage: Coverage; count: number;
     series: { day: string; merged: number }[];
     authors: { username: string; merged: number; mean_merge_hours: number | null }[];
     history: GitLabStatsReport["history"];
   } | null;
   merged_error?: string | null;
   activity?: {
-    complete: boolean; mrs_checked: number; mrs_total: number; comments: number;
+    complete: boolean; mrs_checked: number; mrs_total: number; comments: number | null;
     participants: { username: string; comments: number; mrs: number }[];
     mean_first_response_hours: number | null; responded_mrs: number;
     failures: string[]; rate_remaining: number | null; rate_reset: number | null;
@@ -68,7 +69,7 @@ export function useGitLabStats(host: string, viewer: string | undefined, scope: 
 
 interface GitLabBackfill {
   source: Source; viewer: string; scope: GitLabScope; requested_days: number;
-  complete_days: number; slices: GitLabStatsReport[]; error: string | null;
+  complete_days: number; attempted_days: number; slices: (Pick<GitLabStatsReport, "start" | "fetched_at" | "counts" | "coverage"> & { merged_window: Pick<NonNullable<GitLabStatsReport["merged_window"]>, "count" | "coverage" | "fetched_at"> | null })[]; error: string | null;
 }
 export function useGitLabBackfill(host: string, viewer: string, scope: GitLabScope, days: number) {
   return useMutation({
