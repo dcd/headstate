@@ -1363,6 +1363,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("secs")?,
             app.state(),
             app.state(),
+            app.state(),
         )),
         // `open_update_pr`'s arm went with its row in `SURFACE` (#964).
         // `every_remote_command_has_a_dispatch_arm` reads that table, so

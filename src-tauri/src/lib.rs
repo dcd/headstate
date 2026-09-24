@@ -562,6 +562,21 @@ pub fn run() {
                     .as_deref() != Some("gitlab"),
             ));
             app.manage(poll::GithubSourceEnabled(github_source_enabled.clone()));
+            let gitlab_selected = store::open_db(&commands::db_path(&handle))
+                .ok()
+                .and_then(|c| {
+                    store::settings::get::<String>(&c, store::settings::keys::SOURCE_SELECTION)
+                        .ok()
+                        .flatten()
+                })
+                .is_some_and(|selection| selection == "gitlab" || selection == "both");
+            let gitlab_control = Arc::new(gitlab::poll::Control::new(gitlab_selected.then(|| {
+                identity::Source {
+                    provider: identity::Provider::Gitlab,
+                    host: "gitlab.com".into(),
+                }
+            })));
+            app.manage(gitlab_control.clone());
             // Which repositories have a background update run going,
             // and how the last one ended. Default-constructed: it is
             // empty until someone starts a run.
@@ -1001,6 +1016,15 @@ pub fn run() {
                 gh_client.is_some()
             );
 
+            let focused = Arc::new(AtomicBool::new(true));
+            app.manage(Focused(focused.clone()));
+            gitlab::poll::spawn(
+                handle.clone(),
+                gitlab_control,
+                focused.clone(),
+                interval.clone(),
+            );
+
             if let Some(client) = gh_client {
                 // WHICH account, not just that there is one. A reported
                 // failure took four rounds partly because the log said
@@ -1030,8 +1054,6 @@ pub fn run() {
                 // self-referential. `spawn_backfill`'s own docs carry the
                 // argument in full.
                 poll::spawn_backfill(handle.clone(), client.clone());
-                let focused = Arc::new(AtomicBool::new(true));
-                app.manage(Focused(focused.clone()));
                 poll::spawn(handle, client, focused, waker, interval, needs_gh, github_source_enabled);
             }
 
@@ -1081,6 +1103,9 @@ pub fn run() {
                 if *is_focused {
                     if let Some(waker) = window.try_state::<poll::Waker>() {
                         waker.0.notify_one();
+                    }
+                    if let Some(control) = window.try_state::<Arc<gitlab::poll::Control>>() {
+                        control.wake();
                     }
                 }
             }

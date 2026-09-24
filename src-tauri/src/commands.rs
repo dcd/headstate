@@ -263,6 +263,7 @@ pub fn set_source_selection(
     selection: String,
     enabled: State<'_, crate::poll::GithubSourceEnabled>,
     waker: State<'_, crate::poll::Waker>,
+    gitlab: State<'_, Arc<crate::gitlab::poll::Control>>,
 ) -> Result<(), String> {
     if !matches!(selection.as_str(), "github" | "gitlab" | "both") {
         return Err("Unknown source selection".into());
@@ -279,6 +280,10 @@ pub fn set_source_selection(
         .0
         .store(github, std::sync::atomic::Ordering::Relaxed);
     waker.0.notify_one();
+    gitlab.select((selection != "github").then(|| crate::identity::Source {
+        provider: crate::identity::Provider::Gitlab,
+        host: "gitlab.com".into(),
+    }));
     Ok(())
 }
 
@@ -3777,6 +3782,7 @@ pub fn set_poll_interval(
     secs: u64,
     state: State<'_, crate::poll::PollInterval>,
     waker: State<'_, crate::poll::Waker>,
+    gitlab: State<'_, Arc<crate::gitlab::poll::Control>>,
 ) -> u64 {
     let applied = crate::poll::clamp_interval(secs);
     state.0.store(applied, std::sync::atomic::Ordering::Relaxed);
@@ -3793,6 +3799,7 @@ pub fn set_poll_interval(
     }
 
     waker.0.notify_one();
+    gitlab.wake();
     applied
 }
 

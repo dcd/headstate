@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "./transport";
 import { getSourceSnapshot, refreshSelectedSource, type SourceList, type SourcePollUpdate } from "./tauri";
 import { GitLabQueueState } from "./gitlabQueueState";
 import { safeUnlisten } from "./unlisten";
+import { IS_MOBILE_BUILD } from "../lib/target";
 
 const GITLAB_COM = { provider: "gitlab", host: "gitlab.com" } as const;
 
@@ -51,7 +52,7 @@ export function useGitLabQueue(list: SourceList, enabled: boolean) {
       if (!active) return;
       model.tick();
       publish();
-      void refresh();
+      if (IS_MOBILE_BUILD) void refresh();
     }, 60_000);
     return () => {
       active = false;
