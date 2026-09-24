@@ -102,7 +102,11 @@ const row = (
 
 /// One row per exported wrapper: the command name and argument object
 /// each one sent to `invoke` before the seam existed.
+const source = { provider: "gitlab", host: "gitlab.example" } as const;
 const ROWS: Row[] = [
+  row(api.getSourceSnapshot, [source, "reviewing"], "get_source_snapshot", { source, list: "reviewing" }),
+  row(api.refreshSelectedSource, [source, "authored", "request-1"], "refresh_source", { source, list: "authored", requestId: "request-1" }),
+  row(api.setSourceSelection, ["both"], "set_source_selection", { selection: "both" }),
   row(api.getCached, [], "get_cached"),
   row(api.refreshNow, [], "refresh_now"),
   row(api.refreshSource, ["authored", "request-1"], "refresh_now", { requestId: "request-1" }),
