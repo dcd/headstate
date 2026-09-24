@@ -55,14 +55,6 @@ export class SourceRefreshState {
     this.listeners.add(listener);
     return () => { this.listeners.delete(listener); };
   };
-  /// An initial status read is not a terminal event for an in-flight refresh.
-  /// It may seed an idle view, but must not suppress a later request failure.
-  hydrate(status: SourceStatus) {
-    if (this.requests.size > 0 || this.statusEpoch !== 0 || this.session !== undefined) return;
-    this.backendError = status.error;
-    this.coverage = status.coverage;
-    this.publish();
-  }
   private publish(prs = this.value.prs) {
     this.value = { prs, error: this.transportError?.message ?? this.backendError, modern: this.session !== undefined, coverage: this.coverage };
     for (const listener of this.listeners) listener();
