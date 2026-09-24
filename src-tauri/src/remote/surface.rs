@@ -998,7 +998,9 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "get_gitlab_auth_state" => ok(commands::get_gitlab_auth_state().await),
         "get_cached" => res(commands::get_cached(app.clone())),
         "get_cached_reviewing" => res(commands::get_cached_reviewing(app.clone())),
-        "refresh_now" => res(commands::refresh_now(app.state()).await),
+        "refresh_now" => {
+            res(commands::refresh_now(app.clone(), app.state(), a.get("requestId")?).await)
+        }
         "get_stats" => res(commands::get_stats(app.state()).await),
         "get_history" => res(commands::get_history(app.state(), a.get("days")?).await),
         "get_periods" => res(commands::get_periods(app.state()).await),
@@ -1049,7 +1051,9 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("days")?,
         )
         .await),
-        "get_reviewing" => res(commands::get_reviewing(app.clone(), app.state()).await),
+        "get_reviewing" => {
+            res(commands::get_reviewing(app.clone(), app.state(), a.get("requestId")?).await)
+        }
         "count_reviewing" => res(commands::count_reviewing(app.state()).await),
         "get_pr_detail" => {
             res(commands::get_pr_detail(app.state(), a.get("repo")?, a.get("number")?).await)

@@ -52,12 +52,14 @@ use crate::store::{get_json, put_json, Store, StoreError};
 pub const EVENT_NAMES: &[&str] = &[
     "prs-updated",
     "poll-state",
+    "source-poll-status",
     "poll-error",
     "prs-truncated",
     "prs-incomplete",
     "store-error",
     "worktree-removal-progress",
     "reviewing-short",
+    "reviewing-updated",
     "update-run-progress",
     "update-run-done",
     // Widening this list widens a security boundary: the whole point of

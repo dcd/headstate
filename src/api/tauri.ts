@@ -97,6 +97,9 @@ export const getCached = () => call<PullRequest[]>("get_cached");
 /// A user-initiated, out-of-band fetch. Does not persist to SQLite and does
 /// not affect the poll loop's cadence.
 export const refreshNow = () => call<PullRequest[]>("refresh_now");
+/// Opt into correlated replies; older paired desktops still return arrays.
+export const refreshSource = (list: "authored" | "reviewing", requestId: string) =>
+  call<import("./sourceRefresh").RefreshReply>(list === "authored" ? "refresh_now" : "get_reviewing", { requestId });
 
 /// Interface preferences. Mirrors the Rust `UiPrefs`.
 export interface UiPrefs {

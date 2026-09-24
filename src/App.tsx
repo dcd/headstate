@@ -1014,7 +1014,13 @@ export default function App() {
                 50 pull requests under a sidebar badge reading 62, with
                 nothing to explain the gap -- which is what "the numbers
                 are off" was describing. */}
-            {view === "to-review" && reviewShortfall > 0 ? (
+            {(view === "to-review" && reviewShortfall === null) ||
+            (view === "my-prs" && truncatedTotal === null) ? (
+              <p className="mb-3 rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-4 py-2 text-xs text-[#d29922]">
+                GitHub could not confirm whether this list is complete.
+              </p>
+            ) : null}
+            {view === "to-review" && (reviewShortfall ?? 0) > 0 ? (
               <p className="mb-3 rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-4 py-2 text-xs text-[#d29922]">
                 {reviewShortfall} pull request{reviewShortfall === 1 ? " is" : "s are"}{" "}
                 missing from this list — GitHub could not answer the full query, so
@@ -1047,6 +1053,13 @@ export default function App() {
                   : `Showing a saved list from ${relativeSeconds(reviewingStaleSecs)} — checking GitHub for changes…`}
               </p>
             ) : null}
+            {view === "to-review" && reviewingError && reviewing.length > 0 ? (
+              <QueryError
+                title="Could not refresh the pull requests awaiting your review"
+                message={errorMessage(reviewingErr)}
+                onRetry={() => void refetchReviewing()}
+              />
+            ) : null}
             <FilterBar prs={source} />
             {/* Fed the UNFILTERED list on purpose: selection is keyed by
                 repo#number, so narrowing a filter after selecting must
@@ -1062,7 +1075,7 @@ export default function App() {
               <div className="rounded-md border border-[#30363d] px-4 py-12 text-center text-sm text-[#8b949e]">
                 Loading pull requests…
               </div>
-            ) : (view === "to-review" ? reviewingError : isError) ? (
+            ) : (view === "to-review" ? reviewingError && reviewing.length === 0 : isError) ? (
               // The same reasoning one step further. A REJECTED query also
               // leaves `prs` at its `[]` default, so without this branch the
               // list renders "0 Open -- no pull requests match these

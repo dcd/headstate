@@ -26,6 +26,7 @@ pub mod redact;
 pub mod release_notes;
 pub mod remote;
 pub mod repos;
+pub mod source_poll;
 pub mod store;
 pub mod tools;
 pub mod tray;
@@ -524,6 +525,7 @@ pub fn run() {
             // to signal even when nothing is listening for it.
             let waker = Arc::new(tokio::sync::Notify::new());
             app.manage(poll::Waker(waker.clone()));
+            app.manage(source_poll::SourcePolls::default());
 
             // Managed unconditionally, like the Waker: the settings command
             // must find it whether or not auth succeeded.

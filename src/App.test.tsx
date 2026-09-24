@@ -11,8 +11,10 @@ import { AuthGate } from "./components/AuthGate";
 // exercise the wiring, not the backend.
 const mockPrs = vi.fn<() => PullRequest[]>(() => []);
 const mockReviewing = vi.fn<() => PullRequest[]>(() => []);
+const mockReviewError = vi.fn<() => Error | null>(() => null);
 const mockRefused = vi.fn<() => number>(() => 0);
-const mockShortfall = vi.fn<() => number>(() => 0);
+const mockShortfall = vi.fn<() => number | null>(() => 0);
+const mockTruncation = vi.fn<() => number | null | undefined>(() => undefined);
 const mockDataUpdatedAt = vi.fn<() => number>(() => 0);
 
 /// Overridable UI preferences, so the capability-gate tests at the bottom
@@ -77,7 +79,7 @@ vi.mock("./api/hooks", () => ({
   clearPollError: () => {},
   useRefreshRequested: () => undefined,
   useRefreshFromGesture: () => () => Promise.resolve(),
-  useTruncation: () => null,
+  useTruncation: () => mockTruncation(),
   // No refused fields: the advisory banner stays hidden.
   useIncomplete: () => mockRefused(),
   useReviewShortfall: () => mockShortfall(),
@@ -100,7 +102,7 @@ vi.mock("./api/hooks", () => ({
   // a pending sidebar would leave a "Finding your organizations" line in
   // the document that a `queryByText` elsewhere could trip over.
   useStatsTree: () => ({ data: undefined, isPending: false, error: null }),
-  useReviewing: () => ({ data: mockReviewing(), isLoading: false }),
+  useReviewing: () => ({ data: mockReviewing(), isLoading: false, isError: mockReviewError() !== null, error: mockReviewError(), refetch: () => Promise.resolve() }),
   // The badge's own cheap query, separate from the list.
   useReviewingCount: () => ({ data: mockReviewing().length }),
   // PrDetailView's hooks: App's mock replaces the whole module, so
@@ -474,6 +476,7 @@ describe("opening a pull request from To review", () => {
   };
 
   beforeEach(() => {
+    mockReviewError.mockReturnValue(null);
     mockPrs.mockReturnValue([]);
     mockReviewing.mockReturnValue([theirs]);
     useFilters.setState({
@@ -487,6 +490,15 @@ describe("opening a pull request from To review", () => {
   it("lists the review queue", () => {
     render(<App />);
     expect(screen.getByText(theirs.title)).toBeTruthy();
+  });
+
+  it("keeps usable review rows visible beside a newer refresh failure", () => {
+    mockReviewError.mockReturnValue(new Error("newer review refresh failed"));
+    render(<App />);
+    expect(screen.getByText(theirs.title)).toBeTruthy();
+    expect(screen.getByText("Could not refresh the pull requests awaiting your review")).toBeTruthy();
+    expect(screen.getByText("newer review refresh failed")).toBeTruthy();
+    mockReviewError.mockReturnValue(null);
   });
 
   it("selects the pull request when its row is clicked", () => {
@@ -516,6 +528,7 @@ describe("an incomplete refresh", () => {
   beforeEach(() => {
     mockRefused.mockReturnValue(0);
     mockShortfall.mockReturnValue(0);
+    mockTruncation.mockReturnValue(undefined);
     mockPrs.mockReturnValue([]);
     useFilters.setState({
       view: "my-prs",
@@ -523,6 +536,15 @@ describe("an incomplete refresh", () => {
       filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
   branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "claude-code": {}, "pr-stats": {}, repositories: {}, "system-health": {} },
     });
+  });
+
+  it.each(["my-prs", "to-review"] as const)("qualifies an unknown total for %s without an old numeric count", (view) => {
+    if (view === "my-prs") mockTruncation.mockReturnValue(null);
+    else mockShortfall.mockReturnValue(null);
+    useFilters.setState({ view });
+    render(<App />);
+    expect(screen.getByText("GitHub could not confirm whether this list is complete.")).toBeTruthy();
+    expect(screen.queryByText(/12 pull requests are missing/i)).toBeNull();
   });
 
   /// The silent truncation the v3.5.3 log caught on a real machine: the

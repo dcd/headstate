@@ -8,8 +8,7 @@ use crate::github::model::{
 };
 use crate::github::mutate::{PrAction, ReviewVerdict};
 use crate::store::{
-    load_snapshot, load_snapshot_marked, open_db, save_snapshot, settings, CachedList,
-    CachedSnapshot,
+    load_snapshot, load_snapshot_marked, open_db, settings, CachedList, CachedSnapshot,
 };
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -193,36 +192,204 @@ pub fn get_cached(app: AppHandle) -> Result<Vec<PullRequest>, String> {
 }
 
 /// A user-initiated, out-of-band fetch (e.g. a manual refresh button).
-/// Does not touch the poll loop's cadence or its cached snapshot on disk.
+/// Keeps its own source/list cache and status current without changing cadence.
 #[tauri::command]
-pub async fn refresh_now(client: State<'_, GhClient>) -> Result<Vec<PullRequest>, String> {
-    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
-    // Bounded like the poll loop's fetch. This is the COLD-START path --
-    // `usePullRequests` calls it whenever the cache is empty, which is
-    // exactly a fresh install -- and it had no overall timeout at all.
-    //
-    // The transport timeouts on the client are not enough on their own,
-    // for the reason its own comment gives: a server that trickles bytes
-    // keeps a read alive indefinitely without ever tripping one. With
-    // `retry` enabled each attempt restarts them, so a machine that
-    // cannot complete a handshake sat on "Loading pull requests" for
-    // minutes rather than failing with something to act on.
-    // DIAGNOSTIC LOGGING (Settings > diagnostic log).
-    crate::diag!("[diag] cmd refresh_now start");
-    let started = std::time::Instant::now();
-    let out = match tokio::time::timeout(crate::poll::FETCH_TIMEOUT, client.fetch_prs()).await {
-        Ok(res) => res.map_err(|e| e.to_string()),
-        Err(_) => Err(ClientError::Timeout(crate::poll::FETCH_TIMEOUT.as_secs()).to_string()),
+pub async fn refresh_now(
+    app: AppHandle,
+    client: State<'_, GhClient>,
+    request_id: Option<String>,
+) -> Result<RefreshReply, String> {
+    refresh_reply(app, client, CachedList::Authored, request_id).await
+}
+
+/// Legacy callers receive the original array/error contract. Correlated
+/// callers receive backend outcomes in-band; an IPC rejection then denotes a
+/// transport failure, distinct from a provider failure already in source status.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+pub enum RefreshReply {
+    Legacy(Vec<PullRequest>),
+    Correlated {
+        request_id: String,
+        update: Box<crate::source_poll::Update>,
+    },
+}
+
+async fn refresh_reply(
+    app: AppHandle,
+    client: State<'_, GhClient>,
+    list: CachedList,
+    request_id: Option<String>,
+) -> Result<RefreshReply, String> {
+    let source = crate::identity::Source::default();
+    let result = refresh_source_request(
+        app.clone(),
+        client,
+        source.clone(),
+        list,
+        request_id.clone(),
+    )
+    .await;
+    if let Some(request_id) = request_id {
+        let update = app
+            .state::<crate::source_poll::SourcePolls>()
+            .snapshot(&source, list)
+            .await;
+        Ok(RefreshReply::Correlated {
+            request_id,
+            update: Box::new(update),
+        })
+    } else {
+        result.map(|result| RefreshReply::Legacy(result.prs))
+    }
+}
+
+/// Source-scoped cache/readback for slice 6. Legacy commands stay GitHub-only.
+pub fn get_source_snapshot(
+    app: AppHandle,
+    source: crate::identity::Source,
+    list: CachedList,
+) -> Result<crate::store::source_cache::SourceSnapshot, String> {
+    let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
+    crate::store::source_cache::load_source_snapshot(&conn, &source, list)
+        .map_err(|e| e.to_string())
+}
+
+pub fn get_source_poll_status(
+    state: State<'_, crate::source_poll::SourcePolls>,
+    source: crate::identity::Source,
+    list: CachedList,
+) -> crate::source_poll::Status {
+    state.get(&source, list)
+}
+
+#[derive(serde::Serialize)]
+pub struct SourceRefresh {
+    pub source: crate::identity::Source,
+    pub list: CachedList,
+    pub prs: Vec<PullRequest>,
+    pub coverage: crate::store::source_cache::Coverage,
+}
+
+/// Manual refresh targets exactly one source/list. Slice 4 adds the GitLab
+/// adapter here; an unsupported source is declined before any provider call.
+pub async fn refresh_source(
+    app: AppHandle,
+    client: State<'_, GhClient>,
+    source: crate::identity::Source,
+    list: CachedList,
+) -> Result<SourceRefresh, String> {
+    refresh_source_request(app, client, source, list, None).await
+}
+
+async fn refresh_source_request(
+    app: AppHandle,
+    client: State<'_, GhClient>,
+    source: crate::identity::Source,
+    list: CachedList,
+    request_id: Option<String>,
+) -> Result<SourceRefresh, String> {
+    use crate::source_poll::{self, Failure};
+    let attempt = source_poll::begin_request(&app, source.clone(), list, request_id).await;
+    let refusal = if source != crate::identity::Source::default() {
+        Some("headstate:not-asked: fetching is not enabled for this source".to_string())
+    } else if client.0.is_none() {
+        Some(AUTH_ERR.to_string())
+    } else {
+        None
     };
-    crate::diag!(
-        "[diag] cmd refresh_now end {}ms {}",
-        started.elapsed().as_millis(),
-        match &out {
-            Ok(v) => format!("ok n={}", v.len()),
-            Err(e) => format!("err: {e}"),
+    if let Some(message) = refusal {
+        source_poll::fail(
+            &app,
+            attempt,
+            Failure {
+                message: message.clone(),
+                transient: false,
+                not_asked: true,
+            },
+        )
+        .await;
+        return Err(message);
+    }
+    let client = client.0.as_ref().expect("checked above");
+    // Preserve reviewing's existing paged loader: an outer timeout drops
+    // pages it already owns. The individual HTTP requests remain bounded.
+    let fetched = match list {
+        CachedList::Authored => {
+            tokio::time::timeout(crate::poll::FETCH_TIMEOUT, client.fetch_prs_snapshot())
+                .await
+                .unwrap_or_else(|_| Err(ClientError::Timeout(crate::poll::FETCH_TIMEOUT.as_secs())))
         }
-    );
-    out
+        CachedList::Reviewing => client.fetch_reviewing_snapshot().await,
+    };
+    match fetched {
+        Ok(result) => {
+            let Some(publication) = source_poll::success_publication(&app, &attempt).await else {
+                let winner = source_poll::winner(&app, &attempt, Ok(result))?;
+                return Ok(SourceRefresh {
+                    source,
+                    list,
+                    prs: winner.prs,
+                    coverage: winner.coverage,
+                });
+            };
+            let receipt = result.clone();
+            let crate::github::client::FetchedList {
+                prs,
+                total,
+                coverage,
+            } = result;
+            let path = db_path(&app);
+            let owned = prs.clone();
+            let owned_source = source.clone();
+            let owned_coverage = coverage.clone();
+            let saved = tauri::async_runtime::spawn_blocking(move || {
+                let conn = open_db(&path).map_err(|e| e.to_string())?;
+                crate::store::source_cache::save_source_snapshot(
+                    &conn,
+                    &owned_source,
+                    list,
+                    &owned,
+                    &owned_coverage,
+                )
+                .map_err(|e| e.to_string())
+            })
+            .await;
+            if !matches!(saved, Ok(Ok(()))) {
+                let _ = app.emit(
+                    "store-error",
+                    "The refreshed list could not be saved for offline use.",
+                );
+            }
+            if list == CachedList::Reviewing {
+                crate::poll::emit_reviewing(&app, &receipt);
+            } else {
+                let truncated = total.map(|total| if total > prs.len() as u64 { total } else { 0 });
+                let _ = app.emit("prs-truncated", truncated);
+            }
+            source_poll::complete(&app, publication, Ok(receipt));
+            Ok(SourceRefresh {
+                source,
+                list,
+                prs,
+                coverage,
+            })
+        }
+        Err(error) => {
+            if let Some(publication) = source_poll::publication(&app, &attempt).await {
+                source_poll::complete(&app, publication, Err(Failure::from(&error)));
+                Err(error.to_string())
+            } else {
+                let winner = source_poll::winner(&app, &attempt, Err(error.to_string()))?;
+                Ok(SourceRefresh {
+                    source,
+                    list,
+                    prs: winner.prs,
+                    coverage: winner.coverage,
+                })
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -3541,59 +3708,9 @@ pub fn get_cached_reviewing(app: AppHandle) -> Result<CachedSnapshot, String> {
 pub async fn get_reviewing(
     app: AppHandle,
     client: State<'_, GhClient>,
-) -> Result<Vec<PullRequest>, String> {
-    // DIAGNOSTIC LOGGING (Settings > diagnostic log). Brackets the whole
-    // command, so the log distinguishes the three ways To review can
-    // appear stuck: the command was never invoked (no start line), it
-    // is still running (a start with no end), or it returned promptly
-    // and the delay is in the frontend (a fast start/end pair).
-    crate::diag!("[diag] cmd get_reviewing start");
-    let started = std::time::Instant::now();
-    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
-    let out = client
-        .fetch_reviewing_with_shortfall()
-        .await
-        .map(|(prs, short)| {
-            // Tell the UI when the list is SHORT. The 100 -> 50 fallback
-            // returns fewer pull requests than exist and everything
-            // downstream presented that as complete -- the v3.5.3 log
-            // caught 50 shown against a count of 62, with twelve gone
-            // silently. Emitted even when zero, so a recovered fetch
-            // clears a banner an earlier one raised.
-            if let Err(e) = app.emit("reviewing-short", short) {
-                log::warn!("failed to emit reviewing-short: {e}");
-            }
-            // Cache it, so the next visit to To review paints from disk
-            // instead of waiting out the query again. The measurements
-            // on #328 are what make this the fix: the query itself
-            // cannot be made fast (a bare 25-item search already costs
-            // 6.2s, and trimming fields measured as noise), so the win
-            // has to come from not blocking on it.
-            //
-            // A failed write is logged and swallowed: the caller has
-            // real pull requests in hand, and refusing to return them
-            // because a cache write failed would turn a slow path into
-            // a broken one.
-            match open_db(&db_path(&app)) {
-                Ok(conn) => {
-                    if let Err(e) = save_snapshot(&conn, CachedList::Reviewing, &prs) {
-                        log::warn!("could not cache the review list: {e}");
-                    }
-                }
-                Err(e) => log::warn!("could not open the store to cache the review list: {e}"),
-            }
-            prs
-        })
-        .map_err(|e| e.to_string());
-    crate::diag!(
-        "[diag] cmd get_reviewing end {}ms {}",
-        started.elapsed().as_millis(),
-        match &out {
-            Ok(v) => format!("ok n={}", v.len()),
-            Err(e) => format!("err: {e}"),
-        }
-    );
-    out
+    request_id: Option<String>,
+) -> Result<RefreshReply, String> {
+    refresh_reply(app, client, CachedList::Reviewing, request_id).await
 }
 
 #[tauri::command]

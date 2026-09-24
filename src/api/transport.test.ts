@@ -105,6 +105,7 @@ const row = (
 const ROWS: Row[] = [
   row(api.getCached, [], "get_cached"),
   row(api.refreshNow, [], "refresh_now"),
+  row(api.refreshSource, ["authored", "request-1"], "refresh_now", { requestId: "request-1" }),
   row(api.getUiPrefs, [], "get_ui_prefs"),
   row(api.setUiPrefs, [uiPrefs], "set_ui_prefs", { prefs: uiPrefs }),
   row(api.getAutostart, [], "get_autostart"),
@@ -411,6 +412,11 @@ describe("tauri.ts wrappers through the transport", () => {
     expect(local.call).toHaveBeenCalledWith(r.command, r.expected);
   });
 
+  it("routes correlated reviewing refreshes through get_reviewing", async () => {
+    await api.refreshSource("reviewing", "request-2");
+    expect(local.call).toHaveBeenCalledWith("get_reviewing", { requestId: "request-2" });
+  });
+
   it("covers every wrapper tauri.ts exports", () => {
     // A wrapper added without a row here would otherwise be the one
     // whose arguments silently drift.
@@ -469,6 +475,8 @@ const POLL_EVENTS: [string, () => unknown][] = [
   ["prs-updated", hooks.usePullRequests],
   ["poll-state", hooks.usePollState],
   ["poll-error", hooks.usePollError],
+  ["source-poll-status", hooks.usePollError],
+  ["reviewing-updated", hooks.useReviewing],
   ["prs-truncated", hooks.useTruncation],
   ["prs-incomplete", hooks.useIncomplete],
   ["store-error", hooks.useStoreError],
