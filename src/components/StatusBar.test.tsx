@@ -450,14 +450,14 @@ describe("a panicked background task", () => {
 
 
 describe("selected source status", () => {
-  const gitlab = { rows: [], coverage: "complete" as const, staleSecs: 120, loading: false, refreshing: false, error: null };
+  const gitlab = { rows: [], coverage: "complete" as const, staleSecs: null, loading: false, refreshing: false, error: null };
   afterEach(() => { state.error = null; stubViewport(null); });
 
   it("uses GitLab freshness and ignores GitHub auth and poll failures in GitLab-only mode", () => {
     stubViewport(1400);
     state.error = "GitHub failed";
     render(<StatusBar updatedAt={Date.now()} githubAuthAvailable={false} selection="gitlab" gitlab={gitlab} />);
-    expect(screen.getByText("GitLab MRs updated 2 minutes ago")).toBeTruthy();
+    expect(screen.getByText("GitLab MRs updated within the last hour").previousElementSibling?.className).toContain("3fb950");
     expect(screen.queryByText(/GitHub/)).toBeNull();
     expect(screen.queryByText("PRs up to date")).toBeNull();
     expect(screen.queryByText("Updated just now")).toBeNull();
@@ -467,9 +467,16 @@ describe("selected source status", () => {
     stubViewport(1400);
     render(<StatusBar updatedAt={Date.now()} selection="both" gitlab={{ ...gitlab, coverage: { partial: { total: null } }, error: "GitLab refused credentials" }} />);
     expect(screen.getByText("GitHub · PRs up to date")).toBeTruthy();
-    const status = screen.getByText("GitLab MRs updated 2 minutes ago · partial list · refresh failed");
+    const status = screen.getByText("GitLab MRs updated within the last hour · partial list · refresh failed");
     expect(status.previousElementSibling?.className).toContain("d29922");
     expect(screen.queryByText("PRs up to date")).toBeNull();
+  });
+
+  it("marks a stale GitLab receipt amber even when its coverage is complete", () => {
+    stubViewport(1400);
+    render(<StatusBar updatedAt={Date.now()} selection="gitlab" gitlab={{ ...gitlab, staleSecs: 7200 }} />);
+    const status = screen.getByText("GitLab MRs last updated 2 hours ago · stale");
+    expect(status.previousElementSibling?.className).toContain("d29922");
   });
 
   it("does not substitute a GitHub timestamp for missing GitLab freshness", () => {

@@ -203,7 +203,7 @@ describe("ConnectionBanner", () => {
 
 
 describe("selected provider connection status", () => {
-  const gitlab = { rows: [], coverage: "complete" as const, staleSecs: 120, loading: false, refreshing: false, error: null };
+  const gitlab = { rows: [], coverage: "complete" as const, staleSecs: null, loading: false, refreshing: false, error: null };
   function connected() {
     stubViewport(390);
     connection.current = { kind: "connected", desktop: "octocat's laptop", lastPoll: null, protocolVersion: REQUIRED_PROTOCOL_VERSION, stale: false };
@@ -212,7 +212,8 @@ describe("selected provider connection status", () => {
     connected();
     render(<ConnectionBanner updatedAt={Date.now()} githubAuthAvailable={false} selection="gitlab" gitlab={gitlab} />);
     const banner = screen.getByRole("button");
-    expect(banner.textContent).toContain("GitLab MRs updated 2 minutes ago");
+    expect(banner.textContent).toContain("GitLab MRs updated within the last hour");
+    expect(banner.firstElementChild?.className).toContain("3fb950");
     expect(banner.textContent).not.toContain("GitHub");
     expect(banner.textContent).not.toContain("just now");
   });
@@ -222,6 +223,13 @@ describe("selected provider connection status", () => {
     const banner = screen.getByRole("button");
     expect(banner.textContent).toContain("GitHub updated just now");
     expect(banner.textContent).toContain("GitLab MRs: could not refresh");
+    expect(banner.firstElementChild?.className).toContain("d29922");
+  });
+  it("marks a stale GitLab receipt amber on the phone", () => {
+    connected();
+    render(<ConnectionBanner selection="gitlab" gitlab={{ ...gitlab, staleSecs: 7200 }} />);
+    const banner = screen.getByRole("button");
+    expect(banner.textContent).toContain("GitLab MRs last updated 2 hours ago · stale");
     expect(banner.firstElementChild?.className).toContain("d29922");
   });
   it("withholds provider freshness while the desktop is unreachable", () => {

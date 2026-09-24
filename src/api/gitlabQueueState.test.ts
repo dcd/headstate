@@ -1,3 +1,4 @@
+import { gitlabQueueSummary } from "../lib/gitlabQueueSummary";
 import { describe, expect, it, vi } from "vitest";
 import { GitLabQueueState, receiptAge } from "./gitlabQueueState";
 import type { SourcePollUpdate } from "./tauri";
@@ -92,4 +93,22 @@ describe("GitLab queue reconciliation", () => {
       vi.useRealTimers();
     }
   });
+});
+
+
+it("changes the displayed freshness when a real accepted receipt crosses the stale threshold", () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-09-24T12:00:00Z"));
+  try {
+    const state = new GitLabQueueState();
+    state.accept(update());
+    expect(gitlabQueueSummary(state.snapshot())).toEqual({ text: "GitLab MRs updated within the last hour", warning: false });
+    vi.advanceTimersByTime(7200_000);
+    state.tick();
+    expect(gitlabQueueSummary(state.snapshot())).toEqual({ text: "GitLab MRs last updated 2 hours ago · stale", warning: true });
+    state.accept(update({ revision: 2, receipt_revision: 2, last_received_at: null }));
+    expect(gitlabQueueSummary(state.snapshot())).toEqual({ text: "GitLab MRs freshness unavailable", warning: true });
+  } finally {
+    vi.useRealTimers();
+  }
 });

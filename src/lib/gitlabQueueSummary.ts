@@ -8,13 +8,16 @@ export function gitlabQueueSummary(queue?: GitLabQueueSnapshot): { text: string;
     text: queue.error ? "GitLab MRs: could not refresh" : queue.loading || queue.refreshing ? "Checking GitLab MRs…" : "GitLab MR status unavailable",
     warning: true,
   };
-  const freshness = typeof queue.staleSecs === "number"
-    ? `updated ${relativeSeconds(queue.staleSecs)}` : "freshness unavailable";
+  // staleSecs is a classification: null means a receipt within the last
+  // hour; numbers are ages beyond that threshold, not all receipt ages.
+  const freshness = queue.staleSecs === null ? "updated within the last hour"
+    : typeof queue.staleSecs === "number" ? `last updated ${relativeSeconds(queue.staleSecs)} · stale`
+      : "freshness unavailable";
   const coverage = queue.coverage === "complete" ? "" : typeof queue.coverage === "object" && queue.coverage !== null
     ? " · partial list" : " · completeness unknown";
   const progress = queue.error ? " · refresh failed" : queue.refreshing ? " · refreshing" : "";
   return {
     text: `GitLab MRs ${freshness}${coverage}${progress}`,
-    warning: !!queue.error || queue.coverage !== "complete" || typeof queue.staleSecs !== "number",
+    warning: !!queue.error || queue.coverage !== "complete" || queue.staleSecs !== null,
   };
 }
