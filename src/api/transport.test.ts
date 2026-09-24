@@ -72,6 +72,8 @@ const dirs = ["/home/octocat/code"];
 const name = "hello-world_data";
 const until = "24h";
 const body = "Looks good.";
+const gitlabIdentity = { source: { provider: "gitlab" as const, host: "gitlab.com" }, repo: "group/subgroup/project", number: 7 };
+const gitlabRequest = { identity: gitlabIdentity, action: "approve" as const, expected_head: "head" };
 const verdict = "approve" as const;
 const action = "merge" as const;
 const prs: [string, string, number][] = [[id, repo, number]];
@@ -203,6 +205,9 @@ const ROWS: Row[] = [
   row(api.updatePrBranch, [id, repo, number, expectedHead], "update_pr_branch", { id, repo, number, expectedHead }),
   row(api.actOnPrs, [prs, action], "act_on_prs", { prs, action }),
   row(api.getPrDetail, [repo, number], "get_pr_detail", { repo, number }),
+  row(api.getGitLabDetail, [gitlabIdentity], "get_gitlab_detail", { identity: gitlabIdentity }),
+  row(api.getGitLabActionCapabilities, [gitlabIdentity], "gitlab_action_capabilities", { identity: gitlabIdentity }),
+  row(api.gitLabAction, [gitlabRequest], "gitlab_action", { request: gitlabRequest }),
   row(api.sizeWorktrees, [repoPath], "size_worktrees", { repoPath }),
   row(api.pullCheckout, [path], "pull_checkout", { path }),
   row(api.fetchRefs, [path], "fetch_refs", { path }),

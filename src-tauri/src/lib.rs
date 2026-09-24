@@ -310,6 +310,7 @@ pub fn run() {
             commands::get_reviewing,
             commands::count_reviewing,
             commands::get_pr_detail,
+            commands::get_gitlab_detail,
             commands::gitlab_action_capabilities,
             commands::gitlab_action,
             commands::act_on_pr,

@@ -370,6 +370,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("update_all_state", Class::Read),
     // write: changes GitHub state through the existing write module, or
     // a desktop setting.
+    ("get_gitlab_detail", Class::Read),
     ("gitlab_action_capabilities", Class::Read),
     ("gitlab_action", Class::Write),
     ("act_on_pr", Class::Write),

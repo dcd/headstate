@@ -779,6 +779,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn writes_follow_documented_endpoints_and_do_not_delete_source_branches() {
+        let c = context(raw(), permissions());
+        for (action, method, path, payload) in [
+            (
+                Action::Approve,
+                "POST",
+                format!("{BASE}/approve"),
+                json!({"sha":"old-head"}),
+            ),
+            (
+                Action::Comment,
+                "POST",
+                format!("{BASE}/notes"),
+                json!({"body":"Please review this change."}),
+            ),
+            (
+                Action::Reply,
+                "POST",
+                format!("{BASE}/discussions/{THREAD}/notes"),
+                json!({"body":"Please review this change."}),
+            ),
+            (
+                Action::Resolve,
+                "PUT",
+                format!("{BASE}/discussions/{THREAD}"),
+                json!({"resolved":true}),
+            ),
+            (
+                Action::Merge,
+                "PUT",
+                format!("{BASE}/merge"),
+                json!({"sha":"old-head","auto_merge":false,"should_remove_source_branch":false}),
+            ),
+            (
+                Action::Close,
+                "PUT",
+                BASE.into(),
+                json!({"state_event":"close"}),
+            ),
+            (
+                Action::Rebase,
+                "PUT",
+                format!("{BASE}/rebase"),
+                json!({"skip_ci":false}),
+            ),
+            (
+                Action::RetryCi,
+                "POST",
+                "projects/42/pipelines/91/retry".into(),
+                json!({}),
+            ),
+            (
+                Action::EnableAutoMerge,
+                "PUT",
+                format!("{BASE}/merge"),
+                json!({"sha":"old-head","auto_merge":true,"should_remove_source_branch":false}),
+            ),
+        ] {
+            let write = prepare(BASE, &request(action), &c).unwrap();
+            assert_eq!(
+                (write.method, write.path, write.body),
+                (method, path, payload),
+                "{action:?}"
+            );
+        }
+        let draft = prepare(BASE, &request(Action::Draft), &c).unwrap();
+        assert_eq!(draft.method, "POST");
+        assert_eq!(draft.path, "graphql");
+        assert!(draft.body["query"]
+            .as_str()
+            .unwrap()
+            .contains("mergeRequestSetDraft"));
+        assert_eq!(
+            draft.body["variables"]["input"],
+            json!({"projectPath":"group/subgroup/project","iid":"7","draft":true})
+        );
+    }
+
     #[cfg(unix)]
     fn scripted(steps: &[Value]) -> (tempfile::TempDir, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;

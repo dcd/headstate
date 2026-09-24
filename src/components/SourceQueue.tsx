@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { PullRequest } from "../types/pr";
 import type { MergeRequest } from "../types/gitlab";
 import type { PrIdentity } from "../types/identity";
@@ -13,6 +13,8 @@ import { ExternalLink } from "./ExternalLink";
 import { relativeSeconds } from "../lib/time";
 import { useFilters } from "../store/filters";
 import { useRowCursor } from "../lib/useRowCursor";
+import { GitLabDetail } from "./GitLabDetail";
+import { GitLabBulkActions } from "./GitLabBulkActions";
 
 type Row = { kind: "github"; value: PullRequest } | { kind: "gitlab"; value: MergeRequest };
 
@@ -98,7 +100,7 @@ export function GitLabSummary({ mr, onBack }: { mr: MergeRequest | undefined; on
         <div className="text-xs text-[#8b949e]">GitLab · {mr.source.host} · {mr.repo} !{mr.number}</div>
         <h2 className="mt-1 text-lg font-semibold">{mr.title}</h2>
         <p className="mt-2 text-sm text-[#8b949e]">{mr.author} · {mr.head_ref} → {mr.base_ref}{mr.is_draft ? " · Draft" : ""}</p>
-        <p className="mt-3 text-sm text-[#8b949e]">CI, approval, and discussion status require a detail check.</p>
+        <GitLabDetail key={prKey(mr)} identity={prIdentity(mr)} />
         <ExternalLink href={mr.url} className="mt-3 inline-block text-sm text-[#4493f8] hover:underline">Open on GitLab</ExternalLink>
       </> : <p className="text-sm text-[#8b949e]">This merge request is no longer in the saved list. Go back and refresh the queue.</p>}
     </div>
@@ -130,6 +132,8 @@ export function SourceQueue({
   const repoKey = useSourceSelection((s) => s.repoKey);
   const query = useSourceSelection((s) => s.query);
   const setQuery = useSourceSelection((s) => s.setQuery);
+  const [gitlabSelected, setGitlabSelected] = useState<Set<string>>(() => new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
   const selectedPr = useFilters((s) => s.selectedPr);
   const cursor = useFilters((s) => s.cursor);
   const setCursor = useFilters((s) => s.setCursor);
@@ -161,6 +165,7 @@ export function SourceQueue({
     <label className="block text-xs text-[#8b949e]">Search pull and merge requests
       <input type="search" value={query} onChange={(e) => setQuery(e.target.value)} className="mt-1 w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-sm text-[#e6edf3]" placeholder="Title, project, or number" />
     </label>
+    <GitLabBulkActions rows={rows.flatMap((row) => row.kind === "gitlab" && gitlabSelected.has(prKey(row.value)) ? [row.value] : [])} onBusy={setBulkBusy} onSettled={() => { setGitlabSelected(new Set()); onRefreshGitLab(); }} />
     <div className="rounded-md border border-[#30363d]">
       <div className="border-b border-[#30363d] bg-[#161b22] px-4 py-3 text-sm font-semibold">{rows.length} shown</div>
       {rows.length === 0 ? <p className="px-4 py-10 text-center text-sm text-[#8b949e]">
@@ -169,7 +174,10 @@ export function SourceQueue({
           : query || repoKey ? "No requests match this search or repository." : "No open requests were returned by the selected sources."}
       </p> : rows.map((row, index) => row.kind === "github"
         ? <PrRow key={prKey(row.value)} pr={row.value} onOpen={() => onOpen(prIdentity(row.value))} opened={selectedPr !== null && prKey(selectedPr) === prKey(row.value)} cursored={cursor === index} canWrite={canWriteGitHub} showSource />
-        : <GitLabRow key={prKey(row.value)} mr={row.value} onOpen={() => onOpen(prIdentity(row.value))} opened={selectedPr !== null && prKey(selectedPr) === prKey(row.value)} cursored={cursor === index} />)}
+        : <div key={prKey(row.value)} className="flex items-start">
+          <input type="checkbox" className="ml-3 mt-4" aria-label={`Select GitLab ${row.value.source.host} ${row.value.repo} !${row.value.number}`} checked={gitlabSelected.has(prKey(row.value))} disabled={bulkBusy || (!gitlabSelected.has(prKey(row.value)) && gitlabSelected.size >= 10)} onChange={(event) => setGitlabSelected((previous) => { const next = new Set(previous); if (event.target.checked) next.add(prKey(row.value)); else next.delete(prKey(row.value)); return next; })} />
+          <div className="min-w-0 flex-1"><GitLabRow mr={row.value} onOpen={() => onOpen(prIdentity(row.value))} opened={selectedPr !== null && prKey(selectedPr) === prKey(row.value)} cursored={cursor === index} /></div>
+        </div>)}
     </div>
   </div>;
 }
