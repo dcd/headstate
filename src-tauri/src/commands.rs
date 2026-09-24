@@ -9032,3 +9032,12 @@ pub async fn gitlab_action(
 ) -> Result<crate::gitlab::actions::Receipt, String> {
     crate::gitlab::actions::execute(&request).await
 }
+
+#[tauri::command]
+pub async fn get_gitlab_detail(
+    identity: crate::identity::PrIdentity,
+) -> Result<crate::gitlab::detail::MergeRequestDetail, String> {
+    crate::gitlab::detail::fetch(&identity)
+        .await
+        .map_err(|issue| format!("GitLab detail unavailable ({issue:?})."))
+}

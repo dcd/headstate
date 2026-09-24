@@ -2062,3 +2062,10 @@ export const systemFootprint = () => call<Footprint>("system_footprint");
 /// empty table.
 export const systemNetworkProcesses = () =>
   call<NetProcess[]>("system_network_processes");
+
+export const getGitLabDetail = (identity: import("../types/identity").PrIdentity) =>
+  call<import("../types/gitlabActions").GitLabDetail>("get_gitlab_detail", { identity });
+export const getGitLabActionCapabilities = (identity: import("../types/identity").PrIdentity) =>
+  call<import("../types/gitlabActions").GitLabCapabilities>("gitlab_action_capabilities", { identity });
+export const gitLabAction = (request: import("../types/gitlabActions").GitLabActionRequest) =>
+  call<import("../types/gitlabActions").GitLabReceipt>("gitlab_action", { request });
