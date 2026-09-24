@@ -108,6 +108,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     // desktop-specific -- unlike `reveal_in_finder`, a phone could act on
     // this answer perfectly well.
     ("stats_tree", Class::Read),
+    ("gitlab_stats_tree", Class::Read),
+    ("gitlab_stats_load", Class::Read),
     // The per-author board behind the Mine and Others views (#826). A
     // Read, and the most expensive one in this table: it probes, slices,
     // and fetches per-PR nodes across a whole scope.
@@ -1017,6 +1019,15 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         )
         .await),
         "stats_tree" => res(commands::stats_tree(app.state()).await),
+        "gitlab_stats_tree" => res(commands::gitlab_stats_tree(a.get("host")?).await),
+        "gitlab_stats_load" => res(commands::gitlab_stats_load(
+            app.clone(),
+            a.get("host")?,
+            a.get("scope")?,
+            a.get("days")?,
+            a.get("refresh")?,
+        )
+        .await),
         // No `subject`, deliberately, and not an omission: a board asks
         // about everyone in the scope, and a subject qualifier would render
         // a leaderboard with one name on it. The viewer's login comes back

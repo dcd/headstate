@@ -59,6 +59,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("stats_count", Class::Read),
     // The stats scope hierarchy (#825). A Read; names only, no statistics.
     ("stats_tree", Class::Read),
+    ("gitlab_stats_tree", Class::Read),
+    ("gitlab_stats_load", Class::Read),
     // The Mine/Others per-author board (#826). A Read; the desktop's
     // ceiling, concurrency cap and budget refusal are inside the command.
     ("stats_board", Class::Read),

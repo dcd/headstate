@@ -20,6 +20,7 @@
 
 mod cache;
 pub mod devices;
+pub mod gitlab_stats;
 pub mod health;
 /// Which scopes the background backfill is allowed to walk, and how far
 /// (#1092). Written when a user opens a scope, so background spend

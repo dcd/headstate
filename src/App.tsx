@@ -190,8 +190,8 @@ import { MOBILE_HIDDEN_VIEWS, useActiveFilters, useFilters, viewLabel } from "./
 /// handful from the app's hand-drawn SVG. If the set had shipped the count
 /// would be in the thousands. Nothing to do here, and worth recording so
 /// the 44 MB does not get re-investigated.
-const StatsPage = lazy(() =>
-  import("./components/StatsPage").then((m) => ({ default: m.StatsPage })),
+const ProviderStatsPage = lazy(() =>
+  import("./components/ProviderStatsPage").then((m) => ({ default: m.ProviderStatsPage })),
 );
 const SystemHealthPage = lazy(() =>
   import("./components/SystemHealthPage").then((m) => ({
@@ -950,7 +950,7 @@ export default function App() {
                 the `SystemHealthPage` branch above for why the boundary
                 sits inside the padded wrapper. */}
             <Suspense fallback={<ViewLoading />}>
-              <StatsPage />
+              <ProviderStatsPage />
             </Suspense>
           </div>
         ) : (
