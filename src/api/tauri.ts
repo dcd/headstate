@@ -113,10 +113,27 @@ export type SourceRefreshResult = {
   mrs: MergeRequest[] | null;
   coverage: SourceCoverage;
 };
+export type SourcePollUpdate = {
+  source: Source;
+  list: SourceList;
+  phase: "not_requested" | "fetching" | "ready" | "partial" | "unknown" | "retrying" | "failed" | "not_asked";
+  error: string | null;
+  session: string;
+  revision: number;
+  receipt_revision: number | null;
+  completed_request: string | null;
+  last_received_at: string | null;
+  mrs: MergeRequest[] | null;
+  coverage: SourceCoverage | null;
+};
+export type SourceRefreshReply = SourceRefreshResult | {
+  request_id: string;
+  update: SourcePollUpdate;
+};
 export const getSourceSnapshot = (source: Source, list: SourceList) =>
   call<SourceSnapshot>("get_source_snapshot", { source, list });
-export const refreshSelectedSource = (source: Source, list: SourceList) =>
-  call<SourceRefreshResult>("refresh_source", { source, list });
+export const refreshSelectedSource = (source: Source, list: SourceList, requestId?: string) =>
+  call<SourceRefreshReply>("refresh_source", { source, list, requestId });
 export const setSourceSelection = (selection: "github" | "gitlab" | "both") =>
   call<void>("set_source_selection", { selection });
 

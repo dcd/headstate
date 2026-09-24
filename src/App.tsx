@@ -479,11 +479,11 @@ export default function App() {
     // sessions cursor down to the number of pull requests, or to `null`
     // when there are none. The owning view does its own clamping;
     // `nextCursor` is the shared rule.
-    if (activeRowCursor() !== null) return;
+    if (selection !== "github" || activeRowCursor() !== null) return;
     if (cursor !== null && cursor >= visible.length) {
       setCursor(visible.length > 0 ? visible.length - 1 : null);
     }
-  }, [cursor, visible.length, setCursor]);
+  }, [cursor, visible.length, setCursor, selection]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -543,7 +543,7 @@ export default function App() {
         // captured at mount -- the constraint #953 states explicitly,
         // and the same one the `visible` dependency below encodes.
         const registered = activeRowCursor();
-        const target: RowCursorTarget = registered ?? {
+        const target: RowCursorTarget = registered ?? (selection === "github" ? {
           rows: () => visible.length,
           open: (i) => {
             const pr = visible[i];
@@ -553,7 +553,7 @@ export default function App() {
             const pr = visible[i];
             if (pr) useFilters.getState().toggleChecked(prKey(pr));
           },
-        };
+        } : { rows: () => 0, open: () => {} });
         const rows = target.rows();
         if (rows === 0) return;
         const { cursor, setCursor } = useFilters.getState();
@@ -581,7 +581,7 @@ export default function App() {
     // into it, so a listener bound to a stale list would move the
     // cursor through rows that are no longer on screen. Re-binding one
     // window listener per filter change is cheap; a wrong cursor is not.
-  }, [selectPr, visible]);
+  }, [selectPr, visible, selection]);
 
   // The priorities strip is scoped to the selected repo, matching the page
   // it sits on: on `octocat/hello-world` you want that repo's blocked PRs,
@@ -1022,10 +1022,11 @@ export default function App() {
               gitlabError={gitlabQueue.error}
               githubCoverage={githubCoverage}
               gitlabCoverage={gitlabQueue.coverage}
+              githubStaleSecs={view === "to-review" ? reviewingStaleSecs : null}
               gitlabStaleSecs={gitlabQueue.staleSecs}
               canWriteGitHub={view === "my-prs"}
               onOpen={selectPr}
-              onRefreshGitHub={() => void (view === "to-review" ? refetchReviewing() : refetch())}
+              onRefreshGitHub={() => void (view === "to-review" ? refetchReviewing() : refreshGitHubFromGesture())}
               onRefreshGitLab={() => void gitlabQueue.refresh()}
             />
           </div>
