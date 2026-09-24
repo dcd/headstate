@@ -164,7 +164,6 @@ pub struct MergeRequestDetail {
     pub discussions: ReadState<DiscussionRead>,
 }
 
-/// GitLab.com only until a self-managed host has its own response fixtures.
 pub async fn fetch(identity: &PrIdentity) -> Result<MergeRequestDetail, DetailIssue> {
     validate_identity(identity)?;
     let program = super::auth::find_glab().ok_or(DetailIssue::MissingCli)?;
@@ -172,7 +171,9 @@ pub async fn fetch(identity: &PrIdentity) -> Result<MergeRequestDetail, DetailIs
 }
 
 pub(super) fn validate_identity(identity: &PrIdentity) -> Result<(), DetailIssue> {
-    if identity.source.provider != Provider::Gitlab || identity.source.host != super::auth::HOST {
+    if identity.source.provider != Provider::Gitlab
+        || super::host::validate(&identity.source.host).is_err()
+    {
         return Err(DetailIssue::UnsupportedHost);
     }
     if identity.number == 0
@@ -775,8 +776,9 @@ mod tests {
         wrong = core();
         wrong["iid"] = json!(8);
         assert!(map_core(&wrong, &identity("gitlab.com")).is_none());
+        assert_eq!(validate_identity(&identity("self.example")), Ok(()));
         assert_eq!(
-            validate_identity(&identity("self.example")),
+            validate_identity(&identity("self.example/path")),
             Err(DetailIssue::UnsupportedHost)
         );
         assert_eq!(

@@ -150,6 +150,20 @@ pub fn db_path(app: &AppHandle) -> std::path::PathBuf {
         .join("headstate.db")
 }
 
+fn configured_gitlab_host(app: &AppHandle) -> Result<String, String> {
+    let conn = open_db(&db_path(app)).map_err(|_| "Could not read the GitLab host setting.")?;
+    crate::gitlab::host::read_host(&conn).map_err(|error| error.to_string())
+}
+
+fn require_gitlab_host(app: &AppHandle, candidate: &str) -> Result<(), String> {
+    let configured = configured_gitlab_host(app)?;
+    if candidate == configured {
+        Ok(())
+    } else {
+        Err("This GitLab host is not the one configured in Settings.".into())
+    }
+}
+
 /// DIAGNOSTIC COMMAND (Settings > diagnostic log).
 ///
 /// Lets the frontend write into the same log file as the Rust side, so
@@ -251,6 +265,9 @@ pub fn get_source_snapshot(
     source: crate::identity::Source,
     list: CachedList,
 ) -> Result<crate::store::source_cache::SourceSnapshot, String> {
+    if source.provider == crate::identity::Provider::Gitlab {
+        require_gitlab_host(&app, &source.host)?;
+    }
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
     crate::store::source_cache::load_source_snapshot(&conn, &source, list)
         .map_err(|e| e.to_string())
@@ -280,10 +297,15 @@ pub fn set_source_selection(
         .0
         .store(github, std::sync::atomic::Ordering::Relaxed);
     waker.0.notify_one();
-    gitlab.select((selection != "github").then(|| crate::identity::Source {
-        provider: crate::identity::Provider::Gitlab,
-        host: "gitlab.com".into(),
-    }));
+    if selection == "github" {
+        gitlab.select(None);
+    } else {
+        let host = configured_gitlab_host(&app)?;
+        gitlab.select(Some(crate::identity::Source {
+            provider: crate::identity::Provider::Gitlab,
+            host,
+        }));
+    }
     Ok(())
 }
 
@@ -315,6 +337,9 @@ pub async fn refresh_source(
     list: CachedList,
     request_id: Option<String>,
 ) -> Result<SourceRefreshReply, String> {
+    if source.provider == crate::identity::Provider::Gitlab {
+        require_gitlab_host(&app, &source.host)?;
+    }
     let result = refresh_source_request(
         app.clone(),
         client,
@@ -5301,11 +5326,46 @@ pub fn get_auth_state(state: State<'_, AuthState>) -> AuthState {
     state.inner().clone()
 }
 
+#[tauri::command]
+pub fn get_gitlab_host(app: AppHandle) -> Result<String, String> {
+    configured_gitlab_host(&app)
+}
+
+#[tauri::command]
+pub fn set_gitlab_host(
+    app: AppHandle,
+    host: String,
+    control: State<'_, Arc<crate::gitlab::poll::Control>>,
+) -> Result<String, String> {
+    let conn = open_db(&db_path(&app)).map_err(|_| "Could not save the GitLab host setting.")?;
+    let host = crate::gitlab::host::write_host(&conn, &host).map_err(|e| e.to_string())?;
+    let selected = crate::store::settings::get::<String>(
+        &conn,
+        crate::store::settings::keys::SOURCE_SELECTION,
+    )
+    .ok()
+    .flatten()
+    .is_some_and(|selection| selection == "gitlab" || selection == "both");
+    control.select(selected.then(|| crate::identity::Source {
+        provider: crate::identity::Provider::Gitlab,
+        host: host.clone(),
+    }));
+    Ok(host)
+}
+
 /// GitLab authentication is checked independently of GitHub startup auth.
 /// The CLI retains the credential; only a fixed status and host cross IPC.
 #[tauri::command]
-pub async fn get_gitlab_auth_state() -> crate::gitlab::auth::AuthState {
-    crate::gitlab::auth::check().await
+pub async fn get_gitlab_auth_state(app: AppHandle) -> crate::gitlab::auth::AuthState {
+    match configured_gitlab_host(&app) {
+        Ok(host) => crate::gitlab::auth::check_host(&host).await,
+        Err(_) => crate::gitlab::auth::AuthState {
+            host: String::new(),
+            ok: false,
+            issue: Some(crate::gitlab::auth::AuthIssue::InvalidHost),
+            message: "The configured GitLab host is invalid. Enter a DNS hostname in Settings before using GitLab.".into(),
+        },
+    }
 }
 
 /// Import the Claude Code transcripts already on disk (#914, epic #910).
@@ -9018,7 +9078,11 @@ fn finish(app: &AppHandle, done: UpdateRunDone) {
 
 /// GitLab commands have no GitHub client dependency and no shared stats totals.
 #[tauri::command]
-pub async fn gitlab_stats_tree(host: String) -> Result<crate::gitlab::stats::Tree, String> {
+pub async fn gitlab_stats_tree(
+    app: AppHandle,
+    host: String,
+) -> Result<crate::gitlab::stats::Tree, String> {
+    require_gitlab_host(&app, &host)?;
     crate::gitlab::stats::tree(&host).await
 }
 #[tauri::command]
@@ -9029,6 +9093,7 @@ pub async fn gitlab_stats_load(
     days: u32,
     refresh: bool,
 ) -> Result<crate::gitlab::stats::Report, String> {
+    require_gitlab_host(&app, &host)?;
     crate::gitlab::stats::load(&host, scope, days, db_path(&app), refresh).await
 }
 
@@ -9039,28 +9104,35 @@ pub async fn gitlab_stats_backfill(
     scope: crate::gitlab::stats::Scope,
     days: u32,
 ) -> Result<crate::gitlab::stats::Backfill, String> {
+    require_gitlab_host(&app, &host)?;
     crate::gitlab::stats::backfill(&host, scope, days, db_path(&app)).await
 }
 
 /// Full identity is mandatory: these writes never fall through to GitHub.
 #[tauri::command]
 pub async fn gitlab_action_capabilities(
+    app: AppHandle,
     identity: crate::identity::PrIdentity,
 ) -> Result<crate::gitlab::actions::Capabilities, String> {
+    require_gitlab_host(&app, &identity.source.host)?;
     crate::gitlab::actions::capabilities(&identity).await
 }
 
 #[tauri::command]
 pub async fn gitlab_action(
+    app: AppHandle,
     request: crate::gitlab::actions::ActionRequest,
 ) -> Result<crate::gitlab::actions::Receipt, String> {
+    require_gitlab_host(&app, &request.identity.source.host)?;
     crate::gitlab::actions::execute(&request).await
 }
 
 #[tauri::command]
 pub async fn get_gitlab_detail(
+    app: AppHandle,
     identity: crate::identity::PrIdentity,
 ) -> Result<crate::gitlab::detail::MergeRequestDetail, String> {
+    require_gitlab_host(&app, &identity.source.host)?;
     crate::gitlab::detail::fetch(&identity)
         .await
         .map_err(|issue| format!("GitLab detail unavailable ({issue:?})."))

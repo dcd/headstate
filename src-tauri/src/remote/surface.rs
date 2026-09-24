@@ -78,6 +78,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("tool_versions", Class::Read),
     ("get_auth_state", Class::Read),
     ("get_gitlab_auth_state", Class::Read),
+    ("get_gitlab_host", Class::Read),
+    ("set_gitlab_host", Class::Local),
     ("get_source_snapshot", Class::Read),
     ("refresh_source", Class::Read),
     ("set_source_selection", Class::Local),
@@ -1004,7 +1006,8 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         // phone cannot ask for a larger payload than the desktop would.
         "read_log_tail" => res(commands::read_log_tail(app.clone(), a.get("maxBytes")?).await),
         "get_auth_state" => ok(commands::get_auth_state(app.state())),
-        "get_gitlab_auth_state" => ok(commands::get_gitlab_auth_state().await),
+        "get_gitlab_auth_state" => ok(commands::get_gitlab_auth_state(app.clone()).await),
+        "get_gitlab_host" => res(commands::get_gitlab_host(app.clone())),
         "get_source_snapshot" => res(commands::get_source_snapshot(
             app.clone(),
             a.get("source")?,
@@ -1039,7 +1042,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         )
         .await),
         "stats_tree" => res(commands::stats_tree(app.state()).await),
-        "gitlab_stats_tree" => res(commands::gitlab_stats_tree(a.get("host")?).await),
+        "gitlab_stats_tree" => res(commands::gitlab_stats_tree(app.clone(), a.get("host")?).await),
         "gitlab_stats_backfill" => res(commands::gitlab_stats_backfill(
             app.clone(),
             a.get("host")?,
@@ -1272,11 +1275,13 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("body")?,
         )
         .await),
-        "get_gitlab_detail" => res(commands::get_gitlab_detail(a.get("identity")?).await),
-        "gitlab_action_capabilities" => {
-            res(commands::gitlab_action_capabilities(a.get("identity")?).await)
+        "get_gitlab_detail" => {
+            res(commands::get_gitlab_detail(app.clone(), a.get("identity")?).await)
         }
-        "gitlab_action" => res(commands::gitlab_action(a.get("request")?).await),
+        "gitlab_action_capabilities" => {
+            res(commands::gitlab_action_capabilities(app.clone(), a.get("identity")?).await)
+        }
+        "gitlab_action" => res(commands::gitlab_action(app.clone(), a.get("request")?).await),
         "resolve_thread" => res(commands::resolve_thread(
             app.state(),
             a.get("threadId")?,

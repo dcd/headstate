@@ -93,9 +93,8 @@ struct Page {
     terminal_known: bool,
 }
 
-/// Only GitLab.com is enabled until a self-managed instance is probed.
 pub async fn fetch(source: &Source, list: CachedList) -> Result<FetchedList, QueueError> {
-    if source.provider != Provider::Gitlab || source.host != super::auth::HOST {
+    if source.provider != Provider::Gitlab || super::host::validate(&source.host).is_err() {
         return Err(QueueError::UnsupportedHost);
     }
     let program = super::auth::find_glab().ok_or(QueueError::MissingCli)?;

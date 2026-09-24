@@ -166,15 +166,10 @@ pub struct MergedAuthor {
 }
 
 fn source(host: &str) -> Result<Source, String> {
-    if host != super::auth::HOST {
-        return Err(
-            "GitLab statistics are enabled only for gitlab.com; self-managed validation is pending"
-                .into(),
-        );
-    }
+    let host = super::host::validate(host).map_err(|error| error.to_string())?;
     Ok(Source {
         provider: Provider::Gitlab,
-        host: host.into(),
+        host,
     })
 }
 fn path_ok(path: &str) -> bool {
