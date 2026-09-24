@@ -47,7 +47,6 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("get_auth_state", Class::Read),
     ("get_gitlab_auth_state", Class::Read),
     ("get_source_snapshot", Class::Read),
-    ("get_source_poll_status", Class::Read),
     ("refresh_source", Class::Read),
     ("set_source_selection", Class::Local),
     ("get_cached", Class::Read),

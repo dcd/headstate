@@ -293,7 +293,6 @@ pub fn run() {
             commands::tool_versions,
             commands::get_gitlab_auth_state,
             commands::get_source_snapshot,
-            commands::get_source_poll_status,
             commands::refresh_source,
             commands::set_source_selection,
             commands::read_log_tail,

@@ -79,7 +79,6 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("get_auth_state", Class::Read),
     ("get_gitlab_auth_state", Class::Read),
     ("get_source_snapshot", Class::Read),
-    ("get_source_poll_status", Class::Read),
     ("refresh_source", Class::Read),
     ("set_source_selection", Class::Local),
     ("get_cached", Class::Read),
@@ -1008,11 +1007,6 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "get_gitlab_auth_state" => ok(commands::get_gitlab_auth_state().await),
         "get_source_snapshot" => res(commands::get_source_snapshot(
             app.clone(),
-            a.get("source")?,
-            a.get("list")?,
-        )),
-        "get_source_poll_status" => ok(commands::get_source_poll_status(
-            app.state(),
             a.get("source")?,
             a.get("list")?,
         )),

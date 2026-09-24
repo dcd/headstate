@@ -256,15 +256,6 @@ pub fn get_source_snapshot(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub fn get_source_poll_status(
-    state: State<'_, crate::source_poll::SourcePolls>,
-    source: crate::identity::Source,
-    list: CachedList,
-) -> crate::source_poll::Status {
-    state.get(&source, list)
-}
-
 /// Persist the desktop's selected network sources independently of auth.
 #[tauri::command]
 pub fn set_source_selection(

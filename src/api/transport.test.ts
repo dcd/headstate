@@ -105,6 +105,7 @@ const row = (
 /// One row per exported wrapper: the command name and argument object
 /// each one sent to `invoke` before the seam existed.
 const source = { provider: "gitlab", host: "gitlab.example" } as const;
+const gitlabStatsScope = { kind: "project", path: "octocat/hello-world" } as const;
 const ROWS: Row[] = [
   row(api.getSourceSnapshot, [source, "reviewing"], "get_source_snapshot", { source, list: "reviewing" }),
   row(api.refreshSelectedSource, [source, "authored", "request-1"], "refresh_source", { source, list: "authored", requestId: "request-1" }),
@@ -359,6 +360,9 @@ const ROWS: Row[] = [
   // Argument-free: the scope hierarchy is everything the TOKEN can see, so
   // there is nothing for a caller to narrow. #825.
   row(api.statsTree, [], "stats_tree"),
+  row(api.gitlabStatsTree, ["gitlab.com"], "gitlab_stats_tree", { host: "gitlab.com" }),
+  row(api.gitlabStatsLoad, ["gitlab.com", gitlabStatsScope, days, true], "gitlab_stats_load", { host: "gitlab.com", scope: gitlabStatsScope, days, refresh: true }),
+  row(api.gitlabStatsBackfill, ["gitlab.com", gitlabStatsScope, days], "gitlab_stats_backfill", { host: "gitlab.com", scope: gitlabStatsScope, days }),
   // The scoped stats trio (#826). Argument order matters more here than on
   // most rows: all three take a scope kind and an optional value, and two of
   // them take a subject as well -- so a transposed pair would send a login
