@@ -8,6 +8,7 @@ use std::{path::Path, time::Duration};
 
 const BUDGET: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const RETRY_JOBS: &str = "/jobs?include_retried=false&per_page=100&page=1";
 const QUERY: &str = "query($path: ID!, $iid: String!) { project(fullPath: $path) { mergeRequest(iid: $iid) { iid webUrl diffHeadSha rebaseCommitSha autoMergeEnabled availableAutoMergeStrategies userPermissions { canApprove canMerge createNote updateMergeRequest pushToSourceBranch } headPipeline { id sha retryable userPermissions { updatePipeline } } discussions(first: 100) { nodes { replyId resolvable resolved userPermissions { resolveNote } notes(first: 1) { nodes { system userPermissions { createNote } } } } pageInfo { hasNextPage } } } } }";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,18 +401,44 @@ async fn execute_with_program(program: &Path, request: &ActionRequest) -> Result
     };
     let context = session.context().await.map_err(read_error)?;
     let write = prepare(&session.base(), request, &context)?;
+    let retry_before = if request.action == Action::RetryCi {
+        let path = pipeline_path(&context, RETRY_JOBS)?;
+        // Losing the optional proof must not turn an authorized retry into
+        // a false success. We can still write, but its receipt stays unverified.
+        let jobs = session.request("GET", &path, None).await.ok();
+        let before = jobs.as_ref().and_then(|v| retry_jobs(v, &context));
+        // Reading jobs adds latency: recheck the selected head/pipeline just
+        // before writing. GitLab's retry endpoint has no atomic SHA guard.
+        let fresh = session.core().await.map_err(read_error)?;
+        if fresh["sha"].as_str() != request.expected_head.as_deref()
+            || !same_pipeline(&fresh["head_pipeline"], &context)
+        {
+            return Err("The MR head or pipeline changed. Refresh before acting.".into());
+        }
+        before
+    } else {
+        None
+    };
     let response = session
         .request(write.method, &write.path, Some(write.body))
         .await;
     let verified = match response {
-        Ok(response) => verify(&session, request, &context, response)
-            .await
-            .unwrap_or(false),
+        Ok(response) => verify(
+            &session,
+            request,
+            &context,
+            response,
+            retry_before.as_deref(),
+        )
+        .await
+        .unwrap_or(false),
         Err(_) => false,
     };
     Ok(Receipt { identity: request.identity.clone(), action: request.action,
         outcome: if verified { Outcome::Verified } else { Outcome::Unverified },
-        message: if verified { "GitLab action verified." } else { "The GitLab action could not be verified. Refresh the MR on GitLab before trying again; it may already have applied." }.into() })
+        message: if verified && request.action == Action::RetryCi {
+            "At least one failed or canceled CI job has a new attempt. Refresh GitLab to check the other jobs."
+        } else if verified { "GitLab action verified." } else { "The GitLab action could not be verified. Refresh the MR on GitLab before trying again; it may already have applied." }.into() })
 }
 
 struct Write {
@@ -544,11 +571,65 @@ fn pipeline_path(context: &Context, suffix: &str) -> Result<String, String> {
     Ok(format!("projects/{project}/pipelines/{id}{suffix}"))
 }
 
+fn same_pipeline(pipeline: &Value, context: &Context) -> bool {
+    pipeline["id"].as_u64() == pipeline_id(&context.permissions["headPipeline"])
+        && pipeline["project_id"].as_u64() == context.raw["head_pipeline"]["project_id"].as_u64()
+        && pipeline["sha"].as_str() == context.core.head_oid.as_deref()
+}
+
+struct RetryJob {
+    id: u64,
+    name: String,
+    stage: String,
+    retryable: bool,
+}
+
+/// GitLab's pipeline jobs endpoint returns current attempts newest ID first.
+/// Retain only the first page: a new ID above its maximum cannot be an older
+/// job missed on another page. We prove at least one retry, never all retries.
+fn retry_jobs(value: &Value, context: &Context) -> Option<Vec<RetryJob>> {
+    let values = value.as_array()?;
+    if values.len() > 100 {
+        return None;
+    }
+    let jobs: Vec<_> = values
+        .iter()
+        .map(|v| {
+            if !same_pipeline(&v["pipeline"], context) {
+                return None;
+            }
+            Some(RetryJob {
+                id: v["id"].as_u64().filter(|id| *id > 0)?,
+                name: v["name"].as_str().filter(|s| !s.is_empty())?.to_owned(),
+                stage: v["stage"].as_str().filter(|s| !s.is_empty())?.to_owned(),
+                retryable: matches!(v["status"].as_str()?, "failed" | "canceled"),
+            })
+        })
+        .collect::<Option<_>>()?;
+    // An unexpected sort order or duplicate ID invalidates the high-water mark.
+    jobs.windows(2)
+        .all(|pair| pair[0].id > pair[1].id)
+        .then_some(jobs)
+}
+
+fn has_new_attempt(before: &[RetryJob], after: &[RetryJob]) -> bool {
+    let Some(newest) = before.first() else {
+        return false;
+    };
+    after.iter().any(|new| {
+        new.id > newest.id
+            && before
+                .iter()
+                .any(|old| old.retryable && old.name == new.name && old.stage == new.stage)
+    })
+}
+
 async fn verify(
     session: &Session<'_>,
     request: &ActionRequest,
     context: &Context,
     response: Value,
+    retry_before: Option<&[RetryJob]>,
 ) -> Result<bool, DetailIssue> {
     let base = session.base();
     match request.action {
@@ -594,13 +675,24 @@ async fn verify(
                 }))
         }
         Action::RetryCi => {
-            let path = pipeline_path(context, "").map_err(|_| DetailIssue::InvalidResponse)?;
-            let _pipeline = session.request("GET", &path, None).await?;
-            // Pipeline activity can predate this request. GitLab may skip a
-            // failed protected job while another job keeps running, so even
-            // a matching active pipeline cannot prove that any retry landed.
-            // Until we retain before/after job-level evidence, never confirm
-            // this action from pipeline state or the successful POST alone.
+            let Some(before) = retry_before.filter(|jobs| jobs.iter().any(|j| j.retryable)) else {
+                return Ok(false);
+            };
+            if !same_pipeline(&response, context) {
+                return Ok(false);
+            }
+            let path =
+                pipeline_path(context, RETRY_JOBS).map_err(|_| DetailIssue::InvalidResponse)?;
+            for attempt in 0..3 {
+                if attempt > 0 {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                let value = session.request("GET", &path, None).await?;
+                let after = retry_jobs(&value, context).ok_or(DetailIssue::InvalidResponse)?;
+                if has_new_attempt(before, &after) {
+                    return Ok(true);
+                }
+            }
             Ok(false)
         }
         Action::Rebase => {
@@ -883,7 +975,7 @@ mod tests {
         std::fs::write(
             &program,
             r#"#!/usr/bin/python3
-import sys,json,pathlib
+import sys,json,pathlib,time
 root=pathlib.Path(__file__).parent
 counter=root/'count'
 n=int(counter.read_text()) if counter.exists() else 0
@@ -899,6 +991,7 @@ if '--input' in args:
  assert '--header' in args and 'Content-Type: application/json' in args
 else: assert 'body' not in step
 counter.write_text(str(n+1))
+time.sleep(step.get('sleep_seconds',0))
 print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
 "#,
         )
@@ -919,29 +1012,234 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
         ]
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn retry_cannot_verify_an_unchanged_running_pipeline() {
-        // A failed protected job can be skipped by GitLab's retry service
-        // while another job remains running. The pipeline response is real
-        // but is not evidence that the requested retry happened.
-        let mut r = raw();
-        r["head_pipeline"]["status"] = json!("running");
-        let mut steps = context_steps(&r, &permissions());
-        steps.push(json!({"method":"POST","path":"projects/42/pipelines/91/retry","body":{},"response":{"id":91,"sha":"old-head","status":"running"}}));
+    fn pipeline() -> Value {
+        json!({"id":91,"project_id":42,"sha":"old-head","status":"running"})
+    }
+
+    fn job(id: u64, name: &str, status: &str) -> Value {
+        json!({"id":id,"name":name,"stage":"test","status":status,"pipeline":pipeline()})
+    }
+
+    fn retry_steps(before: Value, after: &[Value]) -> Vec<Value> {
+        let mut steps = context_steps(&raw(), &permissions());
         steps.push(read(
-            "projects/42/pipelines/91".into(),
-            json!({"id":91,"sha":"old-head","status":"running"}),
+            format!("projects/42/pipelines/91{RETRY_JOBS}"),
+            before,
         ));
-        let (dir, program) = scripted(&steps);
+        steps.push(read(
+            format!("{BASE}?include_rebase_in_progress=true"),
+            raw(),
+        ));
+        steps.push(json!({"method":"POST","path":"projects/42/pipelines/91/retry","body":{},"response":pipeline()}));
+        steps.extend(
+            after
+                .iter()
+                .map(|v| read(format!("projects/42/pipelines/91{RETRY_JOBS}"), v.clone())),
+        );
+        steps
+    }
+
+    #[cfg(unix)]
+    async fn check_retry(steps: &[Value], outcome: Outcome) -> Receipt {
+        let (dir, program) = scripted(steps);
         let receipt = execute_with_program(&program, &request(Action::RetryCi))
             .await
             .unwrap();
-        assert_eq!(receipt.outcome, Outcome::Unverified);
-        assert!(receipt.message.contains("could not be verified"));
+        assert_eq!(receipt.outcome, outcome);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("count")).unwrap(),
-            "5"
+            steps.len().to_string()
+        );
+        receipt
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retry_verifies_new_attempts_even_when_they_finish_before_readback() {
+        for prior_status in ["failed", "canceled"] {
+            for new_status in ["pending", "running", "success", "failed", "canceled"] {
+                let before = json!([job(200, "other", "running"), job(100, "unit", prior_status)]);
+                let after = json!([job(201, "unit", new_status), job(200, "other", "running")]);
+                let receipt = check_retry(&retry_steps(before, &[after]), Outcome::Verified).await;
+                assert!(receipt.message.starts_with("At least one"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retry_polls_for_delayed_evidence_but_does_not_repeat_the_write() {
+        let before = json!([job(100, "unit", "failed")]);
+        let after = json!([job(101, "unit", "pending")]);
+        check_retry(
+            &retry_steps(before.clone(), &[before.clone(), before, after]),
+            Outcome::Verified,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retry_cannot_verify_unchanged_running_pipeline_or_unrelated_jobs() {
+        let before = json!([job(200, "other", "running"), job(100, "unit", "failed")]);
+        for after in [
+            before.clone(),
+            // Status changes are not new attempts.
+            json!([job(200, "other", "running"), job(100, "unit", "pending")]),
+            json!([job(201, "unrelated", "pending"), job(100, "unit", "failed")]),
+            // An existing job from another page cannot be counted as new.
+            json!([job(150, "unit", "pending")]),
+            json!([]),
+        ] {
+            let receipt = check_retry(
+                &retry_steps(before.clone(), &[after.clone(), after.clone(), after]),
+                Outcome::Unverified,
+            )
+            .await;
+            assert!(receipt.message.contains("may already have applied"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retry_keeps_incomplete_or_failed_evidence_unverified() {
+        let before = json!([job(100, "unit", "failed")]);
+        let after = json!([job(101, "unit", "pending")]);
+        for invalid in [Value::Null, json!({}), json!([{"id":101}])] {
+            check_retry(&retry_steps(invalid.clone(), &[]), Outcome::Unverified).await;
+            check_retry(
+                &retry_steps(before.clone(), &[invalid]),
+                Outcome::Unverified,
+            )
+            .await;
+        }
+        for prior in [json!([]), json!([job(100, "unit", "success")])] {
+            check_retry(&retry_steps(prior, &[]), Outcome::Unverified).await;
+        }
+        for index in [3, 5, 6] {
+            let mut steps = retry_steps(before.clone(), std::slice::from_ref(&after));
+            steps[index]["status"] = json!(403);
+            // Failed baseline still permits the write; failed write has no readback.
+            if index != 6 {
+                steps.truncate(6);
+            }
+            check_retry(&steps, Outcome::Unverified).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retry_readback_timeout_keeps_receipt_unverified_without_repeating_write() {
+        let mut steps = retry_steps(
+            json!([job(100, "unit", "failed")]),
+            &[json!([job(101, "unit", "pending")])],
+        );
+        steps[6]["sleep_seconds"] = json!(30);
+        let receipt = check_retry(&steps, Outcome::Unverified).await;
+        assert!(receipt.message.contains("may already have applied"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retry_rejects_wrong_pipeline_project_or_head_in_every_evidence_source() {
+        let before = json!([job(100, "unit", "failed")]);
+        let after = json!([job(101, "unit", "pending")]);
+        for (field, wrong) in [
+            ("id", json!(92)),
+            ("project_id", json!(43)),
+            ("sha", json!("other-head")),
+        ] {
+            for index in [3, 5, 6] {
+                for value in [wrong.clone(), Value::Null] {
+                    let mut steps = retry_steps(before.clone(), std::slice::from_ref(&after));
+                    if index == 5 {
+                        steps[index]["response"][field] = value;
+                    } else {
+                        steps[index]["response"][0]["pipeline"][field] = value;
+                    }
+                    if index != 6 {
+                        steps.truncate(6);
+                    }
+                    check_retry(&steps, Outcome::Unverified).await;
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retry_rechecks_head_and_fork_pipeline_before_write() {
+        for field in ["sha", "id", "project_id"] {
+            let mut steps = retry_steps(json!([job(100, "unit", "failed")]), &[]);
+            steps[4]["response"]["head_pipeline"][field] = Value::Null;
+            steps.truncate(5);
+            let (dir, program) = scripted(&steps);
+            assert!(execute_with_program(&program, &request(Action::RetryCi))
+                .await
+                .unwrap_err()
+                .contains("changed"));
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("count")).unwrap(),
+                "5"
+            );
+        }
+        let mut steps = retry_steps(json!([job(100, "unit", "failed")]), &[]);
+        steps[4]["response"]["sha"] = json!("new-head");
+        steps.truncate(5);
+        let (_dir, program) = scripted(&steps);
+        assert!(execute_with_program(&program, &request(Action::RetryCi))
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn retry_requires_ordered_valid_job_evidence_and_respects_page_high_water_mark() {
+        let c = context(raw(), permissions());
+        for invalid in [
+            json!([job(100, "unit", "failed"), job(101, "other", "running")]),
+            json!([job(100, "unit", "failed"), job(100, "other", "running")]),
+            json!([job(0, "unit", "failed")]),
+            json!([job(100, "", "failed")]),
+        ] {
+            assert!(retry_jobs(&invalid, &c).is_none());
+        }
+        // A full page has unknown coverage, but its maximum still excludes
+        // older jobs. A captured failed job can prove at least one retry.
+        let page = Value::Array(
+            (101..=200)
+                .rev()
+                .map(|id| job(id, &format!("job-{id}"), "failed"))
+                .collect(),
+        );
+        let before = retry_jobs(&page, &c).unwrap();
+        let after = retry_jobs(&json!([job(201, "job-101", "pending")]), &c).unwrap();
+        assert!(has_new_attempt(&before, &after));
+        let after = retry_jobs(&json!([job(99, "job-101", "pending")]), &c).unwrap();
+        assert!(!has_new_attempt(&before, &after));
+        let after = retry_jobs(&json!([job(201, "job-100", "pending")]), &c).unwrap();
+        assert!(!has_new_attempt(&before, &after));
+    }
+
+    #[tokio::test]
+    async fn retry_readback_budget_exhaustion_is_not_proof() {
+        let c = context(raw(), permissions());
+        let before = retry_jobs(&json!([job(100, "unit", "failed")]), &c).unwrap();
+        let identity = identity();
+        let session = Session {
+            program: Path::new("/program-must-not-run"),
+            identity: &identity,
+            start: tokio::time::Instant::now() - BUDGET,
+        };
+        assert_eq!(
+            verify(
+                &session,
+                &request(Action::RetryCi),
+                &c,
+                pipeline(),
+                Some(&before)
+            )
+            .await,
+            Err(DetailIssue::BudgetExhausted)
         );
     }
 
@@ -1003,7 +1301,6 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
             Action::Draft,
             Action::Ready,
             Action::Rebase,
-            Action::RetryCi,
             Action::EnableAutoMerge,
             Action::DisableAutoMerge,
         ] {
@@ -1036,7 +1333,6 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
                     steps.push(read(path, json!({"id":123,"body":req.body,"system":false})));
                 }
                 Action::Resolve | Action::Unresolve => steps.push(read(format!("{BASE}/discussions/{THREAD}"), json!({"id":THREAD,"notes":[{"resolvable":true,"resolved":action == Action::Resolve}]}))),
-                Action::RetryCi => steps.push(read("projects/42/pipelines/91".into(), json!({"id":91,"sha":"old-head","status":"pending"}))),
                 Action::Rebase => {
                     r["sha"] = json!("new-head"); p["diffHeadSha"] = json!("new-head"); p["rebaseCommitSha"] = json!("new-head");
                     steps.extend(context_steps(&r, &p));
@@ -1059,15 +1355,7 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
             }
             let (dir, program) = scripted(&steps);
             let receipt = execute_with_program(&program, &req).await.unwrap();
-            assert_eq!(
-                receipt.outcome,
-                if action == Action::RetryCi {
-                    Outcome::Unverified
-                } else {
-                    Outcome::Verified
-                },
-                "{action:?}"
-            );
+            assert_eq!(receipt.outcome, Outcome::Verified, "{action:?}");
             assert_eq!(
                 std::fs::read_to_string(dir.path().join("count")).unwrap(),
                 steps.len().to_string()

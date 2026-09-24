@@ -31,9 +31,14 @@ GitLab's rebase endpoint has no atomic head guard, which the confirmation names.
 Every supported action has a separate readback. Approval checks the current
 user's approval and head; comments/replies check the returned note ID and body;
 resolution checks the requested thread's resolvable notes; state changes read
-the MR again; auto-merge reads its enabled flag. CI retry reads the pipeline
-again but always returns unverified: an already-running pipeline does not prove
-that GitLab retried a failed job, and protected jobs may have been skipped. Rebase polls at most three times and
+the MR again; auto-merge reads its enabled flag. CI retry captures the newest 100 current jobs before writing and rechecks the
+MR head and pipeline identity immediately before the POST. It polls jobs at
+most three times afterward. A new job ID above the baseline maximum must match
+the name and stage of a captured failed or canceled job, with the same pipeline,
+project and SHA. The receipt confirms only **at least one** new attempt;
+protected jobs may still have been skipped. An unchanged active pipeline,
+unrelated new job, missing baseline, failed readback or expired budget remains
+unverified. Rebase polls at most three times and
 requires a changed head matching GitLab's `rebaseCommitSha` after completion.
 
 A successful HTTP status alone never yields `verified`. A write timeout,
@@ -69,10 +74,16 @@ obtain the REST discussion ID. Public schema introspection verified
 rewriting an MR title. No live write, merge or fixture deletion was performed.
 
 Synthetic tests cover 13 actions with successful and failed readback, plus CI
-retry with explicitly unverified results even for an unchanged active pipeline, permission denial/missing data, stale heads, unsupported
+retry with new failed/canceled job attempts, delayed readback, unchanged active
+pipelines, unrelated jobs, malformed and missing evidence, bounded-page
+high-water marks, identity mismatches, budget exhaustion, permission denial/missing data, stale heads, unsupported
 hosts, identity mismatches, GraphQL errors, quick-action refusal, bounded
-discussion permissions and provider-qualified UI/bulk dispatch. CI retry needs before/after job-level evidence before it can be confirmed, and
-a no-op rebase can leave the SHA unchanged; these return unverified. A bounded
+discussion permissions and provider-qualified UI/bulk dispatch. CI retry uses GitLab's documented newest-first job ordering and new retry IDs;
+jobs outside the captured page, trigger-only retries and evidence that arrives
+after the bounded read remain unverified. Concurrent retries by another actor
+can supply the observed new attempt; the receipt proves resulting state, not
+which actor caused it. A no-op rebase can leave the SHA unchanged and remains
+unverified. A bounded
 read of the same disposable fixture confirmed system notes can expose
 `createNote: true`, so system status is checked independently. Backend fixtures
 prove system/unknown discussion permission is refused before the POST; UI
@@ -82,5 +93,8 @@ reauthentication, merge trains and self-managed hosts still lack live fixtures.
 Contracts checked against GitLab's [merge request API](https://docs.gitlab.com/api/merge_requests/),
 [approval API](https://docs.gitlab.com/api/merge_request_approvals/),
 [discussion API](https://docs.gitlab.com/api/discussions/),
-[notes API](https://docs.gitlab.com/api/notes/) and
+[notes API](https://docs.gitlab.com/api/notes/),
+[jobs API](https://docs.gitlab.com/api/jobs/),
+[job retry behavior](https://docs.gitlab.com/ci/jobs/#retry-jobs),
+[pipeline retry API](https://docs.gitlab.com/api/pipelines/#retry-jobs-in-a-pipeline) and
 [GraphQL schema](https://docs.gitlab.com/api/graphql/reference/).
