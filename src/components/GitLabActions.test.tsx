@@ -4,11 +4,12 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import type { GitLabCapabilities, GitLabDetail as Detail } from "../types/gitlabActions";
 import type { MergeRequest } from "../types/gitlab";
+import { GitLabSummary } from "./SourceQueue";
 import { GitLabDetail } from "./GitLabDetail";
 import { GitLabBulkActions } from "./GitLabBulkActions";
 import { getGitLabActionCapabilities, getGitLabDetail, gitLabAction } from "../api/tauri";
 
-vi.mock("../api/tauri", () => ({ getGitLabActionCapabilities: vi.fn(), getGitLabDetail: vi.fn(), gitLabAction: vi.fn() }));
+vi.mock("../api/tauri", async (original) => ({ ...await original<Record<string, unknown>>(), getGitLabActionCapabilities: vi.fn(), getGitLabDetail: vi.fn(), gitLabAction: vi.fn() }));
 vi.mock("./ExternalLink", () => ({ ExternalLink: ({ children }: { children: ReactNode }) => <span>{children}</span> }));
 
 const identity = { source: { provider: "gitlab" as const, host: "gitlab.com" }, repo: "group/subgroup/project", number: 7 };
@@ -139,4 +140,25 @@ describe("GitLab actions", () => {
     expect(screen.queryByRole("button", { name: "Close MRs" })).toBeNull();
     expect(gitLabAction).not.toHaveBeenCalled();
   });
+});
+
+
+it("keeps the selected detail draft and action receipt after the open queue drops the MR", async () => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const summary = (present: boolean) => <QueryClientProvider client={client}>
+    <GitLabSummary identity={identity} mr={present ? { ...identity, title: "A change", url: detail.core.url } as MergeRequest : undefined} onBack={() => {}} />
+  </QueryClientProvider>;
+  const view = render(summary(true));
+  const comment = await screen.findByLabelText("MR comment");
+  fireEvent.change(comment, { target: { value: "Keep this unsent draft" } });
+  view.rerender(summary(false));
+  expect((screen.getByLabelText("MR comment") as HTMLTextAreaElement).value).toBe("Keep this unsent draft");
+  fireEvent.click(screen.getByRole("button", { name: "Close MR" }));
+  fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+  expect(await screen.findByText("Close MR: GitLab action verified.")).toBeTruthy();
+  view.rerender(summary(true));
+  view.rerender(summary(false));
+  expect(screen.getByText("Close MR: GitLab action verified.")).toBeTruthy();
+  expect((screen.getByLabelText("MR comment") as HTMLTextAreaElement).value).toBe("Keep this unsent draft");
+  expect(getGitLabDetail).toHaveBeenCalledWith(identity);
 });

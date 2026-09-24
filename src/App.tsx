@@ -65,7 +65,7 @@ import { relativeSeconds } from "./lib/time";
 import { useGitHubAuthAvailable } from "./api/authAvailability";
 import { setSourceSelection } from "./api/tauri";
 import { useGitLabQueue } from "./api/gitlabQueues";
-import { useSourceRefresh } from "./api/sourceRefreshHooks";
+import { usePhoneGitHubRefresh, useSourceRefresh } from "./api/sourceRefreshHooks";
 import { useSourceSelection } from "./store/sourceSelection";
 import { GitLabSummary, SourceQueue, SourceRepoSidebar } from "./components/SourceQueue";
 import { MOBILE_HIDDEN_VIEWS, useActiveFilters, useFilters, viewLabel } from "./store/filters";
@@ -279,6 +279,7 @@ export default function App() {
       (error: unknown) => setSourceSelectionError(error instanceof Error ? error.message : String(error)),
     );
   }, [selection]);
+  usePhoneGitHubRefresh(githubEnabled);
   const githubAuthAvailable = useGitHubAuthAvailable();
   const {
     data: prs = [],
@@ -711,7 +712,7 @@ export default function App() {
       {/* Above everything, including the header: it says which
           desktop the whole screen is describing. Renders nothing on
           the desktop itself. */}
-      <ConnectionBanner updatedAt={dataUpdatedAt} githubAuthAvailable={githubAuthAvailable} />
+      <ConnectionBanner updatedAt={dataUpdatedAt} githubAuthAvailable={githubAuthAvailable} selection={selection} gitlab={gitlabQueue} />
       {sourceSelectionError ? <p role="alert" className="border-b border-[#d29922]/40 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]">The source choice could not be saved: {sourceSelectionError}</p> : null}
       {/* Below the banner and above everything else: the banner says
           which desktop, this says the rows underneath may be old. The
@@ -871,6 +872,7 @@ export default function App() {
         view !== "system-health" ? (
           <div className="p-4">
             {selectedPr.source?.provider === "gitlab" ? <GitLabSummary
+              identity={selectedPr}
               mr={[...(gitlabAuthored.rows ?? []), ...(gitlabReviewing.rows ?? [])].find((mr) => prKey(mr) === prKey(selectedPr))}
               onBack={() => selectPr(null)}
             /> : <PrDetailView
@@ -1202,7 +1204,7 @@ export default function App() {
       </div>
       {/* Pinned below both the sidebar and the list, so it reads as the
           window's status rather than the list's. */}
-      <StatusBar updatedAt={dataUpdatedAt} githubAuthAvailable={githubAuthAvailable} />
+      <StatusBar updatedAt={dataUpdatedAt} githubAuthAvailable={githubAuthAvailable} selection={selection} gitlab={gitlabQueue} />
     </div>
   );
 }

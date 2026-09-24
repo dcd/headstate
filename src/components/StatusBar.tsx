@@ -21,6 +21,10 @@ import { IS_MOBILE_BUILD } from "../lib/target";
 import { SettingsDialog } from "./SettingsDialog";
 import type { GitHubAuthAvailability } from "@/api/authAvailability";
 
+import type { SourceSelection } from "../store/sourceSelection";
+import type { GitLabQueueSnapshot } from "../api/gitlabQueueState";
+import { gitlabQueueSummary } from "../lib/gitlabQueueSummary";
+
 const CHOICES = [60, 120, 300, 900];
 
 function label(secs: number): string {
@@ -48,7 +52,11 @@ function label(secs: number): string {
 /// still being fast enough that nobody sits three versions behind.
 const UPDATE_CHECK_MS = 24 * 60 * 60 * 1000;
 
-export function StatusBar({ updatedAt, githubAuthAvailable = true }: { updatedAt: number; githubAuthAvailable?: GitHubAuthAvailability }) {
+export function StatusBar({ updatedAt, githubAuthAvailable = true, selection = "github", gitlab }: {
+  updatedAt: number; githubAuthAvailable?: GitHubAuthAvailability;
+  selection?: SourceSelection; gitlab?: GitLabQueueSnapshot;
+}) {
+  const gitlabSummary = gitlabQueueSummary(gitlab);
   const state = usePollState();
   const pollError = usePollError();
 
@@ -242,22 +250,29 @@ export function StatusBar({ updatedAt, githubAuthAvailable = true }: { updatedAt
           Only this pair moves. The progress counter, its cancel button,
           the version and the settings entry point below have no second
           home and stay on both. */}
-      {isMobile ? null : (
+      {isMobile || selection === "gitlab" ? null : (
         <>
           <span className="flex items-center gap-1.5">
             <span className={`h-1.5 w-1.5 rounded-full ${DOT[status]}`} aria-hidden="true" />
             <span className={status === "failed" ? "text-[#f85149]" : undefined}>
-              {TEXT[status]}
+              {selection === "both" && !TEXT[status].includes("GitHub") ? "GitHub · " : ""}{TEXT[status]}
             </span>
           </span>
 
           {/* `dataUpdatedAt`, not `isFetching`: the tray path advances the
               former on both routes but never flips the latter. */}
           {githubAuthAvailable === true && updatedAt > 0 ? (
-            <span>Updated {relativeTime(new Date(updatedAt).toISOString())}</span>
+            <span>{selection === "both" ? "GitHub updated" : "Updated"} {relativeTime(new Date(updatedAt).toISOString())}</span>
           ) : null}
         </>
       )}
+
+      {!isMobile && selection !== "github" ? (
+        <span className="flex items-center gap-1.5">
+          <span className={`h-1.5 w-1.5 rounded-full ${panicked ? DOT.panicked : gitlabSummary.warning ? DOT.stale : DOT.ok}`} aria-hidden="true" />
+          <span>{panicked ? TEXT.panicked : gitlabSummary.text}</span>
+        </span>
+      ) : null}
 
       {/* Bulk worktree removal reported progress only on the Worktrees
           page's own button -- but the work runs on the backend and

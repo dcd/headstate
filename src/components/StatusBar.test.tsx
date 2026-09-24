@@ -447,3 +447,35 @@ describe("a panicked background task", () => {
     expect(screen.queryByText(/Background updates stopped/)).toBeNull();
   });
 });
+
+
+describe("selected source status", () => {
+  const gitlab = { rows: [], coverage: "complete" as const, staleSecs: 120, loading: false, refreshing: false, error: null };
+  afterEach(() => { state.error = null; stubViewport(null); });
+
+  it("uses GitLab freshness and ignores GitHub auth and poll failures in GitLab-only mode", () => {
+    stubViewport(1400);
+    state.error = "GitHub failed";
+    render(<StatusBar updatedAt={Date.now()} githubAuthAvailable={false} selection="gitlab" gitlab={gitlab} />);
+    expect(screen.getByText("GitLab MRs updated 2 minutes ago")).toBeTruthy();
+    expect(screen.queryByText(/GitHub/)).toBeNull();
+    expect(screen.queryByText("PRs up to date")).toBeNull();
+    expect(screen.queryByText("Updated just now")).toBeNull();
+  });
+
+  it("names each provider in Both mode and qualifies a failed partial GitLab receipt", () => {
+    stubViewport(1400);
+    render(<StatusBar updatedAt={Date.now()} selection="both" gitlab={{ ...gitlab, coverage: { partial: { total: null } }, error: "GitLab refused credentials" }} />);
+    expect(screen.getByText("GitHub · PRs up to date")).toBeTruthy();
+    const status = screen.getByText("GitLab MRs updated 2 minutes ago · partial list · refresh failed");
+    expect(status.previousElementSibling?.className).toContain("d29922");
+    expect(screen.queryByText("PRs up to date")).toBeNull();
+  });
+
+  it("does not substitute a GitHub timestamp for missing GitLab freshness", () => {
+    stubViewport(1400);
+    render(<StatusBar updatedAt={Date.now()} selection="gitlab" gitlab={{ ...gitlab, staleSecs: "unknown", coverage: "unknown" }} />);
+    expect(screen.getByText("GitLab MRs freshness unavailable · completeness unknown")).toBeTruthy();
+    expect(screen.queryByText(/just now/)).toBeNull();
+  });
+});

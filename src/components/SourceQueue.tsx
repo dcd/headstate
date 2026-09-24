@@ -92,17 +92,19 @@ function GitLabRow({ mr, onOpen, opened, cursored }: { mr: MergeRequest; onOpen:
   );
 }
 
-export function GitLabSummary({ mr, onBack }: { mr: MergeRequest | undefined; onBack: () => void }) {
+export function GitLabSummary({ identity, mr, onBack }: { identity: PrIdentity; mr?: MergeRequest; onBack: () => void }) {
   return (
     <div className="rounded-md border border-[#30363d] bg-[#161b22] p-4">
       <button type="button" onClick={onBack} className="mb-3 text-sm text-[#4493f8]">← Back to list</button>
+      <div className="text-xs text-[#8b949e]">GitLab · {identity.source?.host} · {identity.repo} !{identity.number}</div>
       {mr ? <>
-        <div className="text-xs text-[#8b949e]">GitLab · {mr.source.host} · {mr.repo} !{mr.number}</div>
         <h2 className="mt-1 text-lg font-semibold">{mr.title}</h2>
         <p className="mt-2 text-sm text-[#8b949e]">{mr.author} · {mr.head_ref} → {mr.base_ref}{mr.is_draft ? " · Draft" : ""}</p>
-        <GitLabDetail key={prKey(mr)} identity={prIdentity(mr)} />
-        <ExternalLink href={mr.url} className="mt-3 inline-block text-sm text-[#4493f8] hover:underline">Open on GitLab</ExternalLink>
-      </> : <p className="text-sm text-[#8b949e]">This merge request is no longer in the saved list. Go back and refresh the queue.</p>}
+      </> : null}
+      {/* The open queue may omit a selected MR after a close or partial poll.
+          Identity keeps detail, drafts and action receipts mounted until Back. */}
+      <GitLabDetail key={prKey(identity)} identity={identity} />
+      {mr ? <ExternalLink href={mr.url} className="mt-3 inline-block text-sm text-[#4493f8] hover:underline">Open on GitLab</ExternalLink> : null}
     </div>
   );
 }

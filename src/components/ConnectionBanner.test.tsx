@@ -200,3 +200,35 @@ describe("ConnectionBanner", () => {
     await waitFor(() => expect(screen.getByRole("dialog").textContent).toContain("phone"));
   });
 });
+
+
+describe("selected provider connection status", () => {
+  const gitlab = { rows: [], coverage: "complete" as const, staleSecs: 120, loading: false, refreshing: false, error: null };
+  function connected() {
+    stubViewport(390);
+    connection.current = { kind: "connected", desktop: "octocat's laptop", lastPoll: null, protocolVersion: REQUIRED_PROTOCOL_VERSION, stale: false };
+  }
+  it("reports GitLab freshness without a GitHub auth error in GitLab-only mode", () => {
+    connected();
+    render(<ConnectionBanner updatedAt={Date.now()} githubAuthAvailable={false} selection="gitlab" gitlab={gitlab} />);
+    const banner = screen.getByRole("button");
+    expect(banner.textContent).toContain("GitLab MRs updated 2 minutes ago");
+    expect(banner.textContent).not.toContain("GitHub");
+    expect(banner.textContent).not.toContain("just now");
+  });
+  it("shows both providers and never colors a GitLab failure green because GitHub is fresh", () => {
+    connected();
+    render(<ConnectionBanner updatedAt={Date.now()} selection="both" gitlab={{ ...gitlab, rows: undefined, error: "Authentication unavailable" }} />);
+    const banner = screen.getByRole("button");
+    expect(banner.textContent).toContain("GitHub updated just now");
+    expect(banner.textContent).toContain("GitLab MRs: could not refresh");
+    expect(banner.firstElementChild?.className).toContain("d29922");
+  });
+  it("withholds provider freshness while the desktop is unreachable", () => {
+    stubViewport(390);
+    connection.current = { kind: "unreachable", desktop: "octocat's laptop", lastPoll: null, stale: true };
+    render(<ConnectionBanner selection="gitlab" gitlab={gitlab} />);
+    expect(screen.getByRole("button").textContent).toContain("unreachable");
+    expect(screen.queryByText(/GitLab MRs/)).toBeNull();
+  });
+});

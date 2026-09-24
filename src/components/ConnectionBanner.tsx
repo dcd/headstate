@@ -7,6 +7,10 @@ import { ExternalLink } from "./ExternalLink";
 import { SettingsDialog } from "./SettingsDialog";
 import type { GitHubAuthAvailability } from "@/api/authAvailability";
 
+import type { SourceSelection } from "../store/sourceSelection";
+import type { GitLabQueueSnapshot } from "../api/gitlabQueueState";
+import { gitlabQueueSummary } from "../lib/gitlabQueueSummary";
+
 /// Where "update Headstate on your desktop" sends the user: the desktop
 /// is what needs replacing, and the phone cannot do that for it.
 const DESKTOP_RELEASES = "https://github.com/pktstorm/headstate/releases/latest";
@@ -72,7 +76,10 @@ function describeState(state: Exclude<ConnectionState, { kind: "local" }>, githu
 /// Renders nothing on the desktop, where the app IS the desktop and
 /// there is no connection to describe. Tapping opens Settings on the
 /// Phone topic, which is where pairing lives.
-export function ConnectionBanner({ updatedAt = 0, githubAuthAvailable = true }: { updatedAt?: number; githubAuthAvailable?: GitHubAuthAvailability } = {}) {
+export function ConnectionBanner({ updatedAt = 0, githubAuthAvailable = true, selection = "github", gitlab }: {
+  updatedAt?: number; githubAuthAvailable?: GitHubAuthAvailability;
+  selection?: SourceSelection; gitlab?: GitLabQueueSnapshot;
+} = {}) {
   const isMobile = useIsMobile();
   const state = useConnectionState();
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -100,15 +107,14 @@ export function ConnectionBanner({ updatedAt = 0, githubAuthAvailable = true }: 
       </ExternalLink>
     );
   }
-  const { text, dot } = describeState(state, githubAuthAvailable);
-  // Appended rather than folded into `describeState`, which every state
-  // shares: GitHub freshness is only meaningful while the desktop is
-  // reachable. When it is not, the desktop is the problem and a stale
-  // GitHub timestamp is noise on top of it.
-  const line =
-    state.kind === "connected" && githubAuthAvailable === true && updatedAt > 0
-      ? `${text} · updated ${relativeTime(new Date(updatedAt).toISOString())}`
-      : text;
+  const githubEnabled = selection !== "gitlab";
+  const described = describeState(state, githubEnabled ? githubAuthAvailable : true);
+  const gitlabSummary = gitlabQueueSummary(gitlab);
+  const connected = state.kind === "connected";
+  const githubFreshness = connected && githubEnabled && githubAuthAvailable === true && updatedAt > 0
+    ? ` · ${selection === "both" ? "GitHub " : ""}updated ${relativeTime(new Date(updatedAt).toISOString())}` : "";
+  const line = `${described.text}${githubFreshness}${connected && selection !== "github" ? ` · ${gitlabSummary.text}` : ""}`;
+  const dot = connected && selection !== "github" && gitlabSummary.warning ? "bg-[#d29922]" : described.dot;
   return (
     <>
       <button

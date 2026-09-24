@@ -1,10 +1,11 @@
 import { useEffect, useSyncExternalStore } from "react";
-import { type QueryClient, useQueryClient } from "@tanstack/react-query";
+import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { PullRequest } from "../types/pr";
 import { SourceRefreshState, type SourceStatus } from "./sourceRefresh";
 import { getCached, refreshSource } from "./tauri";
 import { listen, type UnlistenFn } from "./transport";
 import { safeUnlisten } from "./unlisten";
+import { IS_MOBILE_BUILD } from "../lib/target";
 import { timeCall } from "./diag";
 
 type List = "authored" | "reviewing";
@@ -94,4 +95,20 @@ export async function readAuthored(qc: QueryClient): Promise<PullRequest[]> {
   const { state } = entry(qc, "authored");
   const cached = await getCached();
   return state.snapshot().prs ?? (cached.length > 0 ? cached : await refreshWithState(qc, "authored"));
+}
+
+
+/// The phone's source choice is independent of the desktop poll preference.
+/// Fetch upstream on selection, cadence and resume even when SQLite is warm.
+export function usePhoneGitHubRefresh(enabled: boolean) {
+  const qc = useQueryClient();
+  useQuery({
+    queryKey: ["phone-github-authored-refresh"],
+    queryFn: () => refreshWithState(qc, "authored"),
+    enabled: IS_MOBILE_BUILD && enabled,
+    staleTime: 0,
+    refetchInterval: 60_000,
+    refetchOnWindowFocus: "always",
+    retry: false,
+  });
 }
