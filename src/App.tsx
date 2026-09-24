@@ -807,12 +807,11 @@ export default function App() {
             </label>
           ) : null}
           <div className="ml-auto">
-            {/* My pull requests ONLY. The wizard composes a nudge for
-                pull requests YOU authored, so it means nothing on
-                Docker or Worktrees (local state) and nothing on To
-                review (other people's work). The previous condition
-                excluded only Worktrees, so it appeared on all three. */}
-            {view === "my-prs" ? (
+            {/* The wizard only understands GitHub pull requests and the
+                GitHub repository filter. A GitLab or Both list can retain
+                cached GitHub rows, but must not offer those hidden rows
+                as a review request for the selected source. */}
+            {view === "my-prs" && selection === "github" ? (
               // scopedRepo skips the wizard's "which repositories?" step:
               // selecting a repo in the sidebar already answers it.
               <NudgeWizard prs={source} scopedRepo={filters.repo} />

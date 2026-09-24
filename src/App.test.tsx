@@ -688,3 +688,25 @@ describe("source statistics navigation", () => {
     expect(screen.queryByRole("heading", { name: /GitLab MR Stats/ })).toBeNull();
   });
 });
+
+describe("review request source scope", () => {
+  afterEach(() => {
+    mockPrs.mockReturnValue([]);
+    useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
+    useFilters.setState({ view: "my-prs", selectedPr: null });
+  });
+
+  it("does not offer cached GitHub pull requests after selecting GitLab or Both", async () => {
+    mockPrs.mockReturnValue([PR_FIXTURES[0]]);
+    useFilters.setState({ view: "my-prs", selectedPr: null });
+    useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
+    renderApp();
+    expect(screen.getByRole("button", { name: "Request reviews" })).toBeTruthy();
+
+    await act(async () => useSourceSelection.setState({ selection: "gitlab", repoKey: null, query: "" }));
+    expect(screen.queryByRole("button", { name: "Request reviews" })).toBeNull();
+
+    await act(async () => useSourceSelection.setState({ selection: "both", repoKey: null, query: "" }));
+    expect(screen.queryByRole("button", { name: "Request reviews" })).toBeNull();
+  });
+});
