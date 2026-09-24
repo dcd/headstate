@@ -56,6 +56,25 @@ function accountReport(viewer: string) {
 describe("GitLab statistics account refresh", () => {
   beforeEach(() => vi.mocked(call).mockReset());
 
+  it("loads personal statistics when project discovery times out before page one", async () => {
+    vi.mocked(call).mockImplementation(async (name) => {
+      if (name === "gitlab_stats_tree") {
+        const partial = tree("1", [], false);
+        partial.coverage = { complete: false, stop: "timeout", pages: 0, received: 0, total: null, rate_remaining: null, rate_reset: null };
+        return partial;
+      }
+      return accountReport("1");
+    });
+    mountPage();
+    await screen.findByText("author-1");
+    expect(screen.getByText(/Project discovery is partial \(timeout\)/)).toBeTruthy();
+    expect(screen.getByRole("option", { name: "My authored MRs" })).toBeTruthy();
+    expect(screen.queryByRole("option", { name: /^Project:/ })).toBeNull();
+    const loads = vi.mocked(call).mock.calls.filter(([name]) => name === "gitlab_stats_load");
+    expect(loads).toHaveLength(1);
+    expect(loads[0][1]?.scope).toEqual({ kind: "mine" });
+  });
+
   it("rediscovers partial scopes and refreshes the same account's statistics", async () => {
     let discovery = 0;
     vi.mocked(call).mockImplementation(async (name) => {

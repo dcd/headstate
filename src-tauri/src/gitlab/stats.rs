@@ -55,6 +55,18 @@ pub struct Coverage {
 }
 
 impl Coverage {
+    fn empty(stop: Stop) -> Self {
+        Self {
+            complete: false,
+            stop,
+            pages: 0,
+            received: 0,
+            total: None,
+            rate_remaining: None,
+            rate_reset: None,
+        }
+    }
+
     fn rate_limited(&self) -> bool {
         self.stop == Stop::RateLimited || self.rate_remaining == Some(0)
     }
@@ -356,15 +368,7 @@ async fn pages_limited(
     let mut page_number = 1;
     let mut total_conflict = false;
     let separator = if base.contains('?') { '&' } else { '?' };
-    let mut coverage = Coverage {
-        complete: false,
-        stop: Stop::PageLimit,
-        pages: 0,
-        received: 0,
-        total: None,
-        rate_remaining: None,
-        rate_reset: None,
-    };
+    let mut coverage = Coverage::empty(Stop::PageLimit);
     for _ in 0..max_pages {
         let remaining = budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
@@ -448,15 +452,32 @@ pub async fn tree(host: &str) -> Result<Tree, String> {
     let program =
         super::auth::find_glab().ok_or("GitLab CLI (glab) was not found on the desktop")?;
     let viewer = viewer(&program, host).await?;
+    discover_tree(&program, source, viewer, BUDGET).await
+}
+
+async fn discover_tree(
+    program: &Path,
+    source: Source,
+    viewer: String,
+    budget: Duration,
+) -> Result<Tree, String> {
     let started = tokio::time::Instant::now();
-    let (rows, mut coverage) = pages(
-        &program,
-        host,
+    let (rows, mut coverage) = match pages(
+        program,
+        &source.host,
         "projects?membership=true&simple=true&order_by=id&sort=asc",
-        BUDGET,
+        budget,
     )
     .await
-    .map_err(|failure| error(&failure.stop))?;
+    {
+        Ok(result) => result,
+        // Project discovery is optional for the personal scope. A timeout
+        // before page one means unknown scopes, not an empty project list.
+        Err(failure) if failure.stop == Stop::Timeout => {
+            (Vec::new(), Coverage::empty(Stop::Timeout))
+        }
+        Err(failure) => return Err(error(&failure.stop)),
+    };
     let mut projects = BTreeMap::new();
     for row in rows {
         if let Some(path) = row
@@ -492,18 +513,18 @@ pub async fn tree(host: &str) -> Result<Tree, String> {
     let mut groups = Vec::new();
     let mut group_coverage = None;
     let mut group_error = None;
-    if coverage.rate_limited() || started.elapsed() >= BUDGET {
+    if coverage.rate_limited() || started.elapsed() >= budget {
         group_error = Some("Request budget exhausted before requesting groups".into());
     } else {
         match pages(
-            &program,
-            host,
+            program,
+            &source.host,
             // all_available=true scans every accessible group on GitLab.com;
             // it can return HTTP 500 after our request deadline. Member groups
             // are the scopes this account can act on, and project namespaces
             // still supply groups reached through project membership.
             "groups?all_available=false&order_by=id&sort=asc",
-            BUDGET.saturating_sub(started.elapsed()),
+            budget.saturating_sub(started.elapsed()),
         )
         .await
         {
@@ -1132,6 +1153,30 @@ esac
         )
         .await
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initial_project_timeout_keeps_personal_scope_available() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("glab");
+        std::fs::write(&program, "#!/bin/sh\nsleep 1\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let tree = discover_tree(
+            &program,
+            source("gitlab.com").unwrap(),
+            "viewer-id".into(),
+            Duration::from_millis(30),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tree.viewer, "viewer-id");
+        assert!(tree.projects.is_empty());
+        assert_eq!(tree.coverage.pages, 0);
+        assert_eq!(tree.coverage.stop, Stop::Timeout);
+        assert!(!tree.coverage.complete);
+        assert!(tree.group_error.is_some());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn late_timeout_retains_rows_and_first_failure_is_not_empty_success() {
