@@ -1,5 +1,6 @@
 import { type QueryClient, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { IS_MOBILE_BUILD } from "../lib/target";
 import { type View, useFilters } from "../store/filters";
 import { listen, type UnlistenFn } from "./transport";
 import { safeUnlisten } from "./unlisten";
@@ -4673,6 +4674,10 @@ export function useReviewing(enabled = true) {
     // failed there too.
     enabled,
     staleTime: 60_000,
+    // The phone may select GitHub while the desktop poller selects GitLab.
+    // Keep the visible review queue live without polling hidden views.
+    refetchInterval: IS_MOBILE_BUILD ? 60_000 : false,
+    refetchOnWindowFocus: IS_MOBILE_BUILD ? "always" : true,
   });
 
   // Live data the moment it exists; the cache only until then. Note

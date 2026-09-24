@@ -10,10 +10,11 @@ vi.mock("./transport", () => ({ listen: vi.fn(async () => () => {}), call: vi.fn
 vi.mock("./tauri", async (original) => ({
   ...await original<Record<string, unknown>>(),
   getCached: vi.fn(async () => PR_FIXTURES),
+  getCachedReviewing: vi.fn(async () => ({ prs: PR_FIXTURES, stale_secs: null })),
   refreshSource: vi.fn(async () => PR_FIXTURES.slice(1)),
 }));
 import { refreshSource } from "./tauri";
-import { usePullRequests } from "./hooks";
+import { usePullRequests, useReviewing } from "./hooks";
 import { usePhoneGitHubRefresh, useSourceRefresh } from "./sourceRefreshHooks";
 
 let client: QueryClient;
@@ -50,6 +51,31 @@ describe("phone source refresh", () => {
     await settle();
     expect(refreshSource).toHaveBeenCalledTimes(3);
     hook.rerender({ enabled: false });
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(refreshSource).toHaveBeenCalledTimes(3);
+  });
+
+  it("refreshes the active reviewing queue and stops when hidden or GitHub is deselected", async () => {
+    const hook = renderHook(({ github, view }) => useReviewing(github && view === "to-review"), {
+      wrapper, initialProps: { github: true, view: "my-prs" },
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(refreshSource).not.toHaveBeenCalled();
+    hook.rerender({ github: true, view: "to-review" });
+    await settle();
+    expect(refreshSource).toHaveBeenCalledTimes(1);
+    expect(refreshSource).toHaveBeenLastCalledWith("reviewing", expect.any(String));
+    expect(hook.result.current.data).toEqual(PR_FIXTURES.slice(1));
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(refreshSource).toHaveBeenCalledTimes(2);
+    act(() => focusManager.setFocused(false));
+    act(() => focusManager.setFocused(true));
+    await settle();
+    expect(refreshSource).toHaveBeenCalledTimes(3);
+    hook.rerender({ github: true, view: "my-prs" });
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(refreshSource).toHaveBeenCalledTimes(3);
+    hook.rerender({ github: false, view: "to-review" });
     await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
     expect(refreshSource).toHaveBeenCalledTimes(3);
   });
