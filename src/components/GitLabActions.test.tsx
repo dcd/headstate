@@ -75,6 +75,46 @@ describe("GitLab actions", () => {
     expect(screen.getByText("Current-head jobs were not checked.")).toBeTruthy();
   });
 
+  it("suppresses system-note replies while retaining permitted discussion replies", async () => {
+    const system = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const discussion = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    vi.mocked(getGitLabActionCapabilities).mockResolvedValue({
+      ...capabilities,
+      actions: [...capabilities.actions, { action: "reply", allowed: true, reason: null }],
+      discussions: [
+        { id: system, can_reply: false, can_resolve: false, resolved: false },
+        { id: discussion, can_reply: true, can_resolve: false, resolved: false },
+      ],
+    });
+    vi.mocked(getGitLabDetail).mockResolvedValue({
+      ...detail,
+      discussions: { state: "available", value: { unresolved_resolvable: 0, discussions: {
+        total: 2, coverage: "complete", items: [system, discussion].map((id, index) => ({
+          id, individual_note: index === 0,
+          notes: [{ comment: { id: index + 1, author: "person", body: index === 0 ? "Changed title" : "Review note", created_at: null, system: index === 0 }, kind: null, resolvable: false, resolved: false }],
+        })),
+      } } },
+    });
+    wrap(<GitLabDetail identity={identity} />);
+    await screen.findByText("Changed title");
+    expect(screen.getAllByLabelText("Discussion reply")).toHaveLength(1);
+    fireEvent.change(screen.getByLabelText("Discussion reply"), { target: { value: "Thanks" } });
+    fireEvent.click(screen.getByRole("button", { name: "Reply" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    await waitFor(() => expect(gitLabAction).toHaveBeenCalledExactlyOnceWith({ identity, action: "reply", expected_head: "head-7", body: "Thanks", discussion_id: discussion }));
+  });
+
+  it("reports an uncertain CI retry without claiming success", async () => {
+    vi.mocked(getGitLabActionCapabilities).mockResolvedValue({ ...capabilities, actions: [{ action: "retry_ci", allowed: true, reason: null }] });
+    vi.mocked(gitLabAction).mockResolvedValue({ identity, action: "retry_ci", outcome: "unverified", message: "The GitLab action could not be verified. Refresh before trying again." });
+    wrap(<GitLabDetail identity={identity} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Retry failed CI" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("Retry failed CI: The GitLab action could not be verified.");
+    expect(gitLabAction).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/action verified\./)).toBeNull();
+  });
+
   it("retains per-identity bulk results and clears uncertain writes rather than retrying them", async () => {
     const other = { ...identity, number: 8 };
     const rows = [{ ...identity, head_oid: "head-7" }, { ...other, head_oid: "head-8" }] as MergeRequest[];

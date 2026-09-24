@@ -8,7 +8,7 @@ use std::{path::Path, time::Duration};
 
 const BUDGET: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-const QUERY: &str = "query($path: ID!, $iid: String!) { project(fullPath: $path) { mergeRequest(iid: $iid) { iid webUrl diffHeadSha rebaseCommitSha autoMergeEnabled availableAutoMergeStrategies userPermissions { canApprove canMerge createNote updateMergeRequest pushToSourceBranch } headPipeline { id sha retryable userPermissions { updatePipeline } } discussions(first: 100) { nodes { replyId resolvable resolved userPermissions { resolveNote } } pageInfo { hasNextPage } } } } }";
+const QUERY: &str = "query($path: ID!, $iid: String!) { project(fullPath: $path) { mergeRequest(iid: $iid) { iid webUrl diffHeadSha rebaseCommitSha autoMergeEnabled availableAutoMergeStrategies userPermissions { canApprove canMerge createNote updateMergeRequest pushToSourceBranch } headPipeline { id sha retryable userPermissions { updatePipeline } } discussions(first: 100) { nodes { replyId resolvable resolved userPermissions { resolveNote } notes(first: 1) { nodes { system userPermissions { createNote } } } } pageInfo { hasNextPage } } } } }";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,6 +39,7 @@ pub struct Capability {
 #[derive(Debug, Clone, Serialize)]
 pub struct DiscussionCapability {
     pub id: String,
+    pub can_reply: bool,
     pub can_resolve: bool,
     pub resolved: bool,
 }
@@ -329,12 +330,22 @@ fn capabilities_from(core: &MrCore, raw: &Value, data: &Value) -> Capabilities {
         .filter_map(|d| {
             Some(DiscussionCapability {
                 id: discussion_id(d["replyId"].as_str()?)?.to_owned(),
+                can_reply: yes(p, "createNote")
+                    && d.pointer("/notes/nodes/0/system").and_then(Value::as_bool) == Some(false)
+                    && d.pointer("/notes/nodes/0/userPermissions/createNote")
+                        .and_then(Value::as_bool)
+                        == Some(true),
                 can_resolve: yes(d, "resolvable") && yes(&d["userPermissions"], "resolveNote"),
                 resolved: d["resolved"].as_bool()?,
             })
         })
         .collect();
     for cap in &mut actions {
+        if cap.action == Action::Reply {
+            cap.allowed = discussions.iter().any(|d| d.can_reply);
+            cap.reason = (!cap.allowed)
+                .then(|| "No discussion with confirmed reply permission is available.".into());
+        }
         if matches!(cap.action, Action::Resolve | Action::Unresolve) {
             cap.allowed = discussions
                 .iter()
@@ -468,6 +479,9 @@ fn prepare(base: &str, request: &ActionRequest, context: &Context) -> Result<Wri
             })
             .ok_or("A valid GitLab discussion ID is required.")?;
         let cap = context.capabilities.discussions.iter().find(|d| d.id == id).ok_or("Discussion permission is unavailable in the bounded permission read. Open it on GitLab.")?;
+        if request.action == Action::Reply && !cap.can_reply {
+            return Err("GitLab has not granted permission to reply to this discussion.".into());
+        }
         if matches!(request.action, Action::Resolve | Action::Unresolve) && !cap.can_resolve {
             return Err("GitLab has not granted permission to resolve this discussion.".into());
         }
@@ -581,15 +595,13 @@ async fn verify(
         }
         Action::RetryCi => {
             let path = pipeline_path(context, "").map_err(|_| DetailIssue::InvalidResponse)?;
-            let v = session.request("GET", &path, None).await?;
-            Ok(
-                v["id"].as_u64() == pipeline_id(&context.permissions["headPipeline"])
-                    && v["sha"].as_str() == request.expected_head.as_deref()
-                    && matches!(
-                        v["status"].as_str(),
-                        Some("pending" | "running" | "preparing" | "waiting_for_resource")
-                    ),
-            )
+            let _pipeline = session.request("GET", &path, None).await?;
+            // Pipeline activity can predate this request. GitLab may skip a
+            // failed protected job while another job keeps running, so even
+            // a matching active pipeline cannot prove that any retry landed.
+            // Until we retain before/after job-level evidence, never confirm
+            // this action from pipeline state or the successful POST alone.
+            Ok(false)
         }
         Action::Rebase => {
             // The endpoint enqueues work. Bounded polling may yield an
@@ -659,7 +671,7 @@ mod tests {
     }
 
     fn permissions() -> Value {
-        json!({"iid":"7","webUrl":"https://gitlab.com/group/subgroup/project/-/merge_requests/7","diffHeadSha":"old-head","rebaseCommitSha":null,"autoMergeEnabled":false,"availableAutoMergeStrategies":["merge_when_checks_pass"],"userPermissions":{"canApprove":true,"canMerge":true,"createNote":true,"updateMergeRequest":true,"pushToSourceBranch":true},"headPipeline":{"id":"gid://gitlab/Ci::Pipeline/91","sha":"old-head","retryable":true,"userPermissions":{"updatePipeline":true}},"discussions":{"nodes":[{"replyId":format!("gid://gitlab/DiffDiscussion/{THREAD}"),"resolvable":true,"resolved":false,"userPermissions":{"resolveNote":true}}],"pageInfo":{"hasNextPage":false}}})
+        json!({"iid":"7","webUrl":"https://gitlab.com/group/subgroup/project/-/merge_requests/7","diffHeadSha":"old-head","rebaseCommitSha":null,"autoMergeEnabled":false,"availableAutoMergeStrategies":["merge_when_checks_pass"],"userPermissions":{"canApprove":true,"canMerge":true,"createNote":true,"updateMergeRequest":true,"pushToSourceBranch":true},"headPipeline":{"id":"gid://gitlab/Ci::Pipeline/91","sha":"old-head","retryable":true,"userPermissions":{"updatePipeline":true}},"discussions":{"nodes":[{"replyId":format!("gid://gitlab/DiffDiscussion/{THREAD}"),"resolvable":true,"resolved":false,"userPermissions":{"resolveNote":true},"notes":{"nodes":[{"system":false,"userPermissions":{"createNote":true}}]}}],"pageInfo":{"hasNextPage":false}}})
     }
 
     fn context(raw: Value, permissions: Value) -> Context {
@@ -909,6 +921,75 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn retry_cannot_verify_an_unchanged_running_pipeline() {
+        // A failed protected job can be skipped by GitLab's retry service
+        // while another job remains running. The pipeline response is real
+        // but is not evidence that the requested retry happened.
+        let mut r = raw();
+        r["head_pipeline"]["status"] = json!("running");
+        let mut steps = context_steps(&r, &permissions());
+        steps.push(json!({"method":"POST","path":"projects/42/pipelines/91/retry","body":{},"response":{"id":91,"sha":"old-head","status":"running"}}));
+        steps.push(read(
+            "projects/42/pipelines/91".into(),
+            json!({"id":91,"sha":"old-head","status":"running"}),
+        ));
+        let (dir, program) = scripted(&steps);
+        let receipt = execute_with_program(&program, &request(Action::RetryCi))
+            .await
+            .unwrap();
+        assert_eq!(receipt.outcome, Outcome::Unverified);
+        assert!(receipt.message.contains("could not be verified"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("count")).unwrap(),
+            "5"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn system_or_unknown_discussion_reply_permission_refuses_before_post() {
+        for note in [
+            json!({"system":true,"userPermissions":{"createNote":true}}),
+            json!({"system":null,"userPermissions":{"createNote":true}}),
+            json!({"userPermissions":{"createNote":true}}),
+            json!({"system":false,"userPermissions":{"createNote":false}}),
+            json!({"system":false,"userPermissions":{"createNote":null}}),
+            json!({"system":false}),
+        ] {
+            let mut p = permissions();
+            // Another eligible discussion keeps the MR-level Reply action
+            // enabled, forcing the selected discussion's own gate to decide.
+            let mut other = p["discussions"]["nodes"][0].clone();
+            other["replyId"] =
+                json!("gid://gitlab/DiffDiscussion/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+            p["discussions"]["nodes"]
+                .as_array_mut()
+                .unwrap()
+                .push(other);
+            p["discussions"]["nodes"][0]["notes"]["nodes"][0] = note;
+            let c = context(raw(), p.clone());
+            assert!(!c.capabilities.discussions[0].can_reply);
+            assert!(c.capabilities.discussions[1].can_reply);
+            assert!(c
+                .capabilities
+                .actions
+                .iter()
+                .any(|c| c.action == Action::Reply && c.allowed));
+            let steps = context_steps(&raw(), &p);
+            let (dir, program) = scripted(&steps);
+            let error = execute_with_program(&program, &request(Action::Reply))
+                .await
+                .unwrap_err();
+            assert!(error.contains("permission to reply to this discussion"));
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("count")).unwrap(),
+                "3"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn every_supported_action_requires_matching_readback_after_the_write() {
         for action in [
             Action::Approve,
@@ -978,7 +1059,15 @@ print('HTTP/2 '+str(step.get('status',200))+'\n\n'+json.dumps(step['response']))
             }
             let (dir, program) = scripted(&steps);
             let receipt = execute_with_program(&program, &req).await.unwrap();
-            assert_eq!(receipt.outcome, Outcome::Verified, "{action:?}");
+            assert_eq!(
+                receipt.outcome,
+                if action == Action::RetryCi {
+                    Outcome::Unverified
+                } else {
+                    Outcome::Verified
+                },
+                "{action:?}"
+            );
             assert_eq!(
                 std::fs::read_to_string(dir.path().join("count")).unwrap(),
                 steps.len().to_string()

@@ -12,7 +12,9 @@ Before each write, the adapter reads the exact MR and its GraphQL permissions.
 The REST IID/URL and GraphQL IID/URL/head must agree with the requested identity.
 Approval additionally requires the REST `user_can_approve` flag and refuses
 known reauthentication requirements. Discussion resolution checks each
-discussion's `resolveNote` permission; retry CI checks the current-head
+discussion's `resolveNote` permission; replies require an explicitly non-system
+first note with `createNote` permission as well as MR comment permission. Missing
+note or permission data suppresses replies. Retry CI checks the current-head
 pipeline's `retryable` and `updatePipeline` flags. Pipeline writes use the
 pipeline's project ID, including fork pipelines.
 
@@ -29,8 +31,9 @@ GitLab's rebase endpoint has no atomic head guard, which the confirmation names.
 Every supported action has a separate readback. Approval checks the current
 user's approval and head; comments/replies check the returned note ID and body;
 resolution checks the requested thread's resolvable notes; state changes read
-the MR again; retry checks the current pipeline's identity, head and active
-status; auto-merge reads its enabled flag. Rebase polls at most three times and
+the MR again; auto-merge reads its enabled flag. CI retry reads the pipeline
+again but always returns unverified: an already-running pipeline does not prove
+that GitLab retried a failed job, and protected jobs may have been skipped. Rebase polls at most three times and
 requires a changed head matching GitLab's `rebaseCommitSha` after completion.
 
 A successful HTTP status alone never yields `verified`. A write timeout,
@@ -65,12 +68,15 @@ obtain the REST discussion ID. Public schema introspection verified
 `MergeRequestSetDraftInput`; draft toggles use that mutation rather than
 rewriting an MR title. No live write, merge or fixture deletion was performed.
 
-Synthetic tests cover all 14 supported actions with successful readback and
-failed readback, permission denial/missing data, stale heads, unsupported
+Synthetic tests cover 13 actions with successful and failed readback, plus CI
+retry with explicitly unverified results even for an unchanged active pipeline, permission denial/missing data, stale heads, unsupported
 hosts, identity mismatches, GraphQL errors, quick-action refusal, bounded
-discussion permissions and provider-qualified UI/bulk dispatch. CI retry can
-finish before readback, and a no-op rebase can leave the SHA unchanged; these
-return unverified rather than manufacturing proof. Required approval rules,
+discussion permissions and provider-qualified UI/bulk dispatch. CI retry needs before/after job-level evidence before it can be confirmed, and
+a no-op rebase can leave the SHA unchanged; these return unverified. A bounded
+read of the same disposable fixture confirmed system notes can expose
+`createNote: true`, so system status is checked independently. Backend fixtures
+prove system/unknown discussion permission is refused before the POST; UI
+fixtures prove the reply form is absent while ordinary replies remain usable. Required approval rules,
 reauthentication, merge trains and self-managed hosts still lack live fixtures.
 
 Contracts checked against GitLab's [merge request API](https://docs.gitlab.com/api/merge_requests/),
