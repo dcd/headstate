@@ -11,6 +11,7 @@ use crate::{
 };
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -255,35 +256,19 @@ async fn persist(app: &AppHandle, source: &Source, list: CachedList, result: &Fe
     }
 }
 
-async fn poll_queue(
+async fn fetch_and_persist(
     app: &AppHandle,
-    control: &Control,
-    selection: &Selection,
     source: &Source,
     list: CachedList,
-    baseline: &mut Baseline,
-    prefs: &NotifyPrefs,
-) {
-    if !control.is_current(selection) {
-        return;
-    }
+) -> Option<(source_poll::Publication, FetchedList)> {
     let attempt = source_poll::begin(app, source.clone(), list).await;
     // The accumulating loader enforces FETCH_TIMEOUT itself. Wrapping it in
     // timeout/select would throw away pages that already arrived.
     match queues::fetch(source, list).await {
         Ok(receipt) => {
-            let Some(publication) = source_poll::success_publication(app, &attempt).await else {
-                return;
-            };
+            let publication = source_poll::success_publication(app, &attempt).await?;
             persist(app, source, list, &receipt).await;
-            if control.is_current(selection) {
-                for notice in baseline.observe(source, list, &receipt) {
-                    notify(app, notice, prefs);
-                }
-            }
-            // The permit holds until both the persisted receipt and terminal
-            // event are published. Newer foreground successes win atomically.
-            source_poll::complete_gitlab(app, publication, Ok(receipt));
+            Some((publication, receipt))
         }
         Err(error) => {
             if let Some(publication) = source_poll::publication(app, &attempt).await {
@@ -297,8 +282,46 @@ async fn poll_queue(
                 };
                 source_poll::complete_gitlab(app, publication, Err(failure));
             }
+            None
         }
     }
+}
+
+/// Load preferences after the network and persistence work settles. A user
+/// disabling alerts while a fetch is pending must not receive its MR titles.
+async fn notification_batch<T, P: Future<Output = NotifyPrefs>>(
+    prepared: impl Future<Output = Option<T>>,
+    read_preferences: impl FnOnce() -> P,
+) -> Option<(T, NotifyPrefs)> {
+    let prepared = prepared.await?;
+    let prefs = read_preferences().await;
+    Some((prepared, prefs))
+}
+
+async fn poll_queue(
+    app: &AppHandle,
+    control: &Control,
+    selection: &Selection,
+    source: &Source,
+    list: CachedList,
+    baseline: &mut Baseline,
+) {
+    if !control.is_current(selection) {
+        return;
+    }
+    let Some(((publication, receipt), prefs)) =
+        notification_batch(fetch_and_persist(app, source, list), || preferences(app)).await
+    else {
+        return;
+    };
+    if control.is_current(selection) {
+        for notice in baseline.observe(source, list, &receipt) {
+            notify(app, notice, &prefs);
+        }
+    }
+    // The permit holds until both the persisted receipt and terminal
+    // event are published. Newer foreground successes win atomically.
+    source_poll::complete_gitlab(app, publication, Ok(receipt));
 }
 
 /// Start once at desktop setup, independently of whether a GitHub client exists.
@@ -325,7 +348,6 @@ pub fn spawn(
                 reviewing = Baseline::default();
                 baseline_revision = Some(selection.revision);
             }
-            let prefs = preferences(&app).await;
             tokio::join!(
                 poll_queue(
                     &app,
@@ -334,7 +356,6 @@ pub fn spawn(
                     source,
                     CachedList::Authored,
                     &mut authored,
-                    &prefs,
                 ),
                 poll_queue(
                     &app,
@@ -343,7 +364,6 @@ pub fn spawn(
                     source,
                     CachedList::Reviewing,
                     &mut reviewing,
-                    &prefs,
                 ),
             );
             tokio::select! {
@@ -571,6 +591,45 @@ mod tests {
         prefs.enabled = false;
         assert!(!NoticeKind::Conflict.enabled(&prefs));
         assert!(!NoticeKind::CiFailed.enabled(&prefs));
+    }
+
+    #[tokio::test]
+    async fn disabling_notifications_during_fetch_suppresses_both_queue_arrivals() {
+        let source = source("gitlab.com");
+        for list in [CachedList::Authored, CachedList::Reviewing] {
+            let saved_prefs = Mutex::new(NotifyPrefs::default());
+            let reads = AtomicU64::new(0);
+            let mut baseline = Baseline::default();
+            baseline.observe(&source, list, &receipt(vec![], Coverage::Complete));
+            let (fetched, pending_fetch) = tokio::sync::oneshot::channel();
+            let pending =
+                notification_batch(async { Some(pending_fetch.await.unwrap()) }, || async {
+                    reads.fetch_add(1, Ordering::Relaxed);
+                    *saved_prefs.lock().unwrap()
+                });
+            tokio::pin!(pending);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(5), &mut pending,)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(reads.load(Ordering::Relaxed), 0);
+
+            // The user changes settings while the queue is still in flight.
+            saved_prefs.lock().unwrap().enabled = false;
+            fetched
+                .send(receipt(vec![mr(&source, 7)], Coverage::Complete))
+                .unwrap();
+            let (receipt, prefs) = pending.await.unwrap();
+            let notices = baseline.observe(&source, list, &receipt);
+            assert_eq!(notices.len(), 1, "this arrival would expose an MR title");
+            assert!(notices.iter().all(|notice| !notice.kind.enabled(&prefs)));
+            assert_eq!(reads.load(Ordering::Relaxed), 1);
+            assert!(
+                baseline.observe(&source, list, &receipt).is_empty(),
+                "muted receipts still advance history, so enabling alerts cannot replay them"
+            );
+        }
     }
 
     #[tokio::test]
