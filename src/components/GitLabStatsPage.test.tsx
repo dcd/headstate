@@ -140,7 +140,7 @@ describe("GitLab merged and participation coverage", () => {
       failures: ["GitLab rate limit reached; try again later"], rate_remaining: 0, rate_reset: null,
     };
     render(<GitLabStatsResults report={data} />);
-    expect(screen.getByText(/At least 1 current approvals/)).toBeTruthy();
+    expect(screen.getAllByText(/At least 1 current approvals/)).toHaveLength(2);
     expect(screen.getByText(/Unavailable current change requests/)).toBeTruthy();
     expect(screen.getByText(/First formal review: Unavailable/)).toBeTruthy();
   });
