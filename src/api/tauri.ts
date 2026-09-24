@@ -930,8 +930,10 @@ export const getMergedDetail = () => call<MergedDetail>("get_merged_detail");
 /// Computed once at startup from the `gh` CLI token. `ok: false` means the
 /// user needs to run `gh auth login`; `message` is ready-to-display prose.
 export const getAuthState = () => call<AuthState>("get_auth_state");
-/// The desktop checks glab's GitLab.com credential. No token crosses IPC.
+/// The desktop checks glab's configured GitLab host. No token crosses IPC.
 export const getGitLabAuthState = () => call<GitLabAuthState>("get_gitlab_auth_state");
+export const getGitLabHost = () => call<string>("get_gitlab_host");
+export const setGitLabHost = (host: string) => call<string>("set_gitlab_host", { host });
 
 /// Regenerable build output under the configured scan roots.
 ///

@@ -360,6 +360,8 @@ const ROWS: Row[] = [
   // Argument-free: the scope hierarchy is everything the TOKEN can see, so
   // there is nothing for a caller to narrow. #825.
   row(api.statsTree, [], "stats_tree"),
+  row(api.getGitLabHost, [], "get_gitlab_host"),
+  row(api.setGitLabHost, ["gitlab.example"], "set_gitlab_host", { host: "gitlab.example" }),
   row(api.gitlabStatsTree, ["gitlab.com"], "gitlab_stats_tree", { host: "gitlab.com" }),
   row(api.gitlabStatsLoad, ["gitlab.com", gitlabStatsScope, days, true], "gitlab_stats_load", { host: "gitlab.com", scope: gitlabStatsScope, days, refresh: true }),
   row(api.gitlabStatsBackfill, ["gitlab.com", gitlabStatsScope, days], "gitlab_stats_backfill", { host: "gitlab.com", scope: gitlabStatsScope, days }),
