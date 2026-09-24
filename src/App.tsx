@@ -273,7 +273,14 @@ export default function App() {
   const statsProvider = selection === "both" ? statsTab : selection;
   const githubEnabled = selection !== "gitlab";
   const gitlabEnabled = selection !== "github";
-  const gitlabHost = useQuery({ queryKey: ["gitlab-host"], queryFn: getGitLabHost, retry: false });
+  const gitlabHost = useQuery({
+    queryKey: ["gitlab-host"], queryFn: getGitLabHost, retry: false,
+    // A paired phone stays open while the desktop host setting changes.
+    // Recheck it on the phone's queue cadence so its next requests use the
+    // new host and the old host's rows disappear together.
+    refetchInterval: IS_MOBILE_BUILD ? 60_000 : false,
+    refetchOnWindowFocus: IS_MOBILE_BUILD ? "always" : true,
+  });
   const [sourceSelectionError, setSourceSelectionError] = useState<string | null>(null);
   useEffect(() => {
     if (!IS_DESKTOP_BUILD) return;

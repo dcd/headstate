@@ -142,6 +142,7 @@ describe("the remote surface's frontend half", () => {
       "revealLog",
       "revokePairedDevice",
       "setAutostart",
+      "setGitLabHost",
       "setNotifyPrefs",
       "setRemoteEnabled",
       // App only synchronizes desktop polling preferences behind

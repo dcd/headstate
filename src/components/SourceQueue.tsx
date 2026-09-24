@@ -164,7 +164,7 @@ export function SourceQueue({
     { name: "GitLab", rows: gitlab?.length, loading: gitlabLoading, error: gitlabError, coverage: gitlabCoverage, staleSecs: gitlabStaleSecs, retry: onRefreshGitLab },
   ];
   return <div className="space-y-3">
-    <p className="text-xs text-[#8b949e]">GitLab queues currently read GitLab.com. Self-managed hosts are not configured yet.</p>
+    <p className="text-xs text-[#8b949e]">GitLab queues use the host configured in Settings on the desktop.</p>
     {sources.map((source) => <div key={source.name}>
       {source.error ? <div role="alert" className="rounded-md border border-[#d29922]/40 bg-[#d29922]/10 px-4 py-2 text-sm text-[#d29922]">
         {source.name}: {source.error}{source.rows !== undefined ? " Saved rows remain visible." : ""}

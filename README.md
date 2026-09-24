@@ -251,7 +251,7 @@ discussions, approvals, CI, and permission-checked actions use the configured
 host. GitLab MR Stats offers author, project, and group scopes; incomplete
 reads remain visibly partial. GitHub and GitLab statistics stay separate.
 
-**GitHub pull request list.** Every open PR you authored, across every repo
+**Pull request list.** On GitHub, every open PR you authored, across every repo
 you have access to, in one list — the chrome mirrors GitHub's own
 `<owner>/<repo>/pulls` view: filter by label (include *and* exclude —
 GitHub's own UI only lets you include), review state, drafts, and sort
@@ -281,7 +281,7 @@ with admin access on that repository.
 nobody else — real merge conflicts or failing CI — so the thing you need to
 fix first doesn't get lost in a longer list. Quiet when nothing is blocked.
 
-**GitHub PR Stats.** The first entry in the view menu, answering what the
+**PR Stats.** GitHub's first entry in the view menu, answering what the
 open-PR list cannot: how much is actually getting done, whether that is improving,
 and — for a team or org lead — how the team is doing.
 

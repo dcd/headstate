@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionState } from "./api/connection";
@@ -333,6 +333,29 @@ describe("Stats on the companion build", () => {
     fireEvent.change(screen.getByLabelText("Source"), { target: { value: "gitlab" } });
     expect((screen.getByLabelText("Source") as HTMLSelectElement).value).toBe("gitlab");
     expect(commands).not.toContain("set_source_selection");
+  });
+
+  it("rechecks the desktop GitLab host on the phone's queue cadence", async () => {
+    const hostReads: string[] = [];
+    mockIPC((command, args) => {
+      if (command === "remote_call" && args && "command" in args && args.command === "get_gitlab_host") {
+        hostReads.push("read");
+        return hostReads.length === 1 ? "gitlab.com" : "self.example";
+      }
+      return undefined;
+    }, { shouldMockEvents: true });
+    useSourceSelection.setState({ selection: "gitlab", repoKey: null, query: "" });
+    vi.useFakeTimers();
+    const app = await renderMobileApp();
+    try {
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(hostReads).toHaveLength(1);
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      expect(hostReads.length).toBeGreaterThan(1);
+    } finally {
+      app.unmount();
+      vi.useRealTimers();
+    }
   });
 
   /// #863 ships PR Stats to the companion, reversing #794's
