@@ -205,7 +205,7 @@ import {
 /// is never a bare empty screen while a poll is in flight. Callers that
 /// need "never authenticated" vs. "authenticated, still loading" should
 /// consult `get_auth_state` (see `AuthGate`).
-export function usePullRequests() {
+export function usePullRequests(enabled = true) {
   const qc = useQueryClient();
 
   const source = useSourceRefresh("authored");
@@ -213,6 +213,7 @@ export function usePullRequests() {
   const query = useQuery({
     queryKey: ["prs"],
     queryFn: read,
+    enabled,
     staleTime: Infinity,
   });
   return { ...query, data: source.prs ?? query.data };
@@ -278,7 +279,7 @@ export function useRefreshFromGesture(): () => Promise<void> {
   return useCallback(() => refreshFromGitHub(qc), [qc]);
 }
 
-export function useRefreshRequested(): void {
+export function useRefreshRequested(enabled = true): void {
   const qc = useQueryClient();
   useSourceRefresh("authored");
 
@@ -294,7 +295,7 @@ export function useRefreshRequested(): void {
       // goes to the poll-error store. Extracted when the phone's
       // pull-to-refresh gained the same meaning (#639); a second copy
       // would have drifted.
-      void refreshFromGitHub(qc);
+      if (enabled) void refreshFromGitHub(qc);
     }).then(
       (fn) => {
         if (cancelled) safeUnlisten(fn);
@@ -307,7 +308,7 @@ export function useRefreshRequested(): void {
       cancelled = true;
       safeUnlisten(unlisten);
     };
-  }, [qc]);
+  }, [qc, enabled]);
 }
 
 /// The latest provider or foreground transport failure for the authored list.
@@ -4728,10 +4729,11 @@ export function useReviewing(enabled = true) {
 /// The badge's own query, so it does not depend on the list being
 /// fetched. MEASURED: 1 rate-limit point and ~0.9s, against 6 and ~4s
 /// for the list it replaces here.
-export function useReviewingCount() {
+export function useReviewingCount(enabled = true) {
   return useQuery({
     queryKey: ["reviewing-count"],
     queryFn: REVIEWING_COUNT_FN,
+    enabled,
     staleTime: 60_000,
   });
 }

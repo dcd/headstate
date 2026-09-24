@@ -204,6 +204,27 @@ mod tests {
         .unwrap()
     }
     #[test]
+    fn gitlab_snapshot_wire_keeps_absence_and_coverage_distinct() {
+        let conn = db();
+        let source = gitlab("gitlab.com");
+        save_gitlab_snapshot(
+            &conn,
+            &source,
+            CachedList::Reviewing,
+            &[sample_mr(source.clone())],
+            &Coverage::Partial { total: Some(3) },
+        )
+        .unwrap();
+        let wire = serde_json::to_value(
+            load_source_snapshot(&conn, &source, CachedList::Reviewing).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wire["data"]["state"], "git_lab_available");
+        assert_eq!(wire["data"]["coverage"]["partial"]["total"], 3);
+        assert!(wire["data"]["mrs"][0]["ci"].is_null());
+        assert!(wire["data"]["mrs"][0]["review"].is_null());
+    }
+    #[test]
     fn overlapping_ids_roundtrip_and_a_mixed_write_cannot_replace_good_data() {
         let conn = db();
         let gh = Source::default();
