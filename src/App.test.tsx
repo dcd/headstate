@@ -1,14 +1,16 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { PullRequest } from "./types/pr";
+import type { PullRequest, StatsTree } from "./types/pr";
 import { PR_FIXTURES, prWithState } from "./fixtures/prs";
 import { useFilters } from "./store/filters";
+import { useSourceSelection } from "./store/sourceSelection";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { AuthGate } from "./components/AuthGate";
 
 // The shell talks to Tauri on mount. Stub the command surface so these tests
 // exercise the wiring, not the backend.
+const mockStatsTree = vi.fn<() => StatsTree | undefined>(() => undefined);
 const mockPrs = vi.fn<() => PullRequest[]>(() => []);
 const mockReviewing = vi.fn<() => PullRequest[]>(() => []);
 const mockReviewError = vi.fn<() => Error | null>(() => null);
@@ -101,7 +103,7 @@ vi.mock("./api/hooks", () => ({
   // pending: these tests are about what the PR Stats page body renders, and
   // a pending sidebar would leave a "Finding your organizations" line in
   // the document that a `queryByText` elsewhere could trip over.
-  useStatsTree: () => ({ data: undefined, isPending: false, error: null }),
+  useStatsTree: () => ({ data: mockStatsTree(), isPending: false, error: null }),
   useReviewing: () => ({ data: mockReviewing(), isLoading: false, isError: mockReviewError() !== null, error: mockReviewError(), refetch: () => Promise.resolve() }),
   // The badge's own cheap query, separate from the list.
   useReviewingCount: () => ({ data: mockReviewing().length }),
@@ -188,6 +190,7 @@ const { default: App } = await import("./App");
 /// SHELL (the switcher entry, and the `<h1>` at `App.tsx:529`, which is
 /// driven by `view` alone), not on the lazy page's body.
 await Promise.all([
+  import("./components/ProviderStatsPage"),
   import("./components/StatsPage"),
   import("./components/SystemHealthPage"),
 ]);
@@ -421,13 +424,13 @@ describe("keyboard triage", () => {
     fireEvent.keyDown(window, { key, bubbles: true });
 
   it("puts the cursor on the first row on the first press", () => {
-    render(<App />);
+    renderApp();
     press("j");
     expect(useFilters.getState().cursor).toBe(0);
   });
 
   it("walks down and back up", () => {
-    render(<App />);
+    renderApp();
     press("j");
     press("j");
     expect(useFilters.getState().cursor).toBe(1);
@@ -438,7 +441,7 @@ describe("keyboard triage", () => {
   // Clamped, not wrapped: wrapping from the bottom back to the top
   // silently moves the eye across the whole screen.
   it("stops at the top rather than wrapping", () => {
-    render(<App />);
+    renderApp();
     press("j");
     press("k");
     press("k");
@@ -446,7 +449,7 @@ describe("keyboard triage", () => {
   });
 
   it("selects the cursor row with x", () => {
-    render(<App />);
+    renderApp();
     press("j");
     press("x");
     expect(useFilters.getState().checked).toHaveLength(1);
@@ -455,7 +458,7 @@ describe("keyboard triage", () => {
   // `x` with no cursor must do nothing rather than select row 0 -- the
   // user has not pointed at anything yet.
   it("does nothing on x before the cursor exists", () => {
-    render(<App />);
+    renderApp();
     press("x");
     expect(useFilters.getState().checked).toEqual([]);
   });
@@ -488,13 +491,13 @@ describe("opening a pull request from To review", () => {
   });
 
   it("lists the review queue", () => {
-    render(<App />);
+    renderApp();
     expect(screen.getByText(theirs.title)).toBeTruthy();
   });
 
   it("keeps usable review rows visible beside a newer refresh failure", () => {
     mockReviewError.mockReturnValue(new Error("newer review refresh failed"));
-    render(<App />);
+    renderApp();
     expect(screen.getByText(theirs.title)).toBeTruthy();
     expect(screen.getByText("Could not refresh the pull requests awaiting your review")).toBeTruthy();
     expect(screen.getByText("newer review refresh failed")).toBeTruthy();
@@ -502,7 +505,7 @@ describe("opening a pull request from To review", () => {
   });
 
   it("selects the pull request when its row is clicked", () => {
-    render(<App />);
+    renderApp();
     fireEvent.click(screen.getByText(theirs.title));
     expect(useFilters.getState().selectedPr).toEqual({
       repo: "someone/else",
@@ -515,7 +518,7 @@ describe("opening a pull request from To review", () => {
   // failure here is about rendering rather than routing.
   it("shows the detail view rather than staying on the list", () => {
     useFilters.setState({ selectedPr: { repo: "someone/else", number: 71 } });
-    render(<App />);
+    renderApp();
     expect(screen.getByRole("button", { name: /back to list/i })).toBeTruthy();
   });
 });
@@ -542,7 +545,7 @@ describe("an incomplete refresh", () => {
     if (view === "my-prs") mockTruncation.mockReturnValue(null);
     else mockShortfall.mockReturnValue(null);
     useFilters.setState({ view });
-    render(<App />);
+    renderApp();
     expect(screen.getByText("GitHub could not confirm whether this list is complete.")).toBeTruthy();
     expect(screen.queryByText(/12 pull requests are missing/i)).toBeNull();
   });
@@ -555,27 +558,27 @@ describe("an incomplete refresh", () => {
   it("says how many pull requests are missing from a short review list", () => {
     mockShortfall.mockReturnValue(12);
     useFilters.setState({ view: "to-review" });
-    render(<App />);
+    renderApp();
     expect(screen.getByText(/12 pull requests are missing/i)).toBeTruthy();
   });
 
   it("stays quiet when the review list is complete", () => {
     mockShortfall.mockReturnValue(0);
     useFilters.setState({ view: "to-review" });
-    render(<App />);
+    renderApp();
     expect(screen.queryByText(/missing from this list/i)).toBeNull();
   });
 
   it("says so when GitHub refused some fields", () => {
     mockRefused.mockReturnValue(86);
-    render(<App />);
+    renderApp();
     expect(screen.getByText(/could not compute 86 fields/i)).toBeTruthy();
   });
 
   // Silence is the normal case; a banner that is always there stops
   // being read.
   it("stays quiet when nothing was refused", () => {
-    render(<App />);
+    renderApp();
     expect(screen.queryByText(/could not compute/i)).toBeNull();
   });
 
@@ -583,7 +586,7 @@ describe("an incomplete refresh", () => {
   it("still renders the pull requests it did receive", () => {
     mockRefused.mockReturnValue(86);
     mockPrs.mockReturnValue([{ ...PR_FIXTURES[0], title: "Survived" }]);
-    render(<App />);
+    renderApp();
     expect(screen.getByText("Survived")).toBeTruthy();
   });
 });
@@ -655,5 +658,33 @@ describe("the Claude Code route is gated on the capability", () => {
     uiPrefs.value = { hidden_views: [], close_hides_to_tray: true, claude_integrations_enabled: false };
     at("claude-md");
     expect(screen.getByRole("heading", { name: "CLAUDE.md" })).toBeTruthy();
+  });
+});
+
+
+describe("source statistics navigation", () => {
+  afterEach(() => {
+    mockStatsTree.mockReturnValue(undefined);
+    useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
+  });
+
+  it("shows GitHub scopes only while the GitHub statistics tab is active", async () => {
+    mockStatsTree.mockReturnValue({
+      viewer: "octocat", orgs: [], orgsTotal: 0, personal: [], personalTotal: 0,
+      refusedFields: 0, spend: { points: 0, requests: 0, unmetered: 0, remaining: null, resetAt: null },
+    });
+    useFilters.setState({ view: "pr-stats", selectedPr: null });
+    useSourceSelection.setState({ selection: "both", repoKey: null, query: "" });
+    renderApp();
+    await act(async () => {});
+    expect(screen.getByRole("button", { name: /Everything/ })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "GitLab MR Stats" }));
+    expect(screen.getByRole("heading", { name: /GitLab MR Stats/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Everything/ })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "GitHub PR Stats" }));
+    expect(screen.getByRole("button", { name: /Everything/ })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: /GitLab MR Stats/ })).toBeNull();
   });
 });

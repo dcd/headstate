@@ -266,6 +266,9 @@ function ViewLoading() {
 export default function App() {
   const selection = useSourceSelection((s) => s.selection);
   const setSelection = useSourceSelection((s) => s.setSelection);
+  const sourceRepoKey = useSourceSelection((s) => s.repoKey);
+  const [statsTab, setStatsTab] = useState<"github" | "gitlab">("github");
+  const statsProvider = selection === "both" ? statsTab : selection;
   const githubEnabled = selection !== "gitlab";
   const gitlabEnabled = selection !== "github";
   const [sourceSelectionError, setSourceSelectionError] = useState<string | null>(null);
@@ -357,7 +360,7 @@ export default function App() {
   // the same literal, and dropping it changes no behaviour. Kept in mind
   // rather than silently: this key's job is to name every axis that
   // changes WHERE you are, so a reader should know why one of them left.
-  const navKey = `${view}|${filters.repo ?? ""}`;
+  const navKey = JSON.stringify([view, filters.repo, selection, sourceRepoKey]);
   const [navOpenedAt, setNavOpenedAt] = useState<string | null>(null);
   const navOpen = navOpenedAt === navKey;
   const setNavOpen = (open: boolean) => setNavOpenedAt(open ? navKey : null);
@@ -692,7 +695,7 @@ export default function App() {
       // organisation or a person -- so #823's second audience ("how is
       // my team doing?") had nowhere to be asked from. This one is
       // sourced from GitHub and consults nothing on disk.
-      selection === "gitlab" ? (
+      statsProvider === "gitlab" ? (
         <nav className="flex w-64 shrink-0 flex-col border-r border-[#30363d] p-3"><ViewSwitcher /></nav>
       ) : <StatsSidebar viewCounts={{ "to-review": reviewingCount }} />
     ) : (
@@ -1006,7 +1009,7 @@ export default function App() {
                 the `SystemHealthPage` branch above for why the boundary
                 sits inside the padded wrapper. */}
             <Suspense fallback={<ViewLoading />}>
-              <ProviderStatsPage selection={selection} />
+              <ProviderStatsPage selection={selection} provider={statsProvider} onProviderChange={setStatsTab} />
             </Suspense>
           </div>
         ) : selection !== "github" ? (

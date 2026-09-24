@@ -5,6 +5,8 @@ import type { ConnectionState } from "./api/connection";
 import { PR_FIXTURES } from "./fixtures/prs";
 import { REQUIRED_PROTOCOL_VERSION } from "./lib/protocol";
 import { useFilters } from "./store/filters";
+import { useSourceSelection } from "./store/sourceSelection";
+import { sourceRepoKey } from "./components/SourceQueue";
 import { stubViewport } from "./test-utils";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { AuthGate } from "./components/AuthGate";
@@ -140,11 +142,13 @@ const EMPTY = {
 };
 
 beforeEach(() => {
+  useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
   useFilters.setState({ filtersByView: EMPTY, view: "my-prs" } as never);
 });
 
 afterEach(() => {
   cleanup();
+  useSourceSelection.setState({ selection: "github", repoKey: null, query: "" });
   clearMocks();
   cacheReadAt.value = 0;
   stubViewport(null);
@@ -226,6 +230,17 @@ describe("App shell on a phone", () => {
     expect(within(screen.getByRole("navigation")).getByText("All repositories")).toBeTruthy();
   });
 
+  it("closes the sheet when a source repository is picked in Both mode", async () => {
+    useSourceSelection.setState({ selection: "both" });
+    renderApp();
+    fireEvent.click(screen.getByRole("button", { name: /open navigation/i }));
+    const nav = await screen.findByRole("navigation");
+    fireEvent.click(within(nav).getByRole("button", { name: /GitHub · github.com · octocat\/hello-world/ }));
+    await waitFor(() => expect(screen.queryByRole("navigation")).toBeNull());
+    expect(useSourceSelection.getState().repoKey).toBe(sourceRepoKey(PR_FIXTURES[0]));
+    expect(useFilters.getState().filtersByView["my-prs"].repo).toBeUndefined();
+  });
+
   it("closes the sheet once a repo is picked", async () => {
     renderApp();
     fireEvent.click(screen.getByRole("button", { name: /open navigation/i }));
@@ -294,6 +309,19 @@ describe("Stats on the companion build", () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
+  });
+
+  it("changes the phone source without changing desktop polling preferences", async () => {
+    const commands: string[] = [];
+    mockIPC((command, args) => {
+      commands.push(command === "remote_call" && args && "command" in args ? String(args.command) : command);
+      return undefined;
+    }, { shouldMockEvents: true });
+    stubViewport(390);
+    await renderMobileApp();
+    fireEvent.change(screen.getByLabelText("Source"), { target: { value: "gitlab" } });
+    expect((screen.getByLabelText("Source") as HTMLSelectElement).value).toBe("gitlab");
+    expect(commands).not.toContain("set_source_selection");
   });
 
   /// #863 ships PR Stats to the companion, reversing #794's
