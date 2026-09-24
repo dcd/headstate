@@ -2,7 +2,11 @@
 //! queue are different answers. Coverage survives relaunch and partial results
 //! replace only their own source/list, never another provider's usable data.
 use super::{cache, CachedList, StoreError};
-use crate::{github::model::PullRequest, identity::Source};
+use crate::{
+    github::model::PullRequest,
+    gitlab::queues::MergeRequest,
+    identity::{Provider, Source},
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +32,12 @@ pub enum SnapshotData {
         stale_secs: Option<i64>,
         coverage: Coverage,
     },
+    GitLabAvailable {
+        mrs: Vec<MergeRequest>,
+        fetched_at: String,
+        stale_secs: Option<i64>,
+        coverage: Coverage,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -45,9 +55,32 @@ pub fn save_source_snapshot(
     coverage: &Coverage,
 ) -> Result<(), StoreError> {
     // Reject a mixed/wrong source instead of silently relabelling records.
-    if prs.iter().any(|pr| &pr.source != source) {
+    if source.provider != Provider::Github || prs.iter().any(|pr| &pr.source != source) {
         return Err(StoreError::SnapshotSourceMismatch);
     }
+    save_payload(conn, source, list, prs, coverage)
+}
+
+pub fn save_gitlab_snapshot(
+    conn: &Connection,
+    source: &Source,
+    list: CachedList,
+    mrs: &[MergeRequest],
+    coverage: &Coverage,
+) -> Result<(), StoreError> {
+    if source.provider != Provider::Gitlab || mrs.iter().any(|mr| &mr.source != source) {
+        return Err(StoreError::SnapshotSourceMismatch);
+    }
+    save_payload(conn, source, list, mrs, coverage)
+}
+
+fn save_payload<T: Serialize>(
+    conn: &Connection,
+    source: &Source,
+    list: CachedList,
+    rows: &[T],
+    coverage: &Coverage,
+) -> Result<(), StoreError> {
     let provider = serde_json::to_value(source.provider)?;
     conn.execute(
         "INSERT INTO snapshot (provider, host, id, payload, fetched_at, coverage)
@@ -59,7 +92,7 @@ pub fn save_source_snapshot(
             provider.as_str(),
             source.host,
             list.id(),
-            serde_json::to_string(prs)?,
+            serde_json::to_string(rows)?,
             serde_json::to_string(coverage)?
         ],
     )?;
@@ -83,25 +116,42 @@ pub fn load_source_snapshot(
     let data = match row {
         None => SnapshotData::Missing,
         Some((payload, at, coverage)) => {
-            match (
-                serde_json::from_str::<Vec<PullRequest>>(&payload),
-                serde_json::from_str::<Coverage>(&coverage),
-            ) {
-                (Ok(prs), Ok(coverage)) if prs.iter().all(|pr| &pr.source == source) => {
-                    let now = chrono::Utc::now();
-                    let stale_secs = (!cache::is_fresh(&at, now)).then(|| {
-                        cache::age_secs(&at, now)
-                            .unwrap_or(cache::MAX_SNAPSHOT_AGE_SECS)
-                            .max(1)
-                    });
-                    SnapshotData::Available {
-                        prs,
-                        fetched_at: at,
-                        stale_secs,
-                        coverage,
+            let Ok(coverage) = serde_json::from_str::<Coverage>(&coverage) else {
+                return Ok(SourceSnapshot {
+                    source: source.clone(),
+                    list,
+                    data: SnapshotData::Unreadable,
+                });
+            };
+            let now = chrono::Utc::now();
+            let stale_secs = (!cache::is_fresh(&at, now)).then(|| {
+                cache::age_secs(&at, now)
+                    .unwrap_or(cache::MAX_SNAPSHOT_AGE_SECS)
+                    .max(1)
+            });
+            match source.provider {
+                Provider::Github => match serde_json::from_str::<Vec<PullRequest>>(&payload) {
+                    Ok(prs) if prs.iter().all(|pr| &pr.source == source) => {
+                        SnapshotData::Available {
+                            prs,
+                            fetched_at: at,
+                            stale_secs,
+                            coverage,
+                        }
                     }
-                }
-                _ => SnapshotData::Unreadable,
+                    _ => SnapshotData::Unreadable,
+                },
+                Provider::Gitlab => match serde_json::from_str::<Vec<MergeRequest>>(&payload) {
+                    Ok(mrs) if mrs.iter().all(|mr| &mr.source == source) => {
+                        SnapshotData::GitLabAvailable {
+                            mrs,
+                            fetched_at: at,
+                            stale_secs,
+                            coverage,
+                        }
+                    }
+                    _ => SnapshotData::Unreadable,
+                },
             }
         }
     };
@@ -140,21 +190,40 @@ mod tests {
         pr.source = source;
         pr
     }
+    fn sample_mr(source: Source) -> MergeRequest {
+        serde_json::from_value(serde_json::json!({
+            "source": source, "id": 17, "number": 7, "title": "fixture",
+            "url": "https://gitlab.com/group/subgroup/project/-/merge_requests/7",
+            "repo": "group/subgroup/project", "author": "fixture", "is_draft": true,
+            "head_ref": "topic", "base_ref": "main",
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+            "labels": [], "reviewers": [], "assignees": [], "comment_count": 0,
+            "detailed_merge_status": "draft_status", "ci": null,
+            "review": null, "unresolved_threads": null
+        }))
+        .unwrap()
+    }
     #[test]
     fn overlapping_ids_roundtrip_and_a_mixed_write_cannot_replace_good_data() {
         let conn = db();
         let gh = Source::default();
         let gl = gitlab("gitlab.com");
-        for source in [&gh, &gl] {
-            save_source_snapshot(
-                &conn,
-                source,
-                CachedList::Authored,
-                &[sample(source.clone())],
-                &Coverage::Complete,
-            )
-            .unwrap();
-        }
+        save_source_snapshot(
+            &conn,
+            &gh,
+            CachedList::Authored,
+            &[sample(gh.clone())],
+            &Coverage::Complete,
+        )
+        .unwrap();
+        save_gitlab_snapshot(
+            &conn,
+            &gl,
+            CachedList::Authored,
+            &[sample_mr(gl.clone())],
+            &Coverage::Complete,
+        )
+        .unwrap();
         assert!(save_source_snapshot(
             &conn,
             &gh,
@@ -163,12 +232,14 @@ mod tests {
             &Coverage::Complete
         )
         .is_err());
-        for source in [&gh, &gl] {
-            assert!(
-                matches!(load_source_snapshot(&conn, source, CachedList::Authored).unwrap().data,
-                SnapshotData::Available { prs, .. } if prs == vec![sample(source.clone())])
-            );
-        }
+        assert!(
+            matches!(load_source_snapshot(&conn, &gh, CachedList::Authored).unwrap().data,
+            SnapshotData::Available { prs, .. } if prs == vec![sample(gh.clone())])
+        );
+        assert!(
+            matches!(load_source_snapshot(&conn, &gl, CachedList::Authored).unwrap().data,
+            SnapshotData::GitLabAvailable { mrs, .. } if mrs == vec![sample_mr(gl.clone())])
+        );
         conn.execute("UPDATE snapshot SET provider = 'gitlab', host = 'wrong.example' WHERE provider = 'github'", []).unwrap();
         assert_eq!(
             load_source_snapshot(&conn, &gitlab("wrong.example"), CachedList::Authored)
@@ -185,7 +256,7 @@ mod tests {
         let gl = gitlab("gitlab.com");
         let other = gitlab("gitlab.example");
         save_source_snapshot(&conn, &gh, CachedList::Authored, &[], &Coverage::Complete).unwrap();
-        save_source_snapshot(
+        save_gitlab_snapshot(
             &conn,
             &gl,
             CachedList::Authored,
@@ -193,7 +264,7 @@ mod tests {
             &Coverage::Partial { total: Some(4) },
         )
         .unwrap();
-        save_source_snapshot(&conn, &other, CachedList::Authored, &[], &Coverage::Unknown).unwrap();
+        save_gitlab_snapshot(&conn, &other, CachedList::Authored, &[], &Coverage::Unknown).unwrap();
         conn.execute("UPDATE snapshot SET fetched_at = datetime('now', '-2 hours') WHERE provider = 'github'", []).unwrap();
         assert!(matches!(
             load_source_snapshot(&conn, &gh, CachedList::Authored)
@@ -209,7 +280,7 @@ mod tests {
             load_source_snapshot(&conn, &gl, CachedList::Authored)
                 .unwrap()
                 .data,
-            SnapshotData::Available {
+            SnapshotData::GitLabAvailable {
                 stale_secs: None,
                 coverage: Coverage::Partial { total: Some(4) },
                 ..
@@ -219,7 +290,7 @@ mod tests {
             load_source_snapshot(&conn, &other, CachedList::Authored)
                 .unwrap()
                 .data,
-            SnapshotData::Available {
+            SnapshotData::GitLabAvailable {
                 coverage: Coverage::Unknown,
                 ..
             }

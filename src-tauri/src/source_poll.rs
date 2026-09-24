@@ -62,6 +62,7 @@ type StatusEntries = HashMap<PollKey, (u64, Status)>;
 type PublicationGates = HashMap<PollKey, Arc<tokio::sync::Mutex<()>>>;
 
 type Receipts = HashMap<PollKey, (u64, FetchedList)>;
+type GitLabReceipts = HashMap<PollKey, (u64, crate::gitlab::queues::FetchedList)>;
 
 /// One atomic event/reply. Rows and attempt status have independent ordering:
 /// an older successful attempt can publish rows beside a newer failure.
@@ -72,6 +73,7 @@ pub struct Update {
     pub session: String,
     pub completed_request: Option<String>,
     pub prs: Option<Vec<crate::github::model::PullRequest>>,
+    pub mrs: Option<Vec<crate::gitlab::queues::MergeRequest>>,
 }
 
 pub struct SourcePolls(
@@ -79,6 +81,7 @@ pub struct SourcePolls(
     Mutex<PublicationGates>,
     Mutex<Receipts>,
     String,
+    Mutex<GitLabReceipts>,
 );
 impl Default for SourcePolls {
     fn default() -> Self {
@@ -87,6 +90,7 @@ impl Default for SourcePolls {
             Mutex::default(),
             Mutex::default(),
             format!("{}:{}", std::process::id(), chrono::Utc::now().to_rfc3339()),
+            Mutex::default(),
         )
     }
 }
@@ -146,12 +150,19 @@ impl SourcePolls {
     }
     async fn success_publication(&self, attempt: &Attempt) -> Option<Publication> {
         let guard = self.gate(&attempt.source, attempt.list).lock_owned().await;
-        let newer_success = self
-            .2
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&(attempt.source.clone(), attempt.list))
-            .is_some_and(|(generation, _)| *generation > attempt.generation);
+        let newer_success = if attempt.source.provider == crate::identity::Provider::Gitlab {
+            self.4
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(attempt.source.clone(), attempt.list))
+                .is_some_and(|(generation, _)| *generation > attempt.generation)
+        } else {
+            self.2
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(attempt.source.clone(), attempt.list))
+                .is_some_and(|(generation, _)| *generation > attempt.generation)
+        };
         (!newer_success).then_some(Publication {
             attempt: attempt.clone(),
             _guard: guard,
@@ -181,12 +192,47 @@ impl SourcePolls {
         // The publication permit remains held through both the status mutation
         // and callback. A newer attempt cannot interleave a fetching event.
     }
+    fn complete_gitlab(
+        &self,
+        publication: Publication,
+        result: Result<crate::gitlab::queues::FetchedList, Failure>,
+        emit: impl FnOnce(Status),
+    ) {
+        let attempt = &publication.attempt;
+        let status_result = match result {
+            Ok(result) => {
+                let coverage = result.coverage.clone();
+                self.4.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                    (attempt.source.clone(), attempt.list),
+                    (attempt.generation, result),
+                );
+                Ok(coverage)
+            }
+            Err(error) => Err(error),
+        };
+        if let Some(status) = self.finish(attempt, status_result) {
+            emit(status);
+        }
+    }
     fn winner(
         &self,
         attempt: &Attempt,
         fallback: Result<FetchedList, String>,
     ) -> Result<FetchedList, String> {
         self.2
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(attempt.source.clone(), attempt.list))
+            .filter(|(generation, _)| *generation > attempt.generation)
+            .map(|(_, result)| Ok(result.clone()))
+            .unwrap_or(fallback)
+    }
+    fn winner_gitlab(
+        &self,
+        attempt: &Attempt,
+        fallback: Result<crate::gitlab::queues::FetchedList, String>,
+    ) -> Result<crate::gitlab::queues::FetchedList, String> {
+        self.4
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&(attempt.source.clone(), attempt.list))
@@ -202,11 +248,18 @@ impl SourcePolls {
             .unwrap_or_else(|e| e.into_inner())
             .get(&(status.source.clone(), status.list))
             .map(|(_, receipt)| receipt.prs.clone());
+        let mrs = self
+            .4
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(status.source.clone(), status.list))
+            .map(|(_, receipt)| receipt.mrs.clone());
         Update {
             status,
             session: self.3.clone(),
             completed_request,
             prs,
+            mrs,
         }
     }
     pub async fn snapshot(&self, source: &Source, list: CachedList) -> Update {
@@ -365,6 +418,18 @@ pub fn complete(app: &AppHandle, publication: Publication, result: Result<Fetche
         });
 }
 
+pub fn complete_gitlab(
+    app: &AppHandle,
+    publication: Publication,
+    result: Result<crate::gitlab::queues::FetchedList, Failure>,
+) {
+    let completed_request = publication.attempt.request_id.clone();
+    app.state::<SourcePolls>()
+        .complete_gitlab(publication, result, |status| {
+            emit_status(app, status, completed_request);
+        });
+}
+
 pub async fn fail(app: &AppHandle, attempt: Attempt, failure: Failure) {
     if let Some(publication) = publication(app, &attempt).await {
         complete(app, publication, Err(failure));
@@ -384,6 +449,14 @@ pub fn winner(
     fallback: Result<FetchedList, String>,
 ) -> Result<FetchedList, String> {
     app.state::<SourcePolls>().winner(attempt, fallback)
+}
+
+pub fn winner_gitlab(
+    app: &AppHandle,
+    attempt: &Attempt,
+    fallback: Result<crate::gitlab::queues::FetchedList, String>,
+) -> Result<crate::gitlab::queues::FetchedList, String> {
+    app.state::<SourcePolls>().winner_gitlab(attempt, fallback)
 }
 
 #[cfg(test)]
@@ -419,6 +492,45 @@ mod tests {
             total: Some(1),
             coverage: Coverage::Complete,
         }
+    }
+
+    #[tokio::test]
+    async fn gitlab_receipt_has_its_own_rows_and_partial_coverage() {
+        let polls = SourcePolls::default();
+        let source = Source {
+            provider: Provider::Gitlab,
+            host: "gitlab.com".into(),
+        };
+        let (attempt, _) = polls
+            .begin_attempt(source.clone(), CachedList::Authored)
+            .await;
+        let mr = serde_json::from_value(serde_json::json!({
+            "source": source, "id": 17, "number": 7, "title": "fixture",
+            "url": "https://gitlab.com/group/subgroup/project/-/merge_requests/7",
+            "repo": "group/subgroup/project", "author": "fixture", "is_draft": true,
+            "head_ref": "topic", "base_ref": "main",
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+            "labels": [], "reviewers": [], "assignees": [], "comment_count": 0,
+            "detailed_merge_status": "draft_status", "ci": null,
+            "review": null, "unresolved_threads": null
+        }))
+        .unwrap();
+        let receipt = crate::gitlab::queues::FetchedList {
+            mrs: vec![mr],
+            total: Some(2),
+            coverage: Coverage::Partial { total: Some(2) },
+        };
+        let permit = polls.success_publication(&attempt).await.unwrap();
+        polls.complete_gitlab(permit, Ok(receipt), |_| {});
+        let update = polls.snapshot(&attempt.source, CachedList::Authored).await;
+        assert_eq!(update.status.phase, Phase::Partial);
+        assert!(update.prs.is_none());
+        assert_eq!(update.mrs.as_ref().unwrap().len(), 1);
+        assert_eq!(update.mrs.as_ref().unwrap()[0].unresolved_threads, None);
+        assert_eq!(
+            serde_json::to_value(&update).unwrap()["mrs"][0]["ci"],
+            serde_json::Value::Null
+        );
     }
 
     #[tokio::test]

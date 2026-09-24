@@ -240,7 +240,7 @@ async fn refresh_reply(
             update: Box::new(update),
         })
     } else {
-        result.map(|result| RefreshReply::Legacy(result.prs))
+        result.map(|result| RefreshReply::Legacy(result.prs.expect("GitHub refresh returns PRs")))
     }
 }
 
@@ -267,12 +267,12 @@ pub fn get_source_poll_status(
 pub struct SourceRefresh {
     pub source: crate::identity::Source,
     pub list: CachedList,
-    pub prs: Vec<PullRequest>,
+    pub prs: Option<Vec<PullRequest>>,
+    pub mrs: Option<Vec<crate::gitlab::queues::MergeRequest>>,
     pub coverage: crate::store::source_cache::Coverage,
 }
 
-/// Manual refresh targets exactly one source/list. Slice 4 adds the GitLab
-/// adapter here; an unsupported source is declined before any provider call.
+/// Manual refresh targets exactly one source/list.
 pub async fn refresh_source(
     app: AppHandle,
     client: State<'_, GhClient>,
@@ -291,9 +291,11 @@ async fn refresh_source_request(
 ) -> Result<SourceRefresh, String> {
     use crate::source_poll::{self, Failure};
     let attempt = source_poll::begin_request(&app, source.clone(), list, request_id).await;
-    let refusal = if source != crate::identity::Source::default() {
+    let gitlab_com = source.provider == crate::identity::Provider::Gitlab
+        && source.host == crate::gitlab::auth::HOST;
+    let refusal = if !gitlab_com && source != crate::identity::Source::default() {
         Some("headstate:not-asked: fetching is not enabled for this source".to_string())
-    } else if client.0.is_none() {
+    } else if !gitlab_com && client.0.is_none() {
         Some(AUTH_ERR.to_string())
     } else {
         None
@@ -311,10 +313,13 @@ async fn refresh_source_request(
         .await;
         return Err(message);
     }
-    let client = client.0.as_ref().expect("checked above");
+    if gitlab_com {
+        return refresh_gitlab_request(app, source, list, attempt).await;
+    }
     // Preserve reviewing's existing paged loader: an outer timeout drops
     // pages it already owns. The individual HTTP requests remain bounded.
-    let fetched = match list {
+    let client = client.0.as_ref().expect("checked above");
+    let result = match list {
         CachedList::Authored => {
             tokio::time::timeout(crate::poll::FETCH_TIMEOUT, client.fetch_prs_snapshot())
                 .await
@@ -322,6 +327,7 @@ async fn refresh_source_request(
         }
         CachedList::Reviewing => client.fetch_reviewing_snapshot().await,
     };
+    let fetched = result.map_err(|error| Failure::from(&error));
     match fetched {
         Ok(result) => {
             let Some(publication) = source_poll::success_publication(&app, &attempt).await else {
@@ -329,7 +335,8 @@ async fn refresh_source_request(
                 return Ok(SourceRefresh {
                     source,
                     list,
-                    prs: winner.prs,
+                    prs: Some(winner.prs),
+                    mrs: None,
                     coverage: winner.coverage,
                 });
             };
@@ -371,20 +378,98 @@ async fn refresh_source_request(
             Ok(SourceRefresh {
                 source,
                 list,
-                prs,
+                prs: Some(prs),
+                mrs: None,
                 coverage,
             })
         }
         Err(error) => {
             if let Some(publication) = source_poll::publication(&app, &attempt).await {
-                source_poll::complete(&app, publication, Err(Failure::from(&error)));
-                Err(error.to_string())
+                let message = error.message.clone();
+                source_poll::complete(&app, publication, Err(error));
+                Err(message)
             } else {
-                let winner = source_poll::winner(&app, &attempt, Err(error.to_string()))?;
+                let winner = source_poll::winner(&app, &attempt, Err(error.message))?;
                 Ok(SourceRefresh {
                     source,
                     list,
-                    prs: winner.prs,
+                    prs: Some(winner.prs),
+                    mrs: None,
+                    coverage: winner.coverage,
+                })
+            }
+        }
+    }
+}
+
+async fn refresh_gitlab_request(
+    app: AppHandle,
+    source: crate::identity::Source,
+    list: CachedList,
+    attempt: crate::source_poll::Attempt,
+) -> Result<SourceRefresh, String> {
+    use crate::source_poll::{self, Failure};
+    match crate::gitlab::queues::fetch(&source, list).await {
+        Ok(result) => {
+            let Some(publication) = source_poll::success_publication(&app, &attempt).await else {
+                let winner = source_poll::winner_gitlab(&app, &attempt, Ok(result))?;
+                return Ok(SourceRefresh {
+                    source,
+                    list,
+                    prs: None,
+                    mrs: Some(winner.mrs),
+                    coverage: winner.coverage,
+                });
+            };
+            let receipt = result.clone();
+            let path = db_path(&app);
+            let owned_source = source.clone();
+            let owned = result.mrs.clone();
+            let owned_coverage = result.coverage.clone();
+            let saved = tauri::async_runtime::spawn_blocking(move || {
+                let conn = open_db(&path).map_err(|e| e.to_string())?;
+                crate::store::source_cache::save_gitlab_snapshot(
+                    &conn,
+                    &owned_source,
+                    list,
+                    &owned,
+                    &owned_coverage,
+                )
+                .map_err(|e| e.to_string())
+            })
+            .await;
+            if !matches!(saved, Ok(Ok(()))) {
+                let _ = app.emit(
+                    "store-error",
+                    "The refreshed list could not be saved for offline use.",
+                );
+            }
+            source_poll::complete_gitlab(&app, publication, Ok(receipt));
+            Ok(SourceRefresh {
+                source,
+                list,
+                prs: None,
+                mrs: Some(result.mrs),
+                coverage: result.coverage,
+            })
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let failure = Failure {
+                message: message.clone(),
+                transient: error.transient(),
+                not_asked: matches!(error, crate::gitlab::queues::QueueError::MissingCli),
+            };
+            if let Some(publication) = source_poll::publication(&app, &attempt).await {
+                source_poll::complete_gitlab(&app, publication, Err(failure));
+                Err(message)
+            } else {
+                let winner = source_poll::winner_gitlab(&app, &attempt, Err(message))?;
+                Ok(SourceRefresh {
+                    source,
+                    list,
+                    prs: None,
+                    mrs: Some(winner.mrs),
                     coverage: winner.coverage,
                 })
             }
