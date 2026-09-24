@@ -5042,6 +5042,13 @@ pub fn get_auth_state(state: State<'_, AuthState>) -> AuthState {
     state.inner().clone()
 }
 
+/// GitLab authentication is checked independently of GitHub startup auth.
+/// The CLI retains the credential; only a fixed status and host cross IPC.
+#[tauri::command]
+pub async fn get_gitlab_auth_state() -> crate::gitlab::auth::AuthState {
+    crate::gitlab::auth::check().await
+}
+
 /// Import the Claude Code transcripts already on disk (#914, epic #910).
 ///
 /// A FULL rescan of `~/.claude/projects`, every time. That is the whole

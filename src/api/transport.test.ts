@@ -215,6 +215,7 @@ const ROWS: Row[] = [
   row(api.getHistory, [days], "get_history", { days }),
   row(api.getMergedDetail, [], "get_merged_detail"),
   row(api.getAuthState, [], "get_auth_state"),
+  row(api.getGitLabAuthState, [], "get_gitlab_auth_state"),
   row(api.scanArtifacts, [], "scan_artifacts"),
   row(api.readCachedScan, ["artifacts"], "read_cached_scan", { kind: "artifacts" }),
   row(api.sizeArtifacts, [paths], "size_artifacts", { paths }),

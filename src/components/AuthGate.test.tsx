@@ -13,9 +13,14 @@ afterEach(() => {
   clearMocks();
 });
 
-function renderGated(authState: { ok: boolean; message: string }) {
+function renderGated(authState: { ok: boolean; message: string }, gitlabOk = false) {
   mockIPC((cmd) => {
     if (cmd === "get_auth_state") return authState;
+    if (cmd === "get_gitlab_auth_state") return {
+      host: "gitlab.com", ok: gitlabOk,
+      issue: gitlabOk ? null : "unverified",
+      message: gitlabOk ? "" : "GitLab.com authentication could not be verified.",
+    };
     return undefined;
   }, { shouldMockEvents: true });
 
@@ -35,20 +40,35 @@ describe("AuthGate", () => {
     expect(await screen.findByText("protected content")).toBeTruthy();
   });
 
-  it("shows the gh CLI install screen when not authenticated", async () => {
+  it("keeps local views available when GitHub is not authenticated", async () => {
     renderGated({
       ok: false,
       message: "gh auth status: not logged in to github.com",
     });
 
-    expect(await screen.findByText("Headstate needs the GitHub CLI")).toBeTruthy();
+    expect(await screen.findByText("protected content")).toBeTruthy();
     expect(
-      screen.getByText("gh auth status: not logged in to github.com"),
+      screen.getByText(/GitHub is unavailable: gh auth status: not logged in to github.com/),
     ).toBeTruthy();
-    expect(
-      screen.getByText((_, el) => el?.tagName === "PRE" && !!el.textContent?.includes("gh auth login")),
-    ).toBeTruthy();
-    expect(screen.queryByText("protected content")).toBeNull();
+    expect(await screen.findByText(/GitLab.com authentication could not be verified/)).toBeTruthy();
+  });
+
+  it("allows GitLab sign-in when gh is missing", async () => {
+    renderGated({ ok: false, message: "gh was not found" }, true);
+    expect(await screen.findByText("protected content")).toBeTruthy();
+    expect(await screen.findByText(/GitLab.com sign-in is verified/)).toBeTruthy();
+  });
+
+  it("does not let missing GitLab authentication hide GitHub", async () => {
+    renderGated({ ok: true, message: "" }, false);
+    expect(await screen.findByText("protected content")).toBeTruthy();
+    expect(screen.queryByText(/GitLab.com authentication could not/)).toBeNull();
+  });
+
+  it("keeps the app open when both providers are signed in", async () => {
+    renderGated({ ok: true, message: "" }, true);
+    expect(await screen.findByText("protected content")).toBeTruthy();
+    expect(screen.queryByText(/GitHub is unavailable/)).toBeNull();
   });
 
   it("surfaces a poll-error banner above authenticated content", async () => {

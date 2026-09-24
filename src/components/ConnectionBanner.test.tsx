@@ -90,6 +90,33 @@ describe("ConnectionBanner", () => {
     expect(banner.textContent).not.toContain("updated");
   });
 
+  it("qualifies a connected desktop whose GitHub auth is unavailable", () => {
+    stubViewport(390);
+    connection.current = {
+      kind: "connected", desktop: "octocat's laptop", lastPoll: null,
+      protocolVersion: REQUIRED_PROTOCOL_VERSION, stale: false,
+    };
+    render(<ConnectionBanner updatedAt={Date.now()} githubAuthAvailable={false} />);
+    const banner = screen.getByRole("button", { name: /octocat's laptop/ });
+    expect(banner.textContent).toContain("reachable · GitHub is not refreshing");
+    expect(banner.textContent).not.toContain("updated");
+    expect(banner.querySelector(".bg-\\[\\#3fb950\\]")).toBeNull();
+    expect(banner.querySelector(".bg-\\[\\#d29922\\]")).not.toBeNull();
+  });
+
+  it("treats an unanswered auth check as unknown, not signed out", () => {
+    stubViewport(390);
+    connection.current = {
+      kind: "connected", desktop: "octocat's laptop", lastPoll: null,
+      protocolVersion: REQUIRED_PROTOCOL_VERSION, stale: false,
+    };
+    render(<ConnectionBanner updatedAt={Date.now()} githubAuthAvailable={null} />);
+    const banner = screen.getByRole("button", { name: /octocat's laptop/ });
+    expect(banner.textContent).toContain("GitHub status unavailable");
+    expect(banner.textContent).not.toContain("updated");
+    expect(banner.textContent).not.toContain("sign in");
+  });
+
   it("tells the user to update the desktop when its protocol is too old", () => {
     stubViewport(390);
     connection.current = {

@@ -82,6 +82,13 @@ export interface AuthState {
   message: string;
 }
 
+export interface GitLabAuthState {
+  host: string;
+  ok: boolean;
+  issue: "missingCli" | "unverified" | "timedOut" | null;
+  message: string;
+}
+
 /// The cached snapshot. Never talks to GitHub. Returns `[]` both when
 /// nothing has ever been polled and when auth failed at startup -- callers
 /// must consult `getAuthState` to tell those apart.
@@ -872,6 +879,8 @@ export const getMergedDetail = () => call<MergedDetail>("get_merged_detail");
 /// Computed once at startup from the `gh` CLI token. `ok: false` means the
 /// user needs to run `gh auth login`; `message` is ready-to-display prose.
 export const getAuthState = () => call<AuthState>("get_auth_state");
+/// The desktop checks glab's GitLab.com credential. No token crosses IPC.
+export const getGitLabAuthState = () => call<GitLabAuthState>("get_gitlab_auth_state");
 
 /// Regenerable build output under the configured scan roots.
 ///

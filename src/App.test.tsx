@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PullRequest } from "./types/pr";
 import { PR_FIXTURES, prWithState } from "./fixtures/prs";
 import { useFilters } from "./store/filters";
+import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
+import { AuthGate } from "./components/AuthGate";
 
 // The shell talks to Tauri on mount. Stub the command surface so these tests
 // exercise the wiring, not the backend.
@@ -11,6 +13,7 @@ const mockPrs = vi.fn<() => PullRequest[]>(() => []);
 const mockReviewing = vi.fn<() => PullRequest[]>(() => []);
 const mockRefused = vi.fn<() => number>(() => 0);
 const mockShortfall = vi.fn<() => number>(() => 0);
+const mockDataUpdatedAt = vi.fn<() => number>(() => 0);
 
 /// Overridable UI preferences, so the capability-gate tests at the bottom
 /// of this file can turn `claude_integrations_enabled` on and off without
@@ -68,8 +71,10 @@ vi.mock("./api/hooks", () => ({
   useUpdatePrBranch: () => () => Promise.resolve(),
   useActOnPrs: () => () => Promise.resolve([]),
   useSetAutoMerge: () => () => Promise.resolve(),
-  usePullRequests: () => ({ data: mockPrs(), isSuccess: true, isLoading: false }),
+  usePullRequests: () => ({ data: mockPrs(), isSuccess: true, isLoading: false, dataUpdatedAt: mockDataUpdatedAt() }),
   usePollError: () => null,
+  useStoreError: () => ({ message: null, dismiss: () => {} }),
+  clearPollError: () => {},
   useRefreshRequested: () => undefined,
   useRefreshFromGesture: () => () => Promise.resolve(),
   useTruncation: () => null,
@@ -141,10 +146,6 @@ vi.mock("./api/hooks", () => ({
   useCycleTrend: () => ({ data: undefined, isError: false, refetch: () => {} }),
 }));
 
-vi.mock("./components/AuthGate", () => ({
-  AuthGate: ({ children }: { children: React.ReactNode }) => <>{children}</>,
-}));
-
 const { default: App } = await import("./App");
 
 /// Settle the lazy routes' dynamic imports BEFORE any test runs (#898).
@@ -197,6 +198,41 @@ function renderApp() {
     </QueryClientProvider>,
   );
 }
+
+describe("assembled auth and PR status", () => {
+  afterEach(() => {
+    clearMocks();
+    mockPrs.mockReturnValue([]);
+    mockDataUpdatedAt.mockReturnValue(0);
+  });
+
+  it("shows saved PRs without claiming a fresh poll when GitHub auth is missing", async () => {
+    mockPrs.mockReturnValue([PR_FIXTURES[0]]);
+    // Reading a warm SQLite snapshot advances React Query's timestamp,
+    // even though Rust never starts the GitHub poll without a client.
+    mockDataUpdatedAt.mockReturnValue(Date.now());
+    mockIPC((cmd) => {
+      if (cmd === "get_auth_state") return { ok: false, message: "gh was not found" };
+      if (cmd === "get_gitlab_auth_state") return {
+        host: "gitlab.com", ok: true, issue: null, message: "",
+      };
+      return undefined;
+    }, { shouldMockEvents: true });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <AuthGate><App /></AuthGate>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText(/GitHub is not refreshing/)).toBeTruthy();
+    expect(screen.getByText(PR_FIXTURES[0].title)).toBeTruthy();
+    expect(screen.queryByText("PRs up to date")).toBeNull();
+    expect(screen.queryByText(/Updated just now/)).toBeNull();
+    const dot = screen.getByText(/GitHub is not refreshing/).previousElementSibling;
+    expect(dot?.className).toContain("bg-[#d29922]");
+  });
+});
 
 describe("App — priorities strip scoping", () => {
   afterEach(() => {

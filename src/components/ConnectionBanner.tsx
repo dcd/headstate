@@ -5,6 +5,7 @@ import { useIsMobile } from "@/lib/useIsMobile";
 import { relativeTime } from "@/lib/time";
 import { ExternalLink } from "./ExternalLink";
 import { SettingsDialog } from "./SettingsDialog";
+import type { GitHubAuthAvailability } from "@/api/authAvailability";
 
 /// Where "update Headstate on your desktop" sends the user: the desktop
 /// is what needs replacing, and the phone cannot do that for it.
@@ -22,12 +23,18 @@ const BANNER_CLASS =
 /// Every line names the desktop where there is one: "unreachable" on
 /// its own does not say what is unreachable, and a phone paired with
 /// two desktops later will need the name to tell them apart.
-function describeState(state: Exclude<ConnectionState, { kind: "local" }>): {
+function describeState(state: Exclude<ConnectionState, { kind: "local" }>, githubAuthAvailable: GitHubAuthAvailability): {
   text: string;
   dot: string;
 } {
   switch (state.kind) {
     case "connected":
+      if (githubAuthAvailable !== true) {
+        return {
+          text: `${state.desktop} · reachable · ${githubAuthAvailable === false ? "GitHub is not refreshing" : "GitHub status unavailable"}`,
+          dot: "bg-[#d29922]",
+        };
+      }
       // The desktop is reachable, so its own poll timestamp is the less
       // interesting half: what the reader wants to know is whether the
       // DATA is current, and that is GitHub's freshness. Both were shown,
@@ -65,7 +72,7 @@ function describeState(state: Exclude<ConnectionState, { kind: "local" }>): {
 /// Renders nothing on the desktop, where the app IS the desktop and
 /// there is no connection to describe. Tapping opens Settings on the
 /// Phone topic, which is where pairing lives.
-export function ConnectionBanner({ updatedAt = 0 }: { updatedAt?: number } = {}) {
+export function ConnectionBanner({ updatedAt = 0, githubAuthAvailable = true }: { updatedAt?: number; githubAuthAvailable?: GitHubAuthAvailability } = {}) {
   const isMobile = useIsMobile();
   const state = useConnectionState();
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -93,13 +100,13 @@ export function ConnectionBanner({ updatedAt = 0 }: { updatedAt?: number } = {})
       </ExternalLink>
     );
   }
-  const { text, dot } = describeState(state);
+  const { text, dot } = describeState(state, githubAuthAvailable);
   // Appended rather than folded into `describeState`, which every state
   // shares: GitHub freshness is only meaningful while the desktop is
   // reachable. When it is not, the desktop is the problem and a stale
   // GitHub timestamp is noise on top of it.
   const line =
-    state.kind === "connected" && updatedAt > 0
+    state.kind === "connected" && githubAuthAvailable === true && updatedAt > 0
       ? `${text} · updated ${relativeTime(new Date(updatedAt).toISOString())}`
       : text;
   return (

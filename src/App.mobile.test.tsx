@@ -6,6 +6,10 @@ import { PR_FIXTURES } from "./fixtures/prs";
 import { REQUIRED_PROTOCOL_VERSION } from "./lib/protocol";
 import { useFilters } from "./store/filters";
 import { stubViewport } from "./test-utils";
+import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
+import { AuthGate } from "./components/AuthGate";
+
+const cacheReadAt = vi.hoisted(() => ({ value: 0 }));
 
 // The shell talks to Tauri on mount. Stub the command surface so these
 // tests exercise the layout, not the backend -- the same set App.test
@@ -25,8 +29,10 @@ vi.mock("./api/hooks", () => ({
   useUpdatePrBranch: () => () => Promise.resolve(),
   useActOnPrs: () => () => Promise.resolve([]),
   useSetAutoMerge: () => () => Promise.resolve(),
-  usePullRequests: () => ({ data: PR_FIXTURES, isSuccess: true, isLoading: false }),
+  usePullRequests: () => ({ data: PR_FIXTURES, isSuccess: true, isLoading: false, dataUpdatedAt: cacheReadAt.value }),
   usePollError: () => null,
+  useStoreError: () => ({ message: null, dismiss: () => {} }),
+  clearPollError: () => {},
   useRefreshRequested: () => undefined,
   useRefreshFromGesture: () => () => Promise.resolve(),
   useTruncation: () => null,
@@ -92,10 +98,6 @@ vi.mock("./api/hooks", () => ({
   useMergedDetail: () => ({ data: undefined, isLoading: false }),
 }));
 
-vi.mock("./components/AuthGate", () => ({
-  AuthGate: ({ children }: { children: React.ReactNode }) => <>{children}</>,
-}));
-
 const connection = vi.hoisted(() => ({ current: { kind: "local" } as ConnectionState }));
 // Spread the real module rather than replacing it: only the hook needs
 // to be driven from the test, and `isStale` -- which `StaleRibbon` and
@@ -117,6 +119,15 @@ function renderApp() {
   );
 }
 
+function renderGatedApp() {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={qc}>
+      <AuthGate><App /></AuthGate>
+    </QueryClientProvider>,
+  );
+}
+
 const EMPTY = {
   "my-prs": {},
   "to-review": {},
@@ -134,6 +145,8 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  clearMocks();
+  cacheReadAt.value = 0;
   stubViewport(null);
   connection.current = { kind: "local" };
 });
@@ -172,6 +185,36 @@ describe("App shell on a phone", () => {
       protocolVersion: REQUIRED_PROTOCOL_VERSION,
       stale: false,
     };
+  });
+
+  it("does not show a green or fresh GitHub claim with missing auth and a warm cache", async () => {
+    cacheReadAt.value = Date.now();
+    mockIPC((cmd) => {
+      if (cmd === "get_auth_state") return { ok: false, message: "gh was not found" };
+      if (cmd === "get_gitlab_auth_state") return { host: "gitlab.com", ok: true, issue: null, message: "" };
+      return undefined;
+    }, { shouldMockEvents: true });
+    renderGatedApp();
+    const banner = await screen.findByRole("button", { name: /GitHub is not refreshing/ });
+    expect(banner.textContent).toContain("reachable");
+    expect(banner.textContent).not.toContain("updated");
+    expect(banner.querySelector(".bg-\\[\\#3fb950\\]")).toBeNull();
+    expect(screen.getByText(PR_FIXTURES[0].title)).toBeTruthy();
+  });
+
+  it("labels auth IPC failure unknown on a connected phone with a warm cache", async () => {
+    cacheReadAt.value = Date.now();
+    mockIPC((cmd) => {
+      if (cmd === "get_auth_state") throw new Error("desktop IPC failed");
+      if (cmd === "get_gitlab_auth_state") return { host: "gitlab.com", ok: true, issue: null, message: "" };
+      return undefined;
+    }, { shouldMockEvents: true });
+    renderGatedApp();
+    const banner = await screen.findByRole("button", { name: /GitHub status unavailable/ });
+    expect(banner.textContent).toContain("reachable");
+    expect(banner.textContent).not.toContain("updated");
+    expect(banner.textContent).not.toContain("sign in");
+    expect(screen.getByText(PR_FIXTURES[0].title)).toBeTruthy();
   });
 
   it("puts the repo sidebar behind a menu button", async () => {

@@ -92,6 +92,13 @@ describe("StatusBar on a phone", () => {
 });
 
 describe("StatusBar", () => {
+  it("does not diagnose sign-out when GitHub auth could not be checked", () => {
+    render(<StatusBar updatedAt={Date.now()} githubAuthAvailable={null} />);
+    expect(screen.getByText("GitHub status unavailable")).toBeTruthy();
+    expect(screen.queryByText("PRs up to date")).toBeNull();
+    expect(screen.queryByText(/Updated just now/)).toBeNull();
+    expect(screen.queryByText(/sign in/)).toBeNull();
+  });
   it("shows when the data was last updated", () => {
     render(<StatusBar updatedAt={Date.now() - 90_000} />);
     expect(screen.getByText(/updated/i)).toBeTruthy();

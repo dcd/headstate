@@ -77,6 +77,7 @@ pub const SURFACE: &[(&str, Class)] = &[
     // diagnosing "why are there no worktrees" reasonably asks (#1154).
     ("tool_versions", Class::Read),
     ("get_auth_state", Class::Read),
+    ("get_gitlab_auth_state", Class::Read),
     ("get_cached", Class::Read),
     ("get_cached_reviewing", Class::Read),
     ("refresh_now", Class::Read),
@@ -994,6 +995,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         // phone cannot ask for a larger payload than the desktop would.
         "read_log_tail" => res(commands::read_log_tail(app.clone(), a.get("maxBytes")?).await),
         "get_auth_state" => ok(commands::get_auth_state(app.state())),
+        "get_gitlab_auth_state" => ok(commands::get_gitlab_auth_state().await),
         "get_cached" => res(commands::get_cached(app.clone())),
         "get_cached_reviewing" => res(commands::get_cached_reviewing(app.clone())),
         "refresh_now" => res(commands::refresh_now(app.state()).await),

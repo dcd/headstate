@@ -11,6 +11,7 @@ pub mod commands;
 pub mod diag;
 pub mod docker;
 pub mod github;
+pub mod gitlab;
 pub mod health;
 pub mod identity;
 /// Rules stated elsewhere in this codebase, asserted over its own source
@@ -289,6 +290,7 @@ pub fn run() {
             commands::background_panicked,
             commands::background_health,
             commands::tool_versions,
+            commands::get_gitlab_auth_state,
             commands::read_log_tail,
             commands::reveal_log,
             commands::pull_checkout,

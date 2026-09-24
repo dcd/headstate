@@ -61,6 +61,7 @@ import { shortcutFor } from "./lib/shortcuts";
 import { activeRowCursor, nextCursor, type RowCursorTarget } from "./lib/rowCursor";
 import { useIsMobile } from "./lib/useIsMobile";
 import { relativeSeconds } from "./lib/time";
+import { useGitHubAuthAvailable } from "./api/authAvailability";
 import { MOBILE_HIDDEN_VIEWS, useActiveFilters, useFilters, viewLabel } from "./store/filters";
 
 /// The chart-carrying views, split off the launch chunk (#838, #921).
@@ -257,6 +258,7 @@ function ViewLoading() {
 /// `get_auth_state` query and one `usePollError` subscription (and
 /// therefore one error banner) per window.
 export default function App() {
+  const githubAuthAvailable = useGitHubAuthAvailable();
   const {
     data: prs = [],
     isLoading,
@@ -673,7 +675,7 @@ export default function App() {
       {/* Above everything, including the header: it says which
           desktop the whole screen is describing. Renders nothing on
           the desktop itself. */}
-      <ConnectionBanner updatedAt={dataUpdatedAt} />
+      <ConnectionBanner updatedAt={dataUpdatedAt} githubAuthAvailable={githubAuthAvailable} />
       {/* Below the banner and above everything else: the banner says
           which desktop, this says the rows underneath may be old. The
           banner alone was not enough -- it is one line that scrolls out
@@ -1108,7 +1110,7 @@ export default function App() {
       </div>
       {/* Pinned below both the sidebar and the list, so it reads as the
           window's status rather than the list's. */}
-      <StatusBar updatedAt={dataUpdatedAt} />
+      <StatusBar updatedAt={dataUpdatedAt} githubAuthAvailable={githubAuthAvailable} />
     </div>
   );
 }
