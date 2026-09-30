@@ -27,6 +27,7 @@ const thread = (over: Partial<ReviewThread> = {}): ReviewThread => ({
     {
       author: "carol",
       created_at: "2026-08-20T10:00:00Z",
+      author_is_bot: false,
       body: "This leaks the subscription",
     },
   ],
@@ -170,9 +171,12 @@ describe("ReviewThreads", () => {
     expect(screen.queryByText(/null/)).toBeNull();
   });
 
-  it("says when a thread has more comments than it shows", () => {
+  /// #1453: the thread pages from its opener, so what is missing is the
+  /// NEWEST replies -- and the notice has to say so, or the last reply
+  /// shown reads as the latest.
+  it("says when a thread has more comments than it shows, and that the newer ones are missing", () => {
     view([thread({ comment_count: 12 })]);
-    expect(screen.getByText(/Showing 1 of 12/)).toBeTruthy();
+    expect(screen.getByText(/Showing the first 1 of 12 — newer replies are on GitHub/)).toBeTruthy();
   });
 
   /// #802: the defect was SILENCE, not the window. A list short of the

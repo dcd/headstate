@@ -12,6 +12,9 @@
 /// `invoke`; see `transport.ts`.
 
 import { call } from "./transport";
+import type { GitLabScope, GitLabStatsTree, GitLabStatsReport, GitLabBackfill } from "./gitlabStats";
+import type { Source } from "../types/identity";
+import type { MergeRequest } from "../types/gitlab";
 import type {
   ClaudeMdAdviceMode,
   ClaudeMdAdviceResult,
@@ -30,9 +33,6 @@ import type {
   ClaudeCoverage,
   PluginsReport,
   ClaudeRestartList,
-  ClaudePreview,
-  ClaudeFollow,
-  ClaudeFollowCursor,
   ClaudeSessionDetail,
   ClaudeStopProposal,
   ClaudeStopOutcome,
@@ -65,6 +65,9 @@ import type {
   Periods,
   PrDetail,
   PullRequest,
+  ReviewGates,
+  PusherAsk,
+  RowPusher,
   Stats,
   StatsBoard,
   StatsOutcome,
@@ -76,9 +79,26 @@ import type {
   RepoTree,
   RepoFile,
 } from "../types/pr";
+import type {
+  RemoteTranscriptFind,
+  RemoteTranscriptWindow,
+  TranscriptBlockText,
+  TranscriptPageAnchor,
+  TranscriptPageDirection,
+} from "../types/transcript";
+import type { OpeningPrompt, SessionDigest } from "../types/sessionDigest";
+import type { DiagnosticBundle } from "../types/report";
 
 export interface AuthState {
   ok: boolean;
+  message: string;
+}
+
+export interface GitLabAuthState {
+  viewer?: string | null;
+  host: string;
+  ok: boolean;
+  issue: "missingCli" | "unverified" | "timedOut" | null;
   message: string;
 }
 
@@ -87,9 +107,53 @@ export interface AuthState {
 /// must consult `getAuthState` to tell those apart.
 export const getCached = () => call<PullRequest[]>("get_cached");
 
+export type SourceList = "authored" | "reviewing";
+export type SourceCoverage = "complete" | "unknown" | { partial: { total: number | null } };
+export type SourceSnapshot = {
+  source: Source;
+  list: SourceList;
+  data:
+    | { state: "missing" | "unreadable" }
+    | { state: "available"; prs: PullRequest[]; fetched_at: string; stale_secs: number | null; coverage: SourceCoverage }
+    | { state: "git_lab_available"; mrs: MergeRequest[]; fetched_at: string; stale_secs: number | null; coverage: SourceCoverage };
+};
+export type SourceRefreshResult = {
+  source: Source;
+  list: SourceList;
+  prs: PullRequest[] | null;
+  mrs: MergeRequest[] | null;
+  coverage: SourceCoverage;
+};
+export type SourcePollUpdate = {
+  source: Source;
+  list: SourceList;
+  phase: "not_requested" | "fetching" | "ready" | "partial" | "unknown" | "retrying" | "failed" | "not_asked";
+  error: string | null;
+  session: string;
+  revision: number;
+  receipt_revision: number | null;
+  completed_request: string | null;
+  last_received_at: string | null;
+  mrs: MergeRequest[] | null;
+  coverage: SourceCoverage | null;
+};
+export type SourceRefreshReply = SourceRefreshResult | {
+  request_id: string;
+  update: SourcePollUpdate;
+};
+export const getSourceSnapshot = (source: Source, list: SourceList) =>
+  call<SourceSnapshot>("get_source_snapshot", { source, list });
+export const refreshSelectedSource = (source: Source, list: SourceList, requestId?: string) =>
+  call<SourceRefreshReply>("refresh_source", { source, list, requestId });
+export const setSourceSelection = (selection: "github" | "gitlab" | "both") =>
+  call<void>("set_source_selection", { selection });
+
 /// A user-initiated, out-of-band fetch. Does not persist to SQLite and does
 /// not affect the poll loop's cadence.
 export const refreshNow = () => call<PullRequest[]>("refresh_now");
+/// Opt into correlated replies; older paired desktops still return arrays.
+export const refreshSource = (list: "authored" | "reviewing", requestId: string) =>
+  call<import("./sourceRefresh").RefreshReply>(list === "authored" ? "refresh_now" : "get_reviewing", { requestId });
 
 /// Interface preferences. Mirrors the Rust `UiPrefs`.
 export interface UiPrefs {
@@ -272,6 +336,10 @@ export const getStats = () => call<Stats>("get_stats");
 /// Sourced from GitHub, never from a local checkout. Carries NO statistics --
 /// two requests, 2 rate-limit points total, measured -- because discovery is
 /// cheap and measurement waits for a click (`hooks.ts:712-717`).
+export const gitlabStatsTree = (host: string) => call<GitLabStatsTree>("gitlab_stats_tree", { host });
+export const gitlabStatsLoad = (host: string, scope: GitLabScope, days: number, refresh: boolean) => call<GitLabStatsReport>("gitlab_stats_load", { host, scope, days, refresh });
+export const gitlabStatsBackfill = (host: string, scope: GitLabScope, days: number) => call<GitLabBackfill>("gitlab_stats_backfill", { host, scope, days });
+
 export const statsTree = () => call<StatsTree>("stats_tree");
 
 /// A COMPLETE count of pull requests for one subject and scope (#824).
@@ -488,8 +556,11 @@ export interface RemovalOutcome {
 /// Remove several worktrees, each safety-checked independently at delete
 /// time. Resolves with an outcome per worktree rather than throwing on
 /// the first refusal: partial failure is the normal case.
-export const removeWorktrees = (repoPath: string, worktreePaths: string[]) =>
-  call<RemovalOutcome[]>("remove_worktrees", { repoPath, worktreePaths });
+///
+/// `runId` is echoed on every `worktree-removal-progress` frame, so the
+/// caller can tell its own frames from an overlapping run's (#1544).
+export const removeWorktrees = (repoPath: string, worktreePaths: string[], runId: number | null) =>
+  call<RemovalOutcome[]>("remove_worktrees", { repoPath, worktreePaths, runId });
 
 /// The newest published release, or null when this build is current.
 ///
@@ -687,6 +758,48 @@ export const claudeLaunchSessionPreview = (
     permissionMode: terms.permissionMode ?? null,
   });
 
+/// The command that hands a pull request to Claude Code, for copying
+/// (#1455): `cd <main checkout> && claude <prompt>`.
+///
+/// `repoPath` is the checkout this page chose (`mainCheckoutFor`); Rust
+/// RE-CHECKS it against the live scan and against `prRepo` before
+/// building anything, so a stale or foreign path is refused rather than
+/// used. The line is built in Rust, with Rust's quoting, so copy and
+/// launch carry the same bytes.
+export const claudifyPrCommand = (repoPath: string, prRepo: string, prompt: string) =>
+  call<ClaudifyCommand>("claudify_pr_command", { repoPath, prRepo, prompt });
+
+/// Open the configured terminal on Claude Code in a pull request's main
+/// checkout (#1455). Desktop only -- `Class::Local`.
+export const claudeLaunchPr = (
+  repoPath: string,
+  prRepo: string,
+  prompt: string,
+  terms: LaunchTerms = {},
+) =>
+  call<void>("claude_launch_pr", {
+    repoPath,
+    prRepo,
+    prompt,
+    model: terms.model ?? null,
+    permissionMode: terms.permissionMode ?? null,
+  });
+
+/// The argv `claudeLaunchPr` would spawn, for the user to read (#1214).
+export const claudeLaunchPrPreview = (
+  repoPath: string,
+  prRepo: string,
+  prompt: string,
+  terms: LaunchTerms = {},
+) =>
+  call<LaunchPreview>("claude_launch_pr_preview", {
+    repoPath,
+    prRepo,
+    prompt,
+    model: terms.model ?? null,
+    permissionMode: terms.permissionMode ?? null,
+  });
+
 /// Propose stopping live sessions, with the evidence (#1219).
 ///
 /// Signals nothing. It re-reads the live registry and re-probes the
@@ -725,6 +838,26 @@ export const setAutoMerge = (
   expectedHead: string,
   enable: boolean,
 ) => call<void>("set_auto_merge", { id, repo, number, expectedHead, enable });
+
+/// How a stack merge ended (#1468); see `StackMergeOutcome` in
+/// `github/stack_merge.rs`. `in_progress` is NOT a failure: GitHub accepted
+/// it and was still working when Headstate stopped checking.
+export type StackMergeOutcome =
+  | { kind: "merged"; sha: string | null }
+  | { kind: "enqueued" }
+  | { kind: "failed"; message: string }
+  | { kind: "in_progress"; message: string };
+
+/// Merge, or queue, a native GitHub stack up to and including `number`
+/// (#1468). Lands every open pull request beneath it too -- callers confirm
+/// with that list first. `expectedHead` makes GitHub refuse rather than
+/// land a head the user never saw.
+export const mergeStack = (
+  repo: string,
+  number: number,
+  action: "merge_queue" | "direct_merge",
+  expectedHead: string,
+) => call<StackMergeOutcome>("merge_stack", { repo, number, action, expectedHead });
 
 /// Delete a merged pull request's head branch.
 ///
@@ -782,6 +915,25 @@ export type PrActionName =
 /// Everything the detail view shows for one pull request. Cost 1.
 export const getPrDetail = (repo: string, number: number) =>
   call<PrDetail>("get_pr_detail", { repo, number });
+
+/// The base branch's review rules and the head's last pusher (#1451,
+/// #1454). Two REST reads at most, the rules half cached per (repo, base).
+/// Never rejects for a GitHub failure -- those come back as states.
+export const getReviewGates = (
+  repo: string,
+  base: string,
+  headRepo: string | null,
+  headRef: string,
+  headOid: string,
+) =>
+  call<ReviewGates>("get_review_gates", { repo, base, headRepo, headRef, headOid });
+
+/// Rules and last pusher for every Ready for review row (#1576). Pushers
+/// cached by head commit, rules per (repo, base), new reads capped per
+/// call and inside the REST budget; a row past either is `declined` (not
+/// checked). Never rejects for a GitHub failure.
+export const getReadyPushers = (rows: PusherAsk[]) =>
+  call<RowPusher[]>("get_ready_pushers", { rows });
 
 /// Disk sizes for one repo's worktrees, as `[path, bytes]` pairs.
 ///
@@ -872,6 +1024,10 @@ export const getMergedDetail = () => call<MergedDetail>("get_merged_detail");
 /// Computed once at startup from the `gh` CLI token. `ok: false` means the
 /// user needs to run `gh auth login`; `message` is ready-to-display prose.
 export const getAuthState = () => call<AuthState>("get_auth_state");
+/// The desktop checks glab's configured GitLab host. No token crosses IPC.
+export const getGitLabAuthState = () => call<GitLabAuthState>("get_gitlab_auth_state");
+export const getGitLabHost = () => call<string>("get_gitlab_host");
+export const setGitLabHost = (host: string) => call<string>("set_gitlab_host", { host });
 
 /// Regenerable build output under the configured scan roots.
 ///
@@ -1081,6 +1237,12 @@ export const readLogTail = (maxBytes?: number) =>
 
 export const revealLog = () => call<string>("reveal_log");
 
+/// Everything "Report this" can say about the desktop, redacted (#1575).
+///
+/// `Class::Read`: on the phone this describes the paired desktop, whose
+/// poll the phone's banner reports.
+export const diagnosticBundle = () => call<DiagnosticBundle>("diagnostic_bundle");
+
 /// Every scope a session actually loads: the repository, plus
 /// `~/.claude/CLAUDE.md` and any `CLAUDE.local.md` (#1131).
 ///
@@ -1168,6 +1330,16 @@ export const claudeIndexCoverage = () =>
 /// below that hook sees an index.
 export const claudeSessions = () => call<WireClaudeSessionList>("claude_sessions");
 
+/// The sessions that produced a pull request with this number, in every
+/// repository the link table holds (#1545). The search box's lookup: a
+/// bare `#1234` names no repository, and a qualified one is matched
+/// case-insensitively by the caller. Also the PR detail panel's lookup
+/// since #1557, which retired `claude_sessions_for_pr`: its exact
+/// `owner/repo` match missed every link a transferred repository kept
+/// under its old owner.
+export const claudeSessionsForPrNumber = (number: number) =>
+  call<ClaudePrLink[]>("claude_sessions_for_pr_number", { number });
+
 /// What ONE selected session knows that the list does not carry (#985).
 ///
 /// `Class::Read`, so the phone gets it -- and the phone is who the split
@@ -1179,12 +1351,20 @@ export const claudeSessions = () => call<WireClaudeSessionList>("claude_sessions
 /// session deleted between two polls produces. That is an ANSWER; a
 /// rejection means the database could not be read. The view words them
 /// differently and must never collapse them (#846).
-/// The sessions that produced one pull request (#1132).
-export const claudeSessionsForPr = (repo: string, number: number) =>
-  call<ClaudePrLink[]>("claude_sessions_for_pr", { repo, number });
-
 export const claudeSessionDetail = (sessionId: string) =>
   call<ClaudeSessionDetail | null>("claude_session_detail", { sessionId });
+
+/// A compact, content-free status per session (#1486): liveness, waiting
+/// kind, and the last turn's end and outcome. What the phone's
+/// notifications are computed from; `Class::Read`, and carries no
+/// transcript text.
+export const claudeSessionDigest = () => call<SessionDigest>("claude_session_digest");
+
+/// One session's opening prompt (#1486), for the phone's opt-in
+/// lock-screen snippet. Transcript text, so masked before it reaches a
+/// phone and refused to one that may not read transcripts.
+export const claudeTranscriptOpeningPrompt = (sessionId: string) =>
+  call<OpeningPrompt>("claude_transcript_opening_prompt", { sessionId });
 
 /// Reveal a session's directory or transcript in the file manager.
 /// Returns the path on success.
@@ -1348,35 +1528,86 @@ export const claudeSessionEvents = (sessionId: string) =>
 /// denominators, without which the profile reads as covering everything.
 export const claudeEventProfile = () => call<ClaudeCorpus>("claude_event_profile");
 
-/// The tail of one session's transcript, as conversation (#982).
+/// One clipped block's full text, by the record's id and the block's
+/// index (#1475). Bounded server-side too; the response's `clip` says
+/// when that bound bit.
 ///
-/// `Class::Read`, and the one Claude action whose phone case is stronger
-/// than the desktop's: `claudeRevealPath` is `Class::Local`, so without
-/// this a companion user can see that a session died and not one word of
-/// what it was doing.
+/// `reveal` is the phone's Reveal button (#1481, #1488): the desktop
+/// sends the text unmasked when this device may reveal, and refuses
+/// otherwise. A block fetched while the phone shows revealed text must
+/// arrive revealed too. Sent only when true, so the desktop's own calls
+/// -- which are never masked -- carry exactly the arguments they always
+/// did.
 ///
-/// Bounded inside the command -- a 256 KB window, at most 200 messages,
-/// each block clamped -- so the 76 MB transcript on the development
-/// machine cannot be pulled over the pairing transport.
-export const claudeTranscriptTail = (path: string) =>
-  call<ClaudePreview>("claude_transcript_tail", { path });
+/// `offset` is the record's `offset` from the message or tool output that
+/// showed the block (#1220): with it the fetch reads that one record
+/// instead of scanning the file. `null` scans, as does a stale offset.
+export const claudeTranscriptBlockText = (
+  path: string,
+  messageId: string,
+  index: number,
+  reveal = false,
+  offset: number | null = null,
+) =>
+  call<TranscriptBlockText>("claude_transcript_block_text", {
+    path,
+    messageId,
+    index,
+    // Each rides only when set, so a call without them carries exactly
+    // the arguments it always did.
+    ...(offset !== null ? { offset } : {}),
+    ...(reveal ? { reveal: true } : {}),
+  });
 
-/// One incremental step of following a live transcript (#1208).
+/// One bounded page of a transcript, before or after an anchor (#1220).
 ///
-/// The companion to `claudeTranscriptTail` and deliberately a separate
-/// command: `tail` answers "show me this session" and reads a 256 KB
-/// window every call, which is the wrong shape for a poll. This answers
-/// "what changed since byte N" and reads nothing when nothing did.
+/// Open at `{ kind: "end" }` / `"before"`; page back with
+/// `{ kind: "cursor", ...window.start }` / `"before"`, forward with
+/// `{ kind: "cursor", ...window.end }` / `"after"`. Join pages with
+/// `mergeWindows` (`src/lib/transcriptPages.ts`), and label the position
+/// with `positionLabel` -- it says "estimate" when the figures are one.
 ///
-/// `cursor` is opaque -- whatever the last call returned, handed back
-/// unread. `null` on the first poll.
+/// `limit` is the most messages wanted; `null` is the server's maximum,
+/// and a larger ask is clamped to it. `Class::Read`, bounded per call
+/// inside the command however large the file.
 ///
-/// `Class::Read`, bounded by the same constants as `tail` plus a 64 KB
-/// fingerprint probe; the phone's case is the stronger one, because a
-/// companion user watching a RUNNING agent is exactly who a frozen
-/// snapshot fails.
-export const claudeTranscriptFollow = (path: string, cursor: ClaudeFollowCursor | null) =>
-  call<ClaudeFollow>("claude_transcript_follow", { path, cursor });
+/// `reveal` as `claudeTranscriptBlockText`: sent only when true.
+export const claudeTranscriptPage = (
+  path: string,
+  anchor: TranscriptPageAnchor,
+  direction: TranscriptPageDirection,
+  limit: number | null,
+  reveal = false,
+) =>
+  call<RemoteTranscriptWindow>(
+    "claude_transcript_page",
+    reveal
+      ? { path, anchor, direction, limit, reveal: true }
+      : { path, anchor, direction, limit },
+  );
+
+/// Find messages anywhere in one transcript (#1484): the turn outline
+/// when `query` is `null`, otherwise every message whose text holds it,
+/// ignoring case. Each hit's `cursor` reads the page starting at it
+/// through `claudeTranscriptPage` (`{ kind: "cursor", ...hit.cursor }`,
+/// `"after"`).
+///
+/// Not `claudeSearchTranscripts`: that searches the corpus index, one
+/// row per session from each file's first 8 MB, and names sessions, not
+/// messages. Bounded inside the command -- `more` and `complete` say
+/// when a bound stopped it -- and masked for a phone like a page.
+///
+/// `reveal` as `claudeTranscriptPage`: sent only when true.
+export const claudeTranscriptFind = (
+  path: string,
+  query: string | null,
+  limit: number | null,
+  reveal = false,
+) =>
+  call<RemoteTranscriptFind>(
+    "claude_transcript_find",
+    reveal ? { path, query, limit, reveal: true } : { path, query, limit },
+  );
 
 // ---------------------------------------------------------------------
 // The Claude Code hook installer (#915). Rust side:
@@ -1899,6 +2130,12 @@ export interface PairedDevice {
   paired_at: string;
   /// RFC 3339, or null until the device's first connection after pairing.
   last_seen: string | null;
+  /// "Allow this phone to read session transcripts" (#1488). On by
+  /// default.
+  transcripts_allowed: boolean;
+  /// "Allow this phone to reveal hidden text" (#1488). Off by default:
+  /// the phone gets transcript text with likely secrets masked.
+  reveal_allowed: boolean;
 }
 
 export const listPairedDevices = () =>
@@ -1908,6 +2145,15 @@ export const listPairedDevices = () =>
 /// click on an already-revoked device resolves rather than rejects.
 export const revokePairedDevice = (id: number) =>
   call<void>("revoke_paired_device", { id });
+
+/// What one phone may read of the session transcripts (#1488). Both
+/// switches in one call; the phone's very next request is judged by
+/// them. Rejects when the phone was revoked in the meantime.
+export const setPairedDeviceAccess = (
+  id: number,
+  transcriptsAllowed: boolean,
+  revealAllowed: boolean,
+) => call<void>("set_paired_device_access", { id, transcriptsAllowed, revealAllowed });
 
 /// The machine's health right now, sampled on demand.
 ///
@@ -2007,3 +2253,10 @@ export const systemFootprint = () => call<Footprint>("system_footprint");
 /// empty table.
 export const systemNetworkProcesses = () =>
   call<NetProcess[]>("system_network_processes");
+
+export const getGitLabDetail = (identity: import("../types/identity").PrIdentity) =>
+  call<import("../types/gitlabActions").GitLabDetail>("get_gitlab_detail", { identity });
+export const getGitLabActionCapabilities = (identity: import("../types/identity").PrIdentity) =>
+  call<import("../types/gitlabActions").GitLabCapabilities>("gitlab_action_capabilities", { identity });
+export const gitLabAction = (request: import("../types/gitlabActions").GitLabActionRequest) =>
+  call<import("../types/gitlabActions").GitLabReceipt>("gitlab_action", { request });

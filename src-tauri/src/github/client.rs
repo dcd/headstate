@@ -6,7 +6,7 @@
 
 use super::map::{
     map_cycle_trend, map_detail, map_history, map_list, map_merged_detail, map_rate_limit,
-    map_search, map_total, map_viewer,
+    map_search, map_viewer,
 };
 use super::model::{CycleTrend, History, MergedDetail, Periods, PrDetail, PullRequest, Stats};
 use super::query::{
@@ -290,6 +290,39 @@ fn refused_fields(v: &serde_json::Value) -> usize {
     v["__refused"].as_u64().unwrap_or(0) as usize
 }
 
+/// List evidence retained before legacy numeric wrappers apply defaults.
+#[derive(Clone)]
+pub struct FetchedList {
+    pub prs: Vec<PullRequest>,
+    pub total: Option<u64>,
+    pub coverage: crate::store::source_cache::Coverage,
+}
+
+fn list_evidence(v: &serde_json::Value, prs: Vec<PullRequest>) -> FetchedList {
+    use crate::store::source_cache::Coverage;
+    let total = v["headstate_paging"]["truest_total"]
+        .as_u64()
+        .or_else(|| v["authored"]["issueCount"].as_u64());
+    let refused = refused_fields(v) > 0;
+    let failed = v["headstate_paging"]["failed_pages"].as_u64().unwrap_or(0) > 0;
+    let malformed = v["authored"]["nodes"]
+        .as_array()
+        .is_none_or(|nodes| nodes.len() != prs.len());
+    let coverage = if refused || failed || malformed || total.is_some_and(|n| n > prs.len() as u64)
+    {
+        Coverage::Partial { total }
+    } else if total.is_none() || v["headstate_paging"]["count_unknown"] == true {
+        Coverage::Unknown
+    } else {
+        Coverage::Complete
+    };
+    FetchedList {
+        prs,
+        total,
+        coverage,
+    }
+}
+
 impl GitHubClient {
     pub fn new(octocrab: Octocrab) -> Self {
         Self { octocrab }
@@ -310,7 +343,7 @@ impl GitHubClient {
     /// list" rule one layer above where it was enforced.
     ///
     /// Errors are only fatal when NO data came back at all.
-    async fn graphql_partial_ok(
+    pub(super) async fn graphql_partial_ok(
         &self,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, ClientError> {
@@ -393,11 +426,16 @@ impl GitHubClient {
         // the common case -- the user is working through the queue, and
         // every approval removes one.
         let mut truest_total = total;
+        let mut count_unknown = false;
+        let mut all_refused = refused_fields(&merged);
         for page in rest {
             match page {
                 Ok(v) => {
+                    all_refused += refused_fields(&v);
                     if let Some(t) = v["authored"]["issueCount"].as_u64() {
                         truest_total = truest_total.min(t as u32);
+                    } else {
+                        count_unknown = true;
                     }
                     if let Some(nodes) = v["authored"]["nodes"].as_array() {
                         if let Some(into) = merged["authored"]["nodes"].as_array_mut() {
@@ -435,7 +473,9 @@ impl GitHubClient {
         // crossed, and how many pages were lost. A shortfall no larger
         // than the number of boundaries is ordinary drift and not worth
         // a warning; anything beyond that is worth seeing.
+        merged["__refused"] = json!(all_refused);
         merged["headstate_paging"] = json!({
+            "count_unknown": count_unknown,
             "boundaries": pages.saturating_sub(1),
             "failed_pages": failed_pages,
             "truest_total": truest_total,
@@ -557,6 +597,16 @@ impl GitHubClient {
     pub async fn fetch_reviewing_with_shortfall(
         &self,
     ) -> Result<(Vec<PullRequest>, u64), ClientError> {
+        self.fetch_reviewing_snapshot().await.map(|result| {
+            let short = result
+                .total
+                .unwrap_or(0)
+                .saturating_sub(result.prs.len() as u64);
+            (result.prs, short)
+        })
+    }
+
+    pub async fn fetch_reviewing_snapshot(&self) -> Result<FetchedList, ClientError> {
         // Its OWN request, not both lists. It used to call
         // `fetch_prs_and_reviewing`, so opening To review paid for the
         // authored list as well -- and on a reported account with 40
@@ -622,10 +672,7 @@ impl GitHubClient {
             );
         }
         let refused = refused_fields(&v);
-        Self::reject_empty_after_refusals(mapped, refused).map(|prs| {
-            let short = total.saturating_sub(prs.len() as u64);
-            (prs, short)
-        })
+        Self::reject_empty_after_refusals(mapped, refused).map(|prs| list_evidence(&v, prs))
     }
 
     /// How many pull requests await the user's review.
@@ -752,6 +799,79 @@ impl GitHubClient {
         Ok(parsed)
     }
 
+    /// A REST GET, metered into `budget`, returning the parsed body (#1451).
+    ///
+    /// The app's first REST READ: base-branch rules and branch activity have
+    /// no GraphQL form that also names the pusher, so the review gates read
+    /// them here. Follows `rest_post_json`'s conventions -- raw response via
+    /// octocrab's underscore method, body read as text then parsed -- with
+    /// two differences a read needs:
+    ///
+    /// - **Non-2xx is an error.** `_get` hands back the raw response for
+    ///   any status, so a 404 on a repository the viewer cannot read would
+    ///   otherwise parse as `{"message": "Not Found"}` and look like an
+    ///   answer. `octocrab::map_github_error` turns it into the same
+    ///   `ClientError::Api` every other octocrab call produces.
+    /// - **Metered before the status is judged.** A refusal still spent a
+    ///   request from the `core` pool, and its `X-RateLimit-Remaining` is
+    ///   as true as a success's. REST reports no GraphQL `rateLimit`, so it
+    ///   is recorded with `Budget::record_rest` -- see
+    ///   `budget::OBSERVED_REST_REMAINING` for why the pools stay apart.
+    ///
+    /// A body that is not JSON is `ClientError::NotJson` rather than
+    /// `Null`: unlike the create-PR response, there is no "it probably
+    /// worked" reading of an unparseable read.
+    pub(super) async fn rest_get(
+        &self,
+        path: &str,
+        budget: &crate::github::stats::Budget,
+    ) -> Result<serde_json::Value, ClientError> {
+        let response = self.octocrab._get(path).await?;
+        let remaining = response
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        budget.record_rest(remaining);
+        let response = octocrab::map_github_error(response).await?;
+        let text = self.octocrab.body_to_string(response).await?;
+        serde_json::from_str(&text).map_err(|_| ClientError::NotJson("non-JSON body".into()))
+    }
+
+    /// A REST PUT with a JSON body, metered into `budget`, returning the
+    /// HTTP status beside the parsed body (#1468).
+    ///
+    /// Unlike `rest_get`, a non-2xx status is NOT turned into an error
+    /// here: the stack merge API answers 400 and 409 with a body that IS the
+    /// answer (`status: failed` with GitHub's reason, or the `uuid` of a
+    /// merge already running), and mapping those to `ClientError::Api`
+    /// would throw away exactly what the caller must show. The caller
+    /// judges the status. Metered before anything else, for `rest_get`'s
+    /// reason: a refusal still spent a `core` request.
+    ///
+    /// A body that is not JSON comes back as `Null`, and the caller reads
+    /// the status alone.
+    pub(super) async fn rest_put(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+        budget: &crate::github::stats::Budget,
+    ) -> Result<(u16, serde_json::Value), ClientError> {
+        let response = self.octocrab._put(path, Some(body)).await?;
+        let remaining = response
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        budget.record_rest(remaining);
+        let status = response.status().as_u16();
+        let text = self.octocrab.body_to_string(response).await?;
+        Ok((
+            status,
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
+        ))
+    }
+
     /// Like `graphql_mutation`, but hands back the `data` object.
     ///
     /// Most mutations only need "did it fail", so `graphql_mutation`
@@ -819,12 +939,20 @@ impl GitHubClient {
         let (owner, name) = repo
             .split_once('/')
             .ok_or_else(|| ClientError::Graphql(format!("malformed repository: {repo}")))?;
-        let mut v = self
-            .graphql_partial_ok(&json!({
-                "query": PR_DETAIL_QUERY,
-                "variables": { "owner": owner, "repo": name, "number": number }
-            }))
-            .await?;
+        // The stack lookup runs BESIDE the detail query rather than after
+        // it (#1452), so it costs a point and not a round trip. It never
+        // fails the view: its own failures are `PrStack::Unknown`, and it
+        // stops itself at `stack::STACK_BUDGET`, well inside the command's
+        // ceiling.
+        let body = json!({
+            "query": PR_DETAIL_QUERY,
+            "variables": { "owner": owner, "repo": name, "number": number }
+        });
+        let (first, stack) = tokio::join!(
+            self.graphql_partial_ok(&body),
+            self.fetch_pr_stack(owner, name, number),
+        );
+        let mut v = first?;
         // A refusal on THIS document is not survivable by defaulting, and
         // this is the one path where that is counter-intuitive enough to
         // spell out (#854).
@@ -853,7 +981,9 @@ impl GitHubClient {
         }
         self.append_remaining_checks(&mut v, owner, name, number)
             .await?;
-        Ok(map_detail(&v, repo))
+        let mut detail = map_detail(&v, repo);
+        detail.stack = stack;
+        Ok(detail)
     }
 
     /// Follow `statusCheckRollup.contexts` pagination into `v`.
@@ -1068,7 +1198,46 @@ impl GitHubClient {
         map_viewer(&v).ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))
     }
 
+    /// One chunk of the worktree view's merged-PR lookup (#1440), raw.
+    ///
+    /// `branches` must hold at most [`super::query::MERGED_HEADS_CHUNK`]
+    /// names; the chunking, the deadline and the strict rule that decides
+    /// what the answer is allowed to mean all live in `worktrees::github`,
+    /// which is the only caller. Returned unmapped for the same reason the
+    /// stats layer's `stats_graphql` is: the reader is next to its rule.
+    ///
+    /// Metered into `budget`, before anything is read out of the answer,
+    /// so a response that carried nothing usable still counts its point.
+    pub async fn merged_heads(
+        &self,
+        owner: &str,
+        name: &str,
+        branches: &[String],
+        budget: &crate::github::stats::Budget,
+    ) -> Result<serde_json::Value, ClientError> {
+        let mut vars = serde_json::Map::new();
+        vars.insert("owner".into(), json!(owner));
+        vars.insert("name".into(), json!(name));
+        for (i, b) in branches.iter().enumerate() {
+            vars.insert(format!("h{i}"), json!(b));
+        }
+        let v = self
+            .graphql_partial_ok(&json!({
+                "query": super::query::merged_heads_query(branches.len()),
+                "variables": vars,
+            }))
+            .await?;
+        budget.record(&v);
+        Ok(v)
+    }
+
     pub async fn fetch_prs_with_total(&self) -> Result<(Vec<PullRequest>, u64), ClientError> {
+        self.fetch_prs_snapshot()
+            .await
+            .map(|result| (result.prs, result.total.unwrap_or(0)))
+    }
+
+    pub async fn fetch_prs_snapshot(&self) -> Result<FetchedList, ClientError> {
         let started = std::time::Instant::now();
         let v = self.search_page_with_fallback(AUTHORED_OPEN).await?;
         // How long GitHub took, and what it was asked for. A slow
@@ -1100,7 +1269,7 @@ impl GitHubClient {
             // from the other at different moments.
             crate::github::stats::budget::note_remaining(remaining);
         }
-        Ok((map_search(&v), map_total(&v)))
+        Ok(list_evidence(&v, map_search(&v)))
     }
 
     /// The two historical counters. The other five dashboard numbers are
@@ -1526,6 +1695,47 @@ mod tests {
     /// Offset cursors index a live list, so an item entering mid-fetch
     /// shifts the boundary and hands the same node to two pages. The
     /// merge used to keep both.
+    #[test]
+    fn source_coverage_distinguishes_missing_totals_from_measured_zero() {
+        use crate::store::source_cache::Coverage;
+        let missing = json!({"authored": {"nodes": []}});
+        let result = list_evidence(&missing, vec![]);
+        assert_eq!(result.total, None);
+        assert_eq!(result.coverage, Coverage::Unknown);
+        let empty = json!({"authored": {"nodes": [], "issueCount": 0}});
+        let result = list_evidence(&empty, vec![]);
+        assert_eq!(result.total, Some(0));
+        assert_eq!(result.coverage, Coverage::Complete);
+    }
+
+    #[test]
+    fn source_coverage_retains_refusals_failed_pages_and_unknown_page_counts() {
+        use crate::store::source_cache::Coverage;
+        for response in [
+            json!({"authored": {"nodes": [], "issueCount": 0}, "__refused": 1}),
+            json!({"authored": {"nodes": [], "issueCount": 0}, "headstate_paging": {"failed_pages": 1}}),
+            json!({"authored": {"nodes": [null], "issueCount": 0}}),
+        ] {
+            assert_eq!(
+                list_evidence(&response, vec![]).coverage,
+                Coverage::Partial { total: Some(0) }
+            );
+        }
+        assert_eq!(
+            list_evidence(&json!({"authored": {"nodes": []}, "__refused": 1}), vec![]).coverage,
+            Coverage::Partial { total: None }
+        );
+        assert_eq!(
+            list_evidence(
+                &json!({"authored": {"nodes": [], "issueCount": 0},
+            "headstate_paging": {"count_unknown": true}}),
+                vec![]
+            )
+            .coverage,
+            Coverage::Unknown
+        );
+    }
+
     #[test]
     fn a_node_returned_by_two_pages_appears_once() {
         let mut merged = serde_json::json!({
@@ -2972,7 +3182,15 @@ mod tests {
             .await
             .unwrap();
 
-        let posts = server.received_requests().await.unwrap().len();
+        // The stack lookup (#1452) runs BESIDE this chain, not in it, so it
+        // is not part of the serial count this test guards.
+        let posts = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| !String::from_utf8_lossy(&r.body).contains("query PrStack"))
+            .count();
         assert_eq!(
             posts, 4,
             "one detail query plus at most three check pages; {posts} POSTs is the #790 chain"
@@ -3252,6 +3470,15 @@ mod tests {
                 "stats_graphql",
                 "the stats layer reads the count at each of its own readers",
             ),
+            // #1440. A refusal can only SHRINK what this answers: its
+            // mapper treats a null alias as unanswered and skips a node
+            // missing a field, and the only thing an answer can do is
+            // upgrade a worktree to merged. Nothing is ever rendered as
+            // "GitHub found no merge", so there is no zero to lie with.
+            (
+                "merged_heads",
+                "`worktrees::github::map_merged_heads` reads a refused alias as unanswered",
+            ),
             // The machinery itself, not a caller of it.
             ("graphql_partial_ok", "the helper itself"),
         ];
@@ -3272,6 +3499,7 @@ mod tests {
             "\n    fn ",
             "\n    pub fn ",
             "\n    pub async fn ",
+            "\n    pub(super) async fn ",
             "\n    async fn ",
             "\nfn ",
             "\npub fn ",

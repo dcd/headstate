@@ -2,7 +2,7 @@
 
 use super::model::{
     CheckRun, CiState, CycleTrend, HistoryPoint, Label, MergeState, MergeStateStatus, MergedDetail,
-    MergedPr, PrComment, PrDetail, PullRequest, RepoCount, ReviewState, ReviewThread,
+    MergedPr, PrComment, PrDetail, PrStack, PullRequest, RepoCount, ReviewState, ReviewThread,
     ReviewerVerdict,
 };
 use chrono::{DateTime, Duration, Utc};
@@ -128,12 +128,16 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
         .as_array()
         .unwrap_or(&empty)
         .iter()
-        .map(|c| PrComment {
-            author: c["author"]["login"].as_str().unwrap_or("ghost").to_string(),
-            created_at: c["createdAt"].as_str().unwrap_or_default().to_string(),
-            body: c["body"].as_str().unwrap_or_default().to_string(),
-        })
+        .map(map_comment)
         .collect();
+
+    // #1457. `ready_at` is the list row's own function, so the header and
+    // the row it was opened from cannot date the pull request differently.
+    // An unreadable `createdAt` leaves both absent rather than failing the
+    // whole view the way `map_node` drops a row: a detail payload is one
+    // pull request the user asked for, and the rest of it is still true.
+    let is_draft = pr["isDraft"].as_bool().unwrap_or(false);
+    let created_at = ts(pr, "createdAt");
 
     PrDetail {
         id: pr["id"].as_str().unwrap_or_default().to_string(),
@@ -141,7 +145,10 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
         title: pr["title"].as_str().unwrap_or_default().to_string(),
         url: pr["url"].as_str().unwrap_or_default().to_string(),
         state: pr["state"].as_str().unwrap_or("OPEN").to_lowercase(),
-        is_draft: pr["isDraft"].as_bool().unwrap_or(false),
+        is_draft,
+        ready_at: created_at.and_then(|c| ready_at(pr, c, is_draft)),
+        created_at,
+        last_commit_at: ts(&pr["commits"]["nodes"][0]["commit"], "committedDate"),
         body: pr["body"].as_str().unwrap_or_default().to_string(),
         author: pr["author"]["login"]
             .as_str()
@@ -150,6 +157,9 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
         repo: repo.to_string(),
         head_ref: pr["headRefName"].as_str().unwrap_or_default().to_string(),
         head_oid: pr["headRefOid"].as_str().unwrap_or_default().to_string(),
+        head_repo: pr["headRepository"]["nameWithOwner"]
+            .as_str()
+            .map(str::to_string),
         head_ref_id: pr["headRef"]["id"].as_str().map(str::to_string),
         base_ref: pr["baseRefName"].as_str().unwrap_or_default().to_string(),
         merge_status: merge_status(pr),
@@ -196,6 +206,9 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
             .as_u64()
             .unwrap_or(checks.len() as u64),
         checks,
+        // Not in this document: `fetch_pr_detail` fills it from its own
+        // lookup (#1452). Unknown until then, never "not stacked".
+        stack: PrStack::Unknown,
     }
 }
 
@@ -337,6 +350,27 @@ fn unresolved_threads(node: &Value) -> u64 {
         .unwrap_or(0)
 }
 
+/// The list query's review-thread page: `reviewThreads(first: 100)` in
+/// `PRS_QUERY`. `the_list_thread_page_matches_the_query` pins the two.
+pub(crate) const LIST_THREAD_PAGE: usize = 100;
+
+/// Whether `unresolved_threads` may be a floor (#1577).
+///
+/// A page that came back FULL may have had more behind it, so the count
+/// over it is only "at least". A short page is the whole connection.
+/// No `totalCount` is needed to know that, and none is asked for: a
+/// total of exactly one page reads as "may be short", which is the
+/// qualified answer, never the wrong one.
+///
+/// A node with no thread connection at all counts zero threads and says
+/// nothing about more; a zero is never shown as a tag, so that case
+/// cannot print.
+fn unresolved_threads_floor(node: &Value) -> bool {
+    node["reviewThreads"]["nodes"]
+        .as_array()
+        .is_some_and(|threads| threads.len() >= LIST_THREAD_PAGE)
+}
+
 /// The review conversations in full, for the detail view.
 ///
 /// `unresolved_threads` above counts the same node and stays the source of
@@ -402,15 +436,29 @@ fn map_review_threads(node: &Value) -> Vec<ReviewThread> {
                 .as_array()
                 .unwrap_or(&empty)
                 .iter()
-                .map(|c| PrComment {
-                    author: c["author"]["login"].as_str().unwrap_or("ghost").to_string(),
-                    created_at: c["createdAt"].as_str().unwrap_or_default().to_string(),
-                    body: c["body"].as_str().unwrap_or_default().to_string(),
-                })
+                .map(map_comment)
                 .collect(),
             comment_count: t["comments"]["totalCount"].as_u64().unwrap_or(0),
         })
         .collect()
+}
+
+/// One comment node, from the conversation or a review thread.
+///
+/// ONE function for both, because both selections ask for the same
+/// fields, and two mappings of one node shape drift.
+///
+/// `author_is_bot` is true only when GitHub names the author a `Bot`
+/// (#1581). A deleted account (`author: null`, shown as "ghost") and a
+/// missing `__typename` both read as a person, which is the side the
+/// view folds least on.
+fn map_comment(c: &Value) -> PrComment {
+    PrComment {
+        author: c["author"]["login"].as_str().unwrap_or("ghost").to_string(),
+        created_at: c["createdAt"].as_str().unwrap_or_default().to_string(),
+        body: c["body"].as_str().unwrap_or_default().to_string(),
+        author_is_bot: c["author"]["__typename"].as_str() == Some("Bot"),
+    }
 }
 
 /// GitHub's merge-readiness summary.
@@ -466,6 +514,27 @@ fn labels(node: &Value) -> Vec<Label> {
         .unwrap_or_default()
 }
 
+/// When the pull request became ready for review. See `PullRequest::ready_at`.
+///
+/// The query asks for `last: 1` of `READY_FOR_REVIEW_EVENT` only, so the
+/// one node, if any, is the latest time it left draft.
+///
+/// Three different answers, kept apart:
+/// - an EMPTY list is "never a draft", so `created_at` -- the same moment;
+/// - a MISSING connection is unknown, not empty: reading it as
+///   never-drafted would date a pull request marked ready an hour ago
+///   from the week it spent in draft;
+/// - an event whose time does not parse is unknown, never "now".
+fn ready_at(node: &Value, created_at: DateTime<Utc>, is_draft: bool) -> Option<DateTime<Utc>> {
+    if is_draft {
+        return None;
+    }
+    match node["timelineItems"]["nodes"].as_array()?.last() {
+        None => Some(created_at),
+        Some(event) => ts(event, "createdAt"),
+    }
+}
+
 fn map_node(node: &Value) -> Option<PullRequest> {
     // Bound ahead of the struct literal so each total can default to the
     // length of the list it describes without mapping anything twice --
@@ -474,8 +543,11 @@ fn map_node(node: &Value) -> Option<PullRequest> {
     let assignees = logins(&node["assignees"]);
     let latest_reviews = latest_reviews(node);
     let labels = labels(node);
+    let created_at = ts(node, "createdAt")?;
+    let is_draft = node["isDraft"].as_bool().unwrap_or(false);
 
     Some(PullRequest {
+        source: Default::default(),
         id: node["id"].as_str().unwrap_or_default().to_string(),
         number: node["number"].as_u64()?,
         title: node["title"].as_str()?.to_string(),
@@ -485,12 +557,16 @@ fn map_node(node: &Value) -> Option<PullRequest> {
             .as_str()
             .unwrap_or("unknown")
             .to_string(),
-        is_draft: node["isDraft"].as_bool().unwrap_or(false),
+        is_draft,
         head_ref: node["headRefName"].as_str().unwrap_or_default().to_string(),
         head_oid: node["headRefOid"].as_str().unwrap_or_default().to_string(),
         head_ref_id: node["headRef"]["id"].as_str().map(str::to_string),
+        head_repo: node["headRepository"]["nameWithOwner"]
+            .as_str()
+            .map(str::to_string),
         base_ref: node["baseRefName"].as_str().unwrap_or_default().to_string(),
-        created_at: ts(node, "createdAt")?,
+        ready_at: ready_at(node, created_at, is_draft),
+        created_at,
         updated_at: ts(node, "updatedAt")?,
         ci: ci_state(node),
         merge: merge_state(node),
@@ -519,6 +595,7 @@ fn map_node(node: &Value) -> Option<PullRequest> {
         labels,
         comment_count: node["totalCommentsCount"].as_u64().unwrap_or(0),
         unresolved_threads: unresolved_threads(node),
+        unresolved_threads_floor: unresolved_threads_floor(node),
     })
 }
 
@@ -989,6 +1066,62 @@ mod tests {
         assert_eq!(map_search(&v)[0].unresolved_threads, 0);
     }
 
+    /// #1577: a FULL thread page may have more behind it, so its count is
+    /// a floor; a short page is the whole connection, so its count is
+    /// exact. The strip prints the first as "3+", the second as "3".
+    #[test]
+    fn a_full_thread_page_marks_the_count_as_a_floor() {
+        let mut threads: Vec<serde_json::Value> = Vec::new();
+        for _ in 0..3 {
+            threads.push(json!({"isResolved": false, "isOutdated": false}));
+        }
+        for _ in 3..LIST_THREAD_PAGE {
+            threads.push(json!({"isResolved": true, "isOutdated": false}));
+        }
+        let full = &map_search(&node_with_threads(json!(threads)))[0];
+        assert_eq!(full.unresolved_threads, 3);
+        assert!(full.unresolved_threads_floor, "a full page may be short");
+
+        threads.pop();
+        let short = &map_search(&node_with_threads(json!(threads)))[0];
+        assert_eq!(short.unresolved_threads, 3);
+        assert!(!short.unresolved_threads_floor, "a short page is complete");
+    }
+
+    /// The constant the floor test leans on must be the query's real page,
+    /// or a narrowed window would print floors as totals again (#802).
+    #[test]
+    fn the_list_thread_page_matches_the_query() {
+        let page = format!("reviewThreads(first: {LIST_THREAD_PAGE})");
+        assert!(
+            crate::github::query::PRS_QUERY.contains(&page),
+            "PRS_QUERY must ask for `{page}`"
+        );
+    }
+
+    /// A snapshot cached before #1577 has no `unresolved_threads_floor`.
+    /// It reads as "may be short", never as an exact total.
+    #[test]
+    fn a_cached_row_without_the_floor_flag_reads_as_a_floor() {
+        let mut v = serde_json::to_value(&map_search(&node_with_threads(json!([])))[0]).unwrap();
+        v.as_object_mut()
+            .unwrap()
+            .remove("unresolved_threads_floor")
+            .expect("the field is on the wire");
+        let pr: PullRequest = serde_json::from_value(v).unwrap();
+        assert!(pr.unresolved_threads_floor);
+    }
+
+    /// #1576: the list row carries where its head lives, so the strip can
+    /// ask a fork's activity log. A deleted fork is `None`, not the base.
+    #[test]
+    fn a_list_row_carries_its_head_repository_or_none() {
+        let mut v = node_with_threads(json!([]));
+        assert_eq!(map_search(&v)[0].head_repo, None);
+        v["authored"]["nodes"][0]["headRepository"] = json!({"nameWithOwner": "fork/a"});
+        assert_eq!(map_search(&v)[0].head_repo.as_deref(), Some("fork/a"));
+    }
+
     #[test]
     fn normalises_both_check_shapes() {
         // CheckRun reports `conclusion`; StatusContext reports `state`.
@@ -1040,6 +1173,44 @@ mod tests {
             t.comment_count, 2,
             "the total, not the page: the query caps thread comments at 10"
         );
+    }
+
+    /// #1581: `author_is_bot` is GitHub's `__typename`, on the conversation
+    /// and on a thread alike (one `map_comment`). Only `Bot` is a bot: a
+    /// person, a deleted account and a node with no `__typename` all read
+    /// as not-a-bot, which is the side the view folds least on.
+    #[test]
+    fn a_comment_author_is_a_bot_only_when_github_says_bot() {
+        let node = |author: Value| json!({"author": author, "createdAt": "2026-01-01T00:00:00Z", "body": "x"});
+        let v = json!({"repository": {"pullRequest": {
+            "comments": {"totalCount": 4, "nodes": [
+                node(json!({"login": "coverage-bot", "__typename": "Bot"})),
+                node(json!({"login": "alice", "__typename": "User"})),
+                node(json!(null)),
+                node(json!({"login": "bob"})),
+            ]},
+            "reviewThreads": {"nodes": [{
+                "id": "RT_1", "comments": {"totalCount": 1, "nodes": [
+                    node(json!({"login": "review-bot", "__typename": "Bot"})),
+                ]}
+            }]}
+        }}});
+        let d = map_detail(&v, "acme/widget");
+        let bots: Vec<(&str, bool)> = d
+            .comments
+            .iter()
+            .map(|c| (c.author.as_str(), c.author_is_bot))
+            .collect();
+        assert_eq!(
+            bots,
+            vec![
+                ("coverage-bot", true),
+                ("alice", false),
+                ("ghost", false),
+                ("bob", false)
+            ]
+        );
+        assert!(d.review_threads[0].comments[0].author_is_bot);
     }
 
     /// A force-push strands a thread and GitHub sends `line: null`. Zero
@@ -1124,6 +1295,21 @@ mod tests {
             d.review_threads_total, 3,
             "no total must mean complete, never a zero the UI subtracts from"
         );
+    }
+
+    /// The head repository is carried, and its absence (a deleted fork) is
+    /// `None` rather than a guess at the base repository (#1451).
+    #[test]
+    fn carries_the_head_repository_or_none() {
+        let v = json!({"repository": {"pullRequest": {
+            "headRepository": {"nameWithOwner": "fork-owner/r"}
+        }}});
+        assert_eq!(
+            map_detail(&v, "o/r").head_repo.as_deref(),
+            Some("fork-owner/r")
+        );
+        let v = json!({"repository": {"pullRequest": {"headRepository": null}}});
+        assert_eq!(map_detail(&v, "o/r").head_repo, None);
     }
 
     /// The header count and the thread list are two renderings of one
@@ -1494,6 +1680,80 @@ mod tests {
         assert_eq!(d.latest_reviews[1].state, "CHANGES_REQUESTED");
     }
 
+    /// #1457: the header's three dates, read from the detail payload.
+    ///
+    /// Ready is the list row's derivation: the latest ready-for-review
+    /// event when there is one, `createdAt` when the timeline arrived
+    /// empty (never drafted), and absent while it is a draft.
+    #[test]
+    fn a_detail_payload_carries_its_age_and_last_commit() {
+        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let payload = |draft: bool, events: serde_json::Value| {
+            json!({"repository": {"pullRequest": {
+                "number": 7, "isDraft": draft,
+                "createdAt": "2026-08-01T09:00:00Z",
+                "timelineItems": {"nodes": events},
+                "commits": {"nodes": [{"commit": {"committedDate": "2026-08-09T17:30:00Z"}}]}
+            }}})
+        };
+
+        let d = map_detail(
+            &payload(false, json!([{"createdAt": "2026-08-05T12:00:00Z"}])),
+            "acme/widgets",
+        );
+        assert_eq!(d.created_at, Some(at("2026-08-01T09:00:00Z")));
+        assert_eq!(d.ready_at, Some(at("2026-08-05T12:00:00Z")));
+        assert_eq!(d.last_commit_at, Some(at("2026-08-09T17:30:00Z")));
+
+        let never_drafted = map_detail(&payload(false, json!([])), "acme/widgets");
+        assert_eq!(
+            never_drafted.ready_at,
+            Some(at("2026-08-01T09:00:00Z")),
+            "no ready event means it was ready when opened"
+        );
+
+        let draft = map_detail(
+            &payload(true, json!([{"createdAt": "2026-08-05T12:00:00Z"}])),
+            "acme/widgets",
+        );
+        assert_eq!(
+            draft.ready_at, None,
+            "a draft is not ready, however old its event"
+        );
+    }
+
+    /// Absent dates stay absent, never the epoch or "now": the header
+    /// omits what it could not read rather than printing "0s ago".
+    #[test]
+    fn absent_detail_dates_are_absent_not_zero() {
+        let d = map_detail(
+            &json!({"repository": {"pullRequest": {
+                "number": 7, "isDraft": false,
+                "createdAt": "not a date",
+                "timelineItems": {"nodes": []},
+                "commits": {"nodes": []}
+            }}}),
+            "acme/widgets",
+        );
+        assert_eq!(d.created_at, None);
+        assert_eq!(
+            d.ready_at, None,
+            "with no opening time, never-drafted cannot date readiness"
+        );
+        assert_eq!(d.last_commit_at, None, "no head commit, no commit time");
+
+        // The connection MISSING is unknown, not empty -- the same rule
+        // `ready_at` applies to the list row.
+        let no_timeline = map_detail(
+            &json!({"repository": {"pullRequest": {
+                "number": 7, "createdAt": "2026-08-01T09:00:00Z"
+            }}}),
+            "acme/widgets",
+        );
+        assert!(no_timeline.created_at.is_some());
+        assert_eq!(no_timeline.ready_at, None);
+    }
+
     /// A PR with no checks, no comments and a null author must not panic:
     /// the mapper's rule is that one odd payload never blanks the view.
     #[test]
@@ -1730,5 +1990,84 @@ mod tests {
         // Still counted for volume: the PR merged, we just cannot time it.
         assert_eq!(d.sample_size, 1);
         assert_eq!(d.additions, 1);
+    }
+
+    /// One open pull request with the given ready-for-review timeline, for
+    /// the `ready_at` tests below. `timeline` is the `timelineItems` value
+    /// exactly as the list query selects it.
+    fn with_timeline(is_draft: bool, timeline: Value) -> Value {
+        json!({"search": {"nodes": [{
+            "number": 1, "title": "t", "url": "u", "isDraft": is_draft,
+            "createdAt": "2026-08-01T09:00:00Z", "updatedAt": "2026-08-20T10:00:00Z",
+            "repository": {"nameWithOwner": "octocat/hello-world"},
+            "timelineItems": timeline
+        }]}})
+    }
+
+    /// #1407: a pull request that sat in draft is measured from when it
+    /// was marked ready, not from when it was opened.
+    #[test]
+    fn ready_at_is_the_ready_for_review_event() {
+        let v = with_timeline(
+            false,
+            json!({"nodes": [{"createdAt": "2026-08-19T15:30:00Z"}]}),
+        );
+        let pr = &map_list(&v, "search")[0];
+        assert_eq!(
+            pr.ready_at,
+            Some(ts(&json!({"t": "2026-08-19T15:30:00Z"}), "t").unwrap())
+        );
+        assert_ne!(pr.ready_at, Some(pr.created_at));
+    }
+
+    /// No event means it was never a draft, so it became reviewable the
+    /// moment it was opened: the same instant, not a guess.
+    #[test]
+    fn ready_at_without_an_event_is_when_it_was_opened() {
+        let v = with_timeline(false, json!({"nodes": []}));
+        let pr = &map_list(&v, "search")[0];
+        assert_eq!(pr.ready_at, Some(pr.created_at));
+    }
+
+    /// Present but unreadable is UNKNOWN, never "now" and never the
+    /// opened time: either would print a confident age that is wrong.
+    #[test]
+    fn an_unparseable_ready_time_is_unknown() {
+        for bad in [json!("yesterday"), json!(""), json!(null), json!(7)] {
+            let v = with_timeline(false, json!({"nodes": [{"createdAt": bad}]}));
+            assert_eq!(map_list(&v, "search")[0].ready_at, None, "{bad}");
+        }
+    }
+
+    /// A connection GitHub did not return is not "no event". Reading it
+    /// as never-a-draft would date a PR marked ready an hour ago from
+    /// the week it spent in draft.
+    #[test]
+    fn a_missing_timeline_is_unknown_not_never_drafted() {
+        for missing in [json!(null), json!({}), json!({"nodes": null})] {
+            let v = with_timeline(false, missing.clone());
+            assert_eq!(map_list(&v, "search")[0].ready_at, None, "{missing}");
+        }
+        // And a node shaped without the field at all, as a cached or
+        // partial response would be.
+        let mut v = with_timeline(false, json!({"nodes": []}));
+        v["search"]["nodes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("timelineItems");
+        assert_eq!(map_list(&v, "search")[0].ready_at, None);
+    }
+
+    /// A draft is not ready for review, whatever its history: one marked
+    /// ready and then converted back still has the old event.
+    #[test]
+    fn a_draft_has_no_ready_time() {
+        let v = with_timeline(
+            true,
+            json!({"nodes": [{"createdAt": "2026-08-19T15:30:00Z"}]}),
+        );
+        assert_eq!(map_list(&v, "search")[0].ready_at, None);
+        let v = with_timeline(true, json!({"nodes": []}));
+        assert_eq!(map_list(&v, "search")[0].ready_at, None);
     }
 }

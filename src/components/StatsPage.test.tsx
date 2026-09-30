@@ -98,6 +98,10 @@ const board = (over: Partial<StatsBoard> = {}): StatsBoard => ({
   // acquire a day shortfall it never asked about.
   daysCovered: 30,
   daysTotal: 30,
+  // Registered with no frame emitted yet (#1570): the state the #1115
+  // "queued" tests describe, so they keep describing it. A failed
+  // registration and a seeded frame are opted into by their own tests.
+  backfill: { state: "registered", lastFrame: null },
   ...over,
 });
 
@@ -640,23 +644,41 @@ describe("StatsPage honesty", () => {
   /// the activity line exists to remove: an incomplete board saying
   /// what it is missing and nothing about what is being done reads as
   /// broken, which is what was reported against v5.23.3.
-  it("says collection is starting before the first frame arrives", () => {
+  it("says collection is queued before the first frame arrives", () => {
     vi.mocked(useStatsBoard).mockReturnValue(
-      settled(board({ complete: false, total: 500, retrieved: 120, accumulating: true })),
+      settled(
+        board({
+          complete: false,
+          total: 500,
+          retrieved: 120,
+          accumulating: true,
+          daysCovered: 12,
+          daysTotal: 30,
+        }),
+      ),
     );
     // No frame yet -- the hook's own default, and the state under test.
     vi.mocked(useStatsBackfill).mockReturnValue(null);
     render(<StatsPage />);
     fireEvent.click(screen.getByRole("tab", { name: /others/i }));
-    expect(screen.getByText(/Collection starting/)).toBeTruthy();
+    expect(screen.getByText(/remaining days are queued for collection/)).toBeTruthy();
   });
 
-  it("stops saying starting once a frame has arrived", () => {
-    // The other half: "starting" must not outlive the start. A label
-    // that stuck would be the #1103 complaint again -- an unchanging
+  it("stops saying queued once a frame has arrived", () => {
+    // The other half: the pending line must not outlive the wait. A
+    // label that stuck would be the #1103 complaint again -- an unchanging
     // sentence for ten minutes reads as a page that has stopped.
     vi.mocked(useStatsBoard).mockReturnValue(
-      settled(board({ complete: false, total: 500, retrieved: 120, accumulating: true })),
+      settled(
+        board({
+          complete: false,
+          total: 500,
+          retrieved: 120,
+          accumulating: true,
+          daysCovered: 12,
+          daysTotal: 30,
+        }),
+      ),
     );
     vi.mocked(useStatsBackfill).mockReturnValue({
       scopeKey: "board|merged|*|org:acme",
@@ -669,7 +691,196 @@ describe("StatsPage honesty", () => {
     });
     render(<StatsPage />);
     fireEvent.click(screen.getByRole("tab", { name: /others/i }));
-    expect(screen.queryByText(/Collection starting/)).toBeNull();
+    expect(screen.queryByText(/queued for collection/)).toBeNull();
+    // Replaced by the frame's own words, not by silence.
+    expect(screen.getByText(/Collecting now/)).toBeTruthy();
+  });
+
+  /// A complete board has nothing pending, frame or no frame.
+  it("says nothing about collection on a complete board", () => {
+    // Accumulating, so storage is in play and only completeness decides.
+    vi.mocked(useStatsBoard).mockReturnValue(settled(board({ accumulating: true })));
+    vi.mocked(useStatsBackfill).mockReturnValue(null);
+    render(<StatsPage />);
+    fireEvent.click(screen.getByRole("tab", { name: /others/i }));
+    expect(screen.queryByText(/queued for collection/)).toBeNull();
+  });
+
+  /// Incomplete, but not in a way collection can change (#1115).
+  ///
+  /// Every day is covered and GitHub refused fields: the worker has no day
+  /// left to fetch, and its first frame for this scope would say
+  /// "converged". Promising collection for the minute before it arrives
+  /// would be a claim the next frame retracts.
+  it("promises no collection when every day is already covered", () => {
+    vi.mocked(useStatsBoard).mockReturnValue(
+      settled(board({ complete: false, refusedFields: 2, accumulating: true })),
+    );
+    vi.mocked(useStatsBackfill).mockReturnValue(null);
+    render(<StatsPage />);
+    fireEvent.click(screen.getByRole("tab", { name: /others/i }));
+    // The caveat itself still renders -- the board IS incomplete.
+    expect(screen.getByText(/GitHub refused 2 fields/)).toBeTruthy();
+    expect(screen.queryByText(/queued for collection/)).toBeNull();
+  });
+
+  /// A failed registration is a FAILURE, never "queued" (#1570).
+  ///
+  /// No frame will ever arrive for a scope the collector does not know
+  /// about, so a queued line would stand forever -- #1042's Pending that
+  /// nothing moves out of. The reason is shown, and no retry is offered
+  /// (#1050): nothing on the page can re-run the registration.
+  it("shows a failed registration as a failure with its reason, not as queued", () => {
+    vi.mocked(useStatsBoard).mockReturnValue(
+      settled(
+        board({
+          complete: false,
+          total: 500,
+          retrieved: 120,
+          accumulating: true,
+          daysCovered: 12,
+          daysTotal: 30,
+          backfill: { state: "failed", reason: "database error: disk I/O error" },
+        }),
+      ),
+    );
+    vi.mocked(useStatsBackfill).mockReturnValue(null);
+    render(<StatsPage />);
+    fireEvent.click(screen.getByRole("tab", { name: /others/i }));
+    expect(screen.queryByText(/queued for collection/)).toBeNull();
+    const failure = screen.getByText(/remaining days are not being collected/);
+    expect(failure.textContent).toContain("database error: disk I/O error");
+    // Styled as a failure, not as the amber partiality around it.
+    expect(failure.className).toContain("text-[#f85149]");
+    expect(screen.queryByRole("button", { name: /retry|try again/i })).toBeNull();
+  });
+
+  /// A frame proves collection is happening -- the scope was registered by
+  /// an earlier load -- so a failed registration on THIS load does not
+  /// contradict the progress beside it.
+  it("lets a live frame stand over a failed registration", () => {
+    vi.mocked(useStatsBoard).mockReturnValue(
+      settled(
+        board({
+          complete: false,
+          total: 500,
+          retrieved: 120,
+          accumulating: true,
+          daysCovered: 12,
+          daysTotal: 30,
+          backfill: { state: "failed", reason: "database error: disk I/O error" },
+        }),
+      ),
+    );
+    vi.mocked(useStatsBackfill).mockReturnValue({
+      scopeKey: "board|merged|*|org:acme",
+      daysCovered: 18,
+      daysTotal: 30,
+      collected: 400,
+      total: 500,
+      phase: { kind: "working" },
+      nextTickAtMs: null,
+    });
+    render(<StatsPage />);
+    fireEvent.click(screen.getByRole("tab", { name: /others/i }));
+    expect(screen.getByText(/Collecting now/)).toBeTruthy();
+    expect(screen.queryByText(/not being collected/)).toBeNull();
+  });
+
+  /// A registered scope with a stored frame shows that frame AT ONCE
+  /// (#1570), before the hook has received anything.
+  ///
+  /// The scope-switch case: the collector may have walked this scope for an
+  /// hour, but the hook only hears frames emitted after it subscribed.
+  it("shows a registered scope's stored frame before any live frame arrives", () => {
+    vi.mocked(useStatsBoard).mockReturnValue(
+      settled(
+        board({
+          complete: false,
+          total: 500,
+          retrieved: 120,
+          accumulated: 120,
+          accumulating: true,
+          daysCovered: 6,
+          daysTotal: 30,
+          backfill: {
+            state: "registered",
+            lastFrame: {
+              scopeKey: "board|merged|*|org:acme",
+              daysCovered: 24,
+              daysTotal: 30,
+              collected: 450,
+              total: 500,
+              phase: { kind: "working" },
+              nextTickAtMs: null,
+            },
+          },
+        }),
+      ),
+    );
+    vi.mocked(useStatsBackfill).mockReturnValue(null);
+    render(<StatsPage />);
+    fireEvent.click(screen.getByRole("tab", { name: /others/i }));
+    // The stored frame's figures, not the board's load-time 6 of 30.
+    expect(screen.getByText(/24 of 30 days measured/)).toBeTruthy();
+    expect(screen.getByText(/450 of 500 pull requests collected/)).toBeTruthy();
+    expect(screen.getByText(/Collecting now/)).toBeTruthy();
+    expect(screen.queryByText(/queued for collection/)).toBeNull();
+  });
+
+  /// A seed for another scope is not this scope's news, however it got
+  /// there: the page falls back to its own figures and the queued line.
+  it("ignores a stored frame filed under another scope", () => {
+    vi.mocked(useStatsBoard).mockReturnValue(
+      settled(
+        board({
+          complete: false,
+          total: 500,
+          retrieved: 120,
+          accumulating: true,
+          daysCovered: 6,
+          daysTotal: 30,
+          backfill: {
+            state: "registered",
+            lastFrame: {
+              scopeKey: "board|merged|*|org:widget",
+              daysCovered: 24,
+              daysTotal: 30,
+              collected: 450,
+              total: 500,
+              phase: { kind: "working" },
+              nextTickAtMs: null,
+            },
+          },
+        }),
+      ),
+    );
+    vi.mocked(useStatsBackfill).mockReturnValue(null);
+    render(<StatsPage />);
+    fireEvent.click(screen.getByRole("tab", { name: /others/i }));
+    expect(screen.queryByText(/24 of 30 days measured/)).toBeNull();
+    expect(screen.getByText(/remaining days are queued for collection/)).toBeTruthy();
+  });
+
+  /// A board with no storage behind it has nothing writing down more.
+  it("promises no collection for a board that is not accumulating", () => {
+    vi.mocked(useStatsBoard).mockReturnValue(
+      settled(
+        board({
+          complete: false,
+          total: 500,
+          retrieved: 120,
+          accumulating: false,
+          daysCovered: 12,
+          daysTotal: 30,
+        }),
+      ),
+    );
+    vi.mocked(useStatsBackfill).mockReturnValue(null);
+    render(<StatsPage />);
+    fireEvent.click(screen.getByRole("tab", { name: /others/i }));
+    expect(screen.getByText(/12 of 30 days measured/)).toBeTruthy();
+    expect(screen.queryByText(/queued for collection/)).toBeNull();
   });
 
   it("shows the backfill's live figures rather than the board's snapshot", () => {

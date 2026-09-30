@@ -119,6 +119,12 @@ describe("the remote surface's frontend half", () => {
       "claudeMdAdviceLaunch",
       "claudeMdAdviceLaunchPreview",
       "claudeLaunchWorktree",
+      // A pull request's Claudify (#1455): the worktree pair's shape.
+      // `PrClaudify` offers the launch only when `terminalConfigured`,
+      // which is false on `IS_MOBILE_BUILD`; the phone gets the Read
+      // `claudifyPrCommand` shown in a dialog instead.
+      "claudeLaunchPr",
+      "claudeLaunchPrPreview",
       // #1219's stop. `Class::Local` with NO dispatch arm, and the class
       // IS the safety property here rather than a rendering hint: a
       // phone must not be able to kill a session on a Mac it is not
@@ -142,8 +148,13 @@ describe("the remote surface's frontend half", () => {
       "revealLog",
       "revokePairedDevice",
       "setAutostart",
+      "setGitLabHost",
+      "setPairedDeviceAccess",
       "setNotifyPrefs",
       "setRemoteEnabled",
+      // App only synchronizes desktop polling preferences behind
+      // IS_DESKTOP_BUILD; the phone keeps its source choice locally.
+      "setSourceSelection",
       "setWorktreeDirs",
     ].sort();
 

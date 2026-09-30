@@ -3,6 +3,7 @@
 //! mirrored into TypeScript in a later milestone, so they are chosen to be
 //! stable and are not to be changed casually.
 
+use crate::identity::{PrIdentity, PrNumber, ProjectPath, Source};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -74,6 +75,9 @@ pub struct Label {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
+    /// Absent only in snapshots written before provider identity was added.
+    #[serde(default)]
+    pub source: Source,
     /// GraphQL node ID, so a row can act without first opening the
     /// detail view. Rides along in the list query at no extra cost.
     ///
@@ -85,10 +89,10 @@ pub struct PullRequest {
     /// "cannot act on this row", and the next poll replaces it wholesale.
     #[serde(default)]
     pub id: String,
-    pub number: u64,
+    pub number: PrNumber,
     pub title: String,
     pub url: String,
-    pub repo: String,
+    pub repo: ProjectPath,
     pub author: String,
     pub is_draft: bool,
     /// The branch being merged, and the branch it merges into.
@@ -107,9 +111,36 @@ pub struct PullRequest {
     /// tells "already cleaned up" from "still there".
     #[serde(default)]
     pub head_ref_id: Option<String>,
+    /// The repository the head branch lives in, `owner/name` (#1576).
+    ///
+    /// The same field `PrDetail` carries, for the same reason: the Ready
+    /// for review strip asks THIS repository who pushed the head, and a
+    /// fork's head is not in the base repository. `None` once the fork is
+    /// deleted, and for a snapshot cached before the field existed; the
+    /// pusher is then not asked, never guessed from the base.
+    #[serde(default)]
+    pub head_repo: Option<String>,
     pub base_ref: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// When the pull request became ready for review (#1407).
+    ///
+    /// The latest `ReadyForReviewEvent` when there is one. With NO such
+    /// event the pull request was never a draft, so it became reviewable
+    /// when it was opened: `created_at` is then the same moment, not a
+    /// fallback guess.
+    ///
+    /// `None` means UNKNOWN, and must never render as zero or as "just
+    /// now":
+    /// - the timeline connection did not arrive, which is not the same as
+    ///   arriving empty;
+    /// - the event's time did not parse;
+    /// - the pull request is a draft now, so it is not ready at all (an
+    ///   event from before it was converted back is stale);
+    /// - the snapshot was cached by a build older than this field, hence
+    ///   `#[serde(default)]` -- the reason every field above carries one.
+    #[serde(default)]
+    pub ready_at: Option<DateTime<Utc>>,
     pub ci: CiState,
     pub merge: MergeState,
     /// GitHub's own merge-readiness summary. See `MergeStateStatus`.
@@ -131,8 +162,28 @@ pub struct PullRequest {
     /// is blocked: whether a repo REQUIRES resolution before merging lives
     /// in `requiresConversationResolution`, which needs admin access on
     /// that repository and is unreadable for most of them.
+    ///
+    /// CORRECTED for #1454: that holds for CLASSIC branch protection only.
+    /// A ruleset's `required_review_thread_resolution` is readable without
+    /// admin, and the detail view reads it (`github::gates`) -- counting
+    /// outdated threads too, which GitHub's requirement does. The list row
+    /// still cannot: the rules are a REST read per (repository, base), not
+    /// something `PRS_QUERY` can carry under its cost guard (#312).
     #[serde(default)]
     pub unresolved_threads: u64,
+    /// Whether `unresolved_threads` may be SHORT of the truth (#1577).
+    ///
+    /// The count is taken over the threads that arrived, and the list
+    /// query asks for one page of them (#802). When that page came back
+    /// FULL there may be more beyond it, so the count is a floor and the
+    /// UI must print it as one ("3+"), never as a total.
+    ///
+    /// Defaults to TRUE: a snapshot cached before this field existed
+    /// cannot say whether its page was full, and a floor printed as a
+    /// floor is honest where an exact-looking floor is not. The next
+    /// poll replaces it.
+    #[serde(default = "may_be_a_floor")]
+    pub unresolved_threads_floor: bool,
     /// Logins whose review is still outstanding.
     ///
     /// Empty is ORDINARY, not missing data: repositories that assign
@@ -286,7 +337,21 @@ pub struct History {
     pub month_previous: u64,
 }
 
+/// `unresolved_threads_floor`'s default for a payload that predates it:
+/// "may be short". See the field.
+fn may_be_a_floor() -> bool {
+    true
+}
+
 impl PullRequest {
+    pub fn identity(&self) -> PrIdentity {
+        PrIdentity {
+            source: self.source.clone(),
+            repo: self.repo.clone(),
+            number: self.number,
+        }
+    }
+
     /// Blocked on the author and nobody else: a real conflict, or failing
     /// CI. `Checking` is deliberately excluded -- GitHub reports UNKNOWN
     /// mergeability while it computes, and treating that as a conflict
@@ -329,6 +394,17 @@ pub struct PrComment {
     pub author: String,
     pub created_at: String,
     pub body: String,
+    /// GitHub says the author is a `Bot` (an app or integration account)
+    /// rather than a person (#1581). Read from the author's `__typename`,
+    /// which both comment selections ask for, so `false` means "GitHub
+    /// named some other kind of author, or none" -- never "not asked".
+    ///
+    /// The view folds repeated comments by kind, and the rule is looser
+    /// for a bot than for a person: a person's comment is never folded
+    /// on a heading that merely looks alike. Defaulted so a payload
+    /// without the field reads as a person, the conservative side.
+    #[serde(default)]
+    pub author_is_bot: bool,
 }
 
 /// One review conversation: an inline comment thread anchored to a line.
@@ -396,6 +472,23 @@ pub struct PrDetail {
     pub url: String,
     pub state: String,
     pub is_draft: bool,
+    /// When the pull request was opened (#1457). `None` when GitHub's
+    /// value is missing or does not parse -- the header then omits the
+    /// age rather than printing one measured from nothing.
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+    /// When it became ready for review (#1457): the same derivation, from
+    /// the same selection, as `PullRequest::ready_at` -- see that field for
+    /// what `None` means. `None` also when `created_at` is, since a pull
+    /// request never drafted became ready when it was opened.
+    #[serde(default)]
+    pub ready_at: Option<DateTime<Utc>>,
+    /// The head commit's `committedDate` (#1457). The committer's clock,
+    /// NOT the push time: a rebase or a late push leaves it earlier than
+    /// the push, which is why the view says "last commit". `None` when
+    /// there is no head commit or its date is missing.
+    #[serde(default)]
+    pub last_commit_at: Option<DateTime<Utc>>,
     pub body: String,
     pub author: String,
     pub repo: String,
@@ -410,6 +503,14 @@ pub struct PrDetail {
     /// tells "already cleaned up" from "still there".
     #[serde(default)]
     pub head_ref_id: Option<String>,
+    /// The repository the head branch lives in, `owner/name` (#1451).
+    ///
+    /// The base repository for a same-repository pull request, the fork
+    /// for one from a fork, and `None` once the fork is deleted. The review
+    /// gates ask this repository who pushed the head; asking the BASE
+    /// repository instead would read a different, same-named branch.
+    #[serde(default)]
+    pub head_repo: Option<String>,
     pub base_ref: String,
     // Defaults to Unknown, never Clean: a merge button enabled on data the
     // app never fetched is the one wrong answer that costs something.
@@ -501,6 +602,78 @@ pub struct PrDetail {
     /// `poll::truncation_payload` takes with `issueCount`.
     #[serde(default)]
     pub checks_total: u64,
+    /// Where this pull request sits in a stack, asked of GitHub directly
+    /// rather than inferred from whatever the list happens to hold (#1452).
+    ///
+    /// Defaults to `Unknown`, never `None`: a payload cached before this
+    /// field existed, or a stack lookup that failed, has not established
+    /// that the pull request is standalone, and "not stacked" is the answer
+    /// that re-enables an "Add to merge queue" GitHub would refuse.
+    #[serde(default)]
+    pub stack: PrStack,
+}
+
+/// A pull request's place in a stack (#1452).
+///
+/// Two sources, in order of authority:
+///
+/// - **GitHub's native stack** (`PullRequest.stackEntry`, what `gh stack`
+///   creates). Position and size are GitHub's own numbers and are exact.
+/// - **The base chain**, for stacks made by any other tool or by hand: the
+///   base branch is another open pull request's head branch. Walked a
+///   bounded number of hops each way, so either end can be truncated; the
+///   `*_exact` flags say which, and the UI qualifies with "at least".
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PrStack {
+    /// Could not be determined: the lookup failed, timed out, was refused,
+    /// or the payload predates it. NOT the same as `None`.
+    #[default]
+    Unknown,
+    /// Checked, and not part of any stack.
+    None,
+    Stacked {
+        /// A GitHub-native stack, which GitHub merges only through its
+        /// stack merge -- `mergePullRequest` "does not support stacked pull
+        /// requests" (the schema's own words), and neither does the queue.
+        native: bool,
+        /// The native stack's number, as github.com shows it.
+        stack_number: Option<u64>,
+        /// 1 is the pull request closest to the trunk.
+        position: u64,
+        size: u64,
+        /// False when the downward walk stopped before the trunk, so
+        /// `position` (and therefore `size`) is a floor.
+        position_exact: bool,
+        /// False when either walk stopped early, so `size` is a floor.
+        size_exact: bool,
+        /// The open pull request directly beneath this one, when known --
+        /// the one that has to merge first.
+        below: Option<u64>,
+        /// A native stack's entries, bottom first, as GitHub lists them
+        /// (#1468). Empty for a base-chain stack, which has no such list.
+        ///
+        /// This is what the stack-merge confirmation names: merging a
+        /// stacked pull request through GitHub lands every open one beneath
+        /// it too, and the user must see which before agreeing.
+        #[serde(default)]
+        members: Vec<StackMember>,
+        /// True when `members` is GitHub's WHOLE list. A confirmation built
+        /// from a partial list would understate what the merge lands, so the
+        /// stack merge is offered only when this holds.
+        #[serde(default)]
+        members_complete: bool,
+    },
+}
+
+/// One entry of a native stack (#1468).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StackMember {
+    pub position: u64,
+    pub number: u64,
+    pub title: String,
+    /// GitHub's `PullRequestState`, lowercased: `open`, `merged`, `closed`.
+    pub state: String,
 }
 
 #[cfg(test)]
@@ -512,6 +685,7 @@ mod attention_tests {
             .unwrap()
             .with_timezone(&Utc);
         PullRequest {
+            source: Default::default(),
             id: "PR_test".into(),
             number: 1,
             title: "t".into(),
@@ -522,8 +696,10 @@ mod attention_tests {
             head_ref: "feature/x".into(),
             head_oid: "deadbeef".into(),
             head_ref_id: None,
+            head_repo: None,
             base_ref: "main".into(),
             created_at: t,
+            ready_at: Some(t),
             updated_at: t,
             ci,
             merge,
@@ -533,6 +709,7 @@ mod attention_tests {
             labels: vec![],
             comment_count: 0,
             unresolved_threads: 0,
+            unresolved_threads_floor: false,
             requested_reviewers: Vec::new(),
             assignees: Vec::new(),
             latest_reviews: Vec::new(),

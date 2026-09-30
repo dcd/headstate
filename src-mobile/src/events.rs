@@ -52,12 +52,15 @@ use crate::store::{get_json, put_json, Store, StoreError};
 pub const EVENT_NAMES: &[&str] = &[
     "prs-updated",
     "poll-state",
+    "source-poll-status",
+    "gitlab-data-changed",
     "poll-error",
     "prs-truncated",
     "prs-incomplete",
     "store-error",
     "worktree-removal-progress",
     "reviewing-short",
+    "reviewing-updated",
     "update-run-progress",
     "update-run-done",
     // Widening this list widens a security boundary: the whole point of
@@ -116,6 +119,21 @@ pub const EVENT_NAMES: &[&str] = &[
     // on the page never changes, and a number that never moves reads as
     // broken rather than as progressing.
     "stats-backfill-progress",
+    // The fifteenth, and the first about a Claude Code session (#1477):
+    // `{ session_id, size, seq }` when a RUNNING session's transcript
+    // changed, so the transcript open on this phone reads at once instead
+    // of waiting out its poll's backoff, and the session list can mark
+    // other sessions "active now".
+    //
+    // It carries NO transcript text. Nothing re-emitted from this list is
+    // masked (#1488 masks `/v1/call` answers), so an event about a
+    // transcript is only safe here because nothing in it came out of one.
+    //
+    // It widens nothing: `claude_sessions`, an allowlisted Read, already
+    // RETURNS every session id to this phone, and a byte size says only
+    // that the file changed. A lost nudge costs latency, never what is
+    // shown -- the follow keeps its own poll.
+    "claude-session-activity",
 ];
 
 /// The event whose payload is the PR list, cached as the snapshot.

@@ -1,7 +1,8 @@
 .PHONY: dev build test test-rust test-ui lint lint-rust lint-ui lint-deps fmt icons \
 	mobile-frontend lint-mobile test-mobile check-mobile-ios check-mobile-android \
 	deny-mobile deny-stepup ios-init android-init icons-mobile ios-device android-device \
-	deny test-race check-intel doctor
+	deny test-race check-intel doctor bench-transcript bench-transcript-browser bench-worktrees-browser \
+	check-shell-scroll shadcn-add
 
 # ---- Mobile companion (src-mobile) ---------------------------------------
 #
@@ -132,6 +133,72 @@ test-rust:
 
 test-ui:
 	yarn vitest run
+
+# ---- Transcript performance (#1487) --------------------------------------
+#
+# The measured half of docs/transcript-performance.md: generates the four
+# fixtures (1k and 10k messages, a 70 MB tool-heavy file, one 5 MB tool
+# result), times the transcript reads against them in a RELEASE build, and
+# parses each page payload the way the webview receives it. Not in `test`:
+# it writes ~110 MB to a temporary directory and its durations describe
+# the machine, so it is run on purpose and its tables go in the PR.
+#
+# Pass BENCH_TRANSCRIPT_OUT=<dir> to keep the fixtures and payloads there;
+# otherwise they go to a fresh temporary directory that is removed after.
+# One shell for the whole recipe, so both halves see the SAME directory.
+bench-transcript:
+	@out="$(BENCH_TRANSCRIPT_OUT)"; [ -n "$$out" ] || out="$$(mktemp -d)"; \
+	( cd src-tauri && HEADSTATE_TRANSCRIPT_BENCH=1 HEADSTATE_TRANSCRIPT_BENCH_OUT="$$out" \
+		cargo test --release --lib read_bench -- --ignored --nocapture --test-threads=1 ) \
+	&& node --expose-gc scripts/transcript-receive-bench.mjs "$$out"; status=$$?; \
+	[ -n "$(BENCH_TRANSCRIPT_OUT)" ] || rm -rf "$$out"; exit $$status
+
+# The viewer in a browser (#1480, the harness #1487 designed): writes each
+# fixture's message page, builds the harness page (vite.harness.config.ts,
+# into dist-harness), and opens every page in Playwright's Chromium to
+# take B1 (open to first paint), B2 (long tasks while scrolling) and B3
+# (heap); then B4 (idle live-follow cost, nudges, eviction; about three
+# minutes a page in real time) and a B5 estimate (page bytes over the
+# real-text compression ratio). HARNESS_PHASES=open|follow|b5 picks parts.
+# Not in `test` or CI, for bench-transcript's reason: its figures
+# describe the machine. Needs the browser once:
+# `yarn playwright install chromium` (or HARNESS_CHANNEL=chrome to use an
+# installed Chrome).
+bench-transcript-browser:
+	@out="$(BENCH_TRANSCRIPT_OUT)"; [ -n "$$out" ] || out="$$(mktemp -d)"; \
+	( cd src-tauri && HEADSTATE_TRANSCRIPT_PAYLOADS_OUT="$$out" \
+		cargo test --release --lib read_bench::transcript_message_payloads -- --ignored --nocapture ) \
+	&& yarn vite build -c vite.harness.config.ts \
+	&& node scripts/transcript-browser-bench.mjs "$$out"; status=$$?; \
+	[ -n "$(BENCH_TRANSCRIPT_OUT)" ] || rm -rf "$$out"; exit $$status
+# The document never scrolls (#1583): builds the shell harness page
+# (vite.harness.config.ts, into dist-harness) and opens the real app tree
+# in Playwright's Chromium with long generated lists, at a desktop size,
+# the minimum window and a phone width. Asserts the document stays at
+# scrollTop 0 and no taller or wider than the window, with the Settings
+# button inside it, after every inner list is scrolled to its end, its
+# last row focused and wheeled at -- and that the index.css lock holds
+# when the document is forced taller. jsdom does no layout, so no vitest
+# can; `src/shellLock.test.ts` is the cheap half that runs in `test-ui`.
+# Not in `test` or CI: it needs a browser, installed once with
+# `yarn playwright install chromium`. HARNESS_ENGINE=webkit runs
+# Playwright's WebKit instead (`yarn playwright install webkit`), which
+# is closer to the WKWebView the app ships in. About a minute.
+check-shell-scroll:
+	yarn vite build -c vite.harness.config.ts
+	node scripts/check-shell-scroll.mjs
+
+# The Worktrees page in a browser (#1582): builds the harness page
+# (vite.harness-worktrees.config.ts, into dist-harness-worktrees), mounts
+# the real WorktreesPage over a generated repository of N worktrees and
+# streams a classification pass into it, timing every commit, the lag of
+# each verdict's delivery, and where the CPU went. Generated fixtures
+# only; it reads nothing from the machine. N, PRS, RATES, SIZES and
+# THROTTLE are passed through (see the script's header). Not in `test` or
+# CI, for bench-transcript's reason: its figures describe the machine.
+bench-worktrees-browser:
+	yarn vite build -c vite.harness-worktrees.config.ts \
+	&& node scripts/worktrees-browser-bench.mjs
 
 # ---- Parity with CI (#853) -----------------------------------------------
 #
@@ -353,6 +420,13 @@ lint-deps:
 	# "cannot look" path exits 0 on purpose, so a bug that always took it
 	# would leave the mark unguarded while printing something reassuring.
 	#
+	# A mark that LAGS a shipped build is a warning here and in CI, not a
+	# failure (#1418): failing turned every branch cut before the mark PR
+	# red for a reason unrelated to it. Warn per commit, enforce at the
+	# next mobile release -- mobile-release.yml's Preflight runs this with
+	# --release and refuses to build. A missing or unparseable mark file
+	# still fails here.
+	#
 	# NOT passed --require here. Unlike everything above it, this one
 	# needs the network and a `gh` token, and `lint-deps` is the target
 	# whose comment promises answers in a second. Locally it reports what
@@ -371,8 +445,15 @@ lint-deps:
 	# shared, draining resource rather than a property of the branch under
 	# test, so a gate would fail pull requests for a state their authors
 	# cannot fix. See the script's docstring.
+	#
+	# --advisory (#1505): an over-ceiling class is printed as a WARNING and
+	# does not fail this target. What it measures is `main`'s cache, which
+	# no branch writes, so it went red on every branch for a state none of
+	# them caused. The scheduled .github/workflows/cache-budget.yml enforces
+	# the ceilings on `main`. A measurement that returns nothing still
+	# fails here: that is a broken guard, not a cache state.
 	python3 scripts/check-cache-budget.test.py
-	python3 scripts/check-cache-budget.py
+	python3 scripts/check-cache-budget.py --advisory
 	python3 scripts/check-supply-chain-pins.test.py
 	python3 scripts/check-supply-chain-pins.py
 	# The leak guard, LAST in this target: it is the only check here that
@@ -410,10 +491,37 @@ lint-ui:
 	# @tailwindcss/vite claims it, and tests avoid node:fs. Deleting the
 	# rule un-fixes every button in the app with a green suite (#694).
 	./scripts/check-focus-css.sh
+	# The document scroll lock is CSS the suite cannot see either, for the
+	# same reasons. Without it the status bar could sit below the window's
+	# edge (#1583); `make check-shell-scroll` is the in-browser half.
+	python3 scripts/check-shell-lock.test.py
+	python3 scripts/check-shell-lock.py
 
 fmt:
 	cd crates/headstate-stepup && cargo fmt
 	cd src-tauri && cargo fmt
+
+# Add a shadcn component: `make shadcn-add C=tabs`.
+#
+# Not a bare `yarn shadcn add` (#1558). The shadcn registry now writes
+# `import { cn } from "cn"` into every component and adds shadcn's `cn`
+# npm package as a dependency. No components.json alias maps a bare
+# package name, so the CLI copies the import through as written. Our
+# `cn` is `@/lib/utils`. So this points the import back at it and removes
+# the direct dependency. `yarn remove` keeps the `cn@^0.2.4` lock entry
+# that the shadcn CLI itself depends on. `src/lib/cnImport.test.ts` fails
+# if either step is skipped. Test files are left alone: that test's own
+# fixtures spell the bad import on purpose, and rewriting them would
+# disarm it.
+shadcn-add:
+	@test -n "$(C)" || { echo "usage: make shadcn-add C=<component>"; exit 2; }
+	yarn shadcn add $(C)
+	@grep -rlE --include='*.ts' --include='*.tsx' --exclude='*.test.ts' --exclude='*.test.tsx' \
+		"from ['\"]cn['\"]" src | while read -r f; do \
+		perl -pi -e "s/from ([\"'])cn\1/from \1\@\/lib\/utils\1/" "$$f"; \
+		echo "rewrote the cn import in $$f"; \
+	done
+	@if grep -q '"cn":' package.json; then yarn remove cn; fi
 
 # Requires Pillow: pip install -r scripts/requirements.txt
 #

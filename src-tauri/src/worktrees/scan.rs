@@ -62,14 +62,73 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 
 /// [`git_output_with`] over the resolved git binary.
 pub(crate) fn git_output(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    #[cfg(test)]
+    if let Some(fake) = fake_git::for_dir(dir) {
+        return git_output_with(&fake, dir, args);
+    }
     git_output_with(crate::auth::git_program(), dir, args)
+}
+
+/// A stand-in git for the directories one test names (#1582).
+///
+/// `git_program` is resolved once per process, so a test cannot swap it
+/// without swapping it for every test running beside it. This maps a
+/// directory PREFIX -- inside the test's own `TempDir`, so no two tests
+/// share one -- to a program, and every git call under that prefix runs
+/// it instead. That is how a test gets a git that hangs inside a real
+/// classification.
+#[cfg(test)]
+pub(crate) mod fake_git {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static FAKES: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
+
+    /// Run `program` for every git call in a directory under `prefix`,
+    /// until the returned guard drops. Unix only, like the one test that
+    /// uses it: its fake git is a shell script.
+    #[cfg(unix)]
+    pub(crate) fn install(prefix: &Path, program: &Path) -> Installed {
+        FAKES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((prefix.to_path_buf(), program.to_path_buf()));
+        Installed(prefix.to_path_buf())
+    }
+
+    #[cfg(unix)]
+    pub(crate) struct Installed(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            FAKES
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|(p, _)| p != &self.0);
+        }
+    }
+
+    /// Matched on the path's string form: a worktree's path is a sibling
+    /// of the repository's (`proj`, `proj-f0`), so a prefix can name the
+    /// worktrees without naming the repository.
+    pub(crate) fn for_dir(dir: &Path) -> Option<PathBuf> {
+        let dir = dir.to_string_lossy();
+        FAKES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|(p, _)| dir.starts_with(p.to_string_lossy().as_ref()))
+            .map(|(_, prog)| prog.clone())
+    }
 }
 
 /// A bounded git call with its exit status kept, for a caller that reads
 /// it: `git check-ignore` exits 1 for "not ignored" and 128 for "not a
 /// repository", and [`git`] folds both into one `Err`. `Err` here means
 /// the call never ran or never answered -- a spawn that failed three
-/// times, or the timeout -- never a git that ran and said no.
+/// times, a spent [`budget`], or the timeout -- never a git that ran and
+/// said no.
 ///
 /// `program` is a parameter so a test can prove what a missing binary
 /// produces without touching the resolved one.
@@ -78,6 +137,11 @@ pub(crate) fn git_output_with(
     dir: &Path,
     args: &[&str],
 ) -> Result<std::process::Output, String> {
+    // The budget this thread's caller installed, if any (#1582). Asked
+    // BEFORE the spawn: a classification whose budget is spent must stop
+    // spending, and the cheapest git call is the one never started.
+    let limit = budget::admit()?;
+
     // RETRIED on a spawn failure.
     //
     // Spawning git intermittently fails with ENOENT under process
@@ -96,14 +160,19 @@ pub(crate) fn git_output_with(
     // a slow one.
     let mut spawned = None;
     for _ in 0..3 {
-        match Command::new(program)
-            .arg("-C")
+        let mut cmd = Command::new(program);
+        cmd.arg("-C")
             .arg(dir)
             .args(args)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
+            .stderr(std::process::Stdio::piped());
+        // Its own process group, so expiry can kill git AND whatever it
+        // started (a fetch's `ssh`, a `remote-https` helper). Killing only
+        // git would leave a child holding the pipes open, and the reader
+        // threads below with them (#1582).
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        match cmd.spawn() {
             Ok(c) => {
                 spawned = Some(Ok(c));
                 break;
@@ -116,35 +185,279 @@ pub(crate) fn git_output_with(
         Some(Err(e)) => return Err(e.to_string()),
         None => return Err("could not spawn git".to_string()),
     };
+    wait_bounded(child, limit)
+}
 
-    // A thread that BLOCKS on the child, rather than polling it. Polling
-    // was measurably wrong here: a flat 20ms interval took the full scan
-    // from 35s to 71s, and even 1ms-with-backoff left it at 48s, because
-    // several thousand calls each paid up to an interval of dead time.
-    // Blocking costs nothing on the common path and still bounds the
-    // pathological one.
+/// [`git_output`] with `input` written to git's stdin, for the commands
+/// that read a stream (`patch-id`, `log --stdin`) (#1582).
+///
+/// The same budget, process group and kill-on-expiry as every other call
+/// here. The input is written on its own thread, so a git that produces
+/// output before it has read all of its input cannot deadlock against a
+/// writer that is waiting for it to read.
+fn git_piped(dir: &Path, args: &[&str], input: Vec<u8>) -> Result<std::process::Output, String> {
+    let limit = budget::admit()?;
+    #[cfg(test)]
+    let program =
+        fake_git::for_dir(dir).unwrap_or_else(|| crate::auth::git_program().to_path_buf());
+    #[cfg(not(test))]
+    let program = crate::auth::git_program();
+    let mut cmd = Command::new(program);
+    cmd.arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    if let Some(mut stdin) = child.stdin.take() {
+        std::thread::spawn(move || {
+            use std::io::Write;
+            // A git that exits early closes the pipe; the write error that
+            // follows is expected, and the exit status says what happened.
+            let _ = stdin.write_all(&input);
+        });
+    }
+    wait_bounded(child, limit)
+}
+
+/// Wait for a spawned git, and KILL it when `limit` expires (#1582).
+///
+/// Threads that BLOCK on the pipes, rather than polling the child.
+/// Polling was measurably wrong here: a flat 20ms interval took the full
+/// scan from 35s to 71s, and even 1ms-with-backoff left it at 48s,
+/// because several thousand calls each paid up to an interval of dead
+/// time. Blocking costs nothing on the common path and still bounds the
+/// pathological one.
+///
+/// The child stays HERE, not inside a waiting thread. The version before
+/// #1582 moved it into `wait_with_output` on a thread, which left no
+/// handle to kill it with, so a timed-out git was abandoned rather than
+/// stopped and ran on for as long as it liked -- one of the ways a
+/// 141-worktree classification kept spending after its rows had already
+/// "timed out". Now the pipes are read on threads, the wait here is only
+/// for both to close, and on expiry git's whole process group is killed
+/// and reaped before this returns. No git outlives its budget.
+///
+/// Two readers, not one: a git that fills the stderr pipe while its
+/// stdout is still open would block on the write forever if only one of
+/// them were being drained.
+fn wait_bounded(
+    mut child: std::process::Child,
+    limit: budget::Limit,
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
     let (tx, rx) = std::sync::mpsc::channel();
-    let handle = std::thread::spawn(move || {
-        let result = child.wait_with_output();
-        // The receiver is gone on timeout; that is expected, not an error.
-        let _ = tx.send(result);
+    std::thread::spawn(move || {
+        let err_reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            stderr.map(|mut e| e.read_to_end(&mut buf)).transpose()?;
+            Ok::<_, std::io::Error>(buf)
+        });
+        let mut out = Vec::new();
+        let read = stdout.map(|mut o| o.read_to_end(&mut out)).transpose();
+        let err = err_reader
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("stderr reader panicked")));
+        // The receiver is gone on expiry; that is expected, not an error.
+        let _ = tx.send(read.and(err).map(|err| (out, err)));
     });
 
-    match rx.recv_timeout(GIT_TIMEOUT) {
-        Ok(Ok(out)) => {
-            let _ = handle.join();
-            Ok(out)
+    match rx.recv_timeout(limit.wait) {
+        Ok(Ok((stdout, stderr))) => {
+            // Both pipes closed, so git has exited or is about to: this
+            // wait is the reap, not a second unbounded wait.
+            let status = child.wait().map_err(|e| e.to_string())?;
+            Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
         }
-        Ok(Err(e)) => Err(e.to_string()),
-        // The thread is left running rather than detached-and-killed:
-        // `wait_with_output` owns the child, so there is no handle here
-        // to kill it with. It exits when git does, and the scan moves on
-        // treating this worktree as Unknown -- which is the honest
-        // answer for a call that never came back.
-        Err(_) => Err(format!(
-            "git did not respond within {}s",
-            GIT_TIMEOUT.as_secs()
-        )),
+        Ok(Err(e)) => {
+            kill_group(&mut child);
+            Err(e.to_string())
+        }
+        Err(_) => {
+            kill_group(&mut child);
+            Err(limit.expired())
+        }
+    }
+}
+
+/// Kill a spawned git and everything in its process group, then reap it.
+///
+/// The group is signalled BEFORE `wait`, while the child is unreaped, so
+/// its pid cannot have been reused by anything else.
+fn kill_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // `process_group(0)` made git its own group leader, so its pid is
+        // the group id. SAFETY: `kill` takes no pointers; a stale id is
+        // an `ESRCH`, never undefined behaviour.
+        let pgid = child.id() as libc::pid_t;
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A per-thread budget over this module's git calls (#1582).
+///
+/// `classify` is a straight-line sequence of git calls spread over a
+/// dozen helpers, none of which take a deadline, and `content_landed`
+/// alone spends up to four calls per CHANGED FILE. Threading a deadline
+/// through every helper would touch all of them and still miss the next
+/// one written. So the budget is installed around the classification, on
+/// the thread that runs it, and [`git_output_with`] -- the one place every
+/// git call goes through -- consults it:
+///
+/// - before a spawn, a spent budget refuses the call: past the deadline,
+///   or past the call ceiling;
+/// - a call that is admitted waits at most until the deadline (never
+///   longer than `GIT_TIMEOUT`), and is KILLED when it expires.
+///
+/// A refused or killed call is an `Err`, like any other git failure. The
+/// helpers already map a failure to "cannot say" or to the conservative
+/// verdict; `classify_within` then reads [`budget::Spent`] and replaces
+/// whatever verdict came out with `Unknown` carrying the reason, because
+/// a verdict computed from calls that were refused might be wrong.
+pub(crate) mod budget {
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+
+    /// Why a budget stopped admitting calls.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Spent {
+        /// The deadline passed.
+        Time,
+        /// The call ceiling was reached.
+        Calls,
+    }
+
+    struct Budget {
+        deadline: Instant,
+        ceiling: u32,
+        used: u32,
+        spent: Option<Spent>,
+    }
+
+    thread_local! {
+        static BUDGET: RefCell<Option<Budget>> = const { RefCell::new(None) };
+    }
+
+    /// How long an admitted call may wait, and what to say when it ran
+    /// out.
+    pub(crate) struct Limit {
+        pub(crate) wait: Duration,
+        /// Whether `wait` is the budget's deadline rather than
+        /// `GIT_TIMEOUT`, which decides the message and records `Spent`.
+        by_deadline: bool,
+    }
+
+    impl Limit {
+        /// The error for a call that ran out of `wait`. Records the
+        /// budget as spent when it was the deadline that ran out.
+        pub(crate) fn expired(&self) -> String {
+            if self.by_deadline {
+                mark(Spent::Time);
+                "stopped: the classification's time budget ran out".to_string()
+            } else {
+                format!(
+                    "git did not respond within {}s",
+                    super::GIT_TIMEOUT.as_secs()
+                )
+            }
+        }
+    }
+
+    fn mark(why: Spent) {
+        BUDGET.with(|b| {
+            if let Some(b) = b.borrow_mut().as_mut() {
+                b.spent.get_or_insert(why);
+            }
+        });
+    }
+
+    /// Admit one git call, or refuse it because the budget is spent.
+    pub(crate) fn admit() -> Result<Limit, String> {
+        BUDGET.with(|b| {
+            let mut b = b.borrow_mut();
+            let Some(b) = b.as_mut() else {
+                return Ok(Limit {
+                    wait: super::GIT_TIMEOUT,
+                    by_deadline: false,
+                });
+            };
+            if b.used >= b.ceiling {
+                b.spent.get_or_insert(Spent::Calls);
+                return Err(format!(
+                    "not run: the classification's budget of {} git calls is spent",
+                    b.ceiling
+                ));
+            }
+            let left = b.deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                b.spent.get_or_insert(Spent::Time);
+                return Err("not run: the classification's time budget ran out".to_string());
+            }
+            b.used += 1;
+            Ok(Limit {
+                wait: left.min(super::GIT_TIMEOUT),
+                by_deadline: left < super::GIT_TIMEOUT,
+            })
+        })
+    }
+
+    /// What one budgeted run spent.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Report {
+        /// Git calls admitted.
+        pub(crate) calls: u32,
+        /// Why the budget stopped admitting calls, if it did.
+        pub(crate) spent: Option<Spent>,
+    }
+
+    /// Run `f` with a budget of `ceiling` git calls until `deadline`, on
+    /// this thread. Removed again afterwards, including on a panic, so a
+    /// pooled thread never carries one run's budget into the next.
+    pub(crate) fn with<R>(deadline: Instant, ceiling: u32, f: impl FnOnce() -> R) -> (R, Report) {
+        struct Uninstall;
+        impl Drop for Uninstall {
+            fn drop(&mut self) {
+                BUDGET.with(|b| b.borrow_mut().take());
+            }
+        }
+        BUDGET.with(|b| {
+            *b.borrow_mut() = Some(Budget {
+                deadline,
+                ceiling,
+                used: 0,
+                spent: None,
+            })
+        });
+        let guard = Uninstall;
+        let out = f();
+        let report = BUDGET.with(|b| {
+            b.borrow()
+                .as_ref()
+                .map(|b| Report {
+                    calls: b.used,
+                    spent: b.spent,
+                })
+                .unwrap_or(Report {
+                    calls: 0,
+                    spent: None,
+                })
+        });
+        drop(guard);
+        (out, report)
     }
 }
 
@@ -181,17 +494,50 @@ pub(super) fn fetched_at(dir: &Path) -> Option<String> {
     Some(t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
-pub fn parse_owner_repo(url: &str) -> Option<String> {
-    let url = url.trim().trim_end_matches('/');
-    let url = url.strip_suffix(".git").unwrap_or(url);
-    // Everything after the host, whichever form the URL takes:
-    //   git@host:owner/repo   https://host/owner/repo   ssh://git@host/owner/repo
-    let tail = url.rsplit_once(':').map_or(url, |(_, t)| t);
-    let mut parts = tail.rsplit('/');
-    let repo = parts.next()?;
-    let owner = parts.next()?;
-    (!owner.is_empty() && !repo.is_empty() && !owner.contains(' ') && !repo.contains(' '))
-        .then(|| format!("{owner}/{repo}"))
+/// GitHub keeps its established owner/repo key. Other hosts retain their
+/// hostname and full namespace, so they cannot join unrelated GitHub PRs.
+pub fn parse_owner_repo(remote: &str) -> Option<String> {
+    let remote = remote.trim();
+    let normalized = if remote.contains("://") {
+        remote.to_owned()
+    } else {
+        let (authority, path) = remote.split_once(':')?;
+        if !authority.contains('@') || path.starts_with('/') {
+            return None;
+        }
+        format!("ssh://{authority}/{path}")
+    };
+    let url = reqwest::Url::parse(&normalized).ok()?;
+    if !matches!(url.scheme(), "https" | "http" | "ssh" | "git")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let host = url.host_str()?.to_ascii_lowercase();
+    let path = url.path().trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let parts: Vec<_> = path.split('/').collect();
+    if parts.len() < 2
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || *part == "."
+                || *part == ".."
+                || !part
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || "._-".contains(c))
+        })
+    {
+        return None;
+    }
+    if (host == "github.com"
+        && (url.port().is_none() || url.scheme() == "ssh" && url.port() == Some(22)))
+        || (host == "ssh.github.com" && url.scheme() == "ssh" && url.port() == Some(443))
+    {
+        (parts.len() == 2).then(|| path.to_owned())
+    } else {
+        Some(format!("{host}/{path}"))
+    }
 }
 
 /// The `owner/repo` a checkout belongs to, or None.
@@ -469,9 +815,11 @@ pub fn worktree_safety(
         return Safety::Empty;
     }
 
-    // No upstream means nothing was ever pushed: these commits exist only
-    // here. Checked BEFORE merge status, because a branch name that looks
-    // merged tells you nothing about commits that never left the machine.
+    // No upstream used to mean "nothing was ever pushed: these commits
+    // exist only here", checked BEFORE merge status. That was right about
+    // a branch NAME that looks merged and wrong about CONTENT that
+    // provably is: see #1439 below, where the merge question is now asked
+    // first on the no-tracking-config path.
     //
     // `has_upstream` is passed in rather than re-probed: the caller
     // already asked, and this was one of two identical `rev-parse @{u}`
@@ -565,8 +913,35 @@ pub fn worktree_safety(
         if wt.branch.is_empty() {
             return detached_safety(dir, default_branch);
         }
+        // Merge status BEFORE the missing tracking config, and the order
+        // is the whole of #1439.
+        //
+        // `was_ever_pushed` reads only `branch.<name>.remote`, and a
+        // missing key is weaker evidence than "commits exist only here"
+        // claims. A contributor's PR fetched with `git fetch origin
+        // pull/N/head:prN`, or any branch checked out without
+        // `--track`, has no such key, yet its work may be on the default
+        // branch already. On the reporting machine two such worktrees
+        // read in red "never pushed" weeks after their PRs were
+        // squash-merged; the aggregate diff of each had exactly the same
+        // `patch-id --stable` as its squash commit on main.
+        //
+        // This does NOT widen the gate. `merged_into` is the same check
+        // every other branch faces: ancestry, per-commit patch-ids, or
+        // an exact aggregate patch-id. The only rows that change are
+        // ones it has already proven are on the default branch. Anything
+        // it does not answer `Safe` for, whether unmerged or undecided,
+        // keeps the refusal it had before.
+        //
+        // Its own variant rather than `MergedUpstreamDeleted`. That label
+        // says the tracking config outlived the remote branch, and here
+        // there was never a tracking config: the same objection
+        // `detached_safety` makes for a branchless checkout.
         if !was_ever_pushed(dir) {
-            return Safety::NeverPushed;
+            return match merged_into(dir, default_branch) {
+                Safety::Safe => Safety::MergedNoUpstream,
+                _ => Safety::NeverPushed,
+            };
         }
         return match merged_into(dir, default_branch) {
             Safety::Safe => Safety::MergedUpstreamDeleted,
@@ -918,7 +1293,8 @@ fn holder_is_running(holder: LockHolder) -> bool {
 ///
 /// This function therefore asks exactly the merge question and nothing
 /// else. There is no path from here to `NeverPushed`, `Unpushed`,
-/// `MergedUpstreamDeleted` or `Empty`, and that is the #776 property
+/// `MergedUpstreamDeleted`, `MergedNoUpstream` or `Empty`, and that is
+/// the #776 property
 /// stated as code rather than as a comment:
 ///
 /// - `NeverPushed` / `Unpushed` are claims about a branch's relationship
@@ -1658,9 +2034,6 @@ fn descends_from_branch(dir: &Path, default_branch: &str, base: &str) -> Safety 
 /// favourable, and it removes the pathological case the old loop had:
 /// no match meant maximum work.
 fn batch_contains_patch(dir: &Path, candidates: &str, want: &str) -> Safety {
-    use std::io::Write;
-    use std::process::Stdio;
-
     let shas: Vec<&str> = candidates
         .lines()
         .map(str::trim)
@@ -1673,42 +2046,23 @@ fn batch_contains_patch(dir: &Path, candidates: &str, want: &str) -> Safety {
     // `--no-walk` treats each SHA as its own root, and `-p` gives each
     // one its own diff -- the squash commit's contents, which is what
     // the per-candidate `sha^..sha` was computing.
-    let Ok(mut log) = Command::new(crate::auth::git_program())
-        .arg("-C")
-        .arg(dir)
-        .args(["log", "--stdin", "--no-walk", "-p", "--format=commit %H"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return Safety::Unmerged;
-    };
-    if let Some(mut stdin) = log.stdin.take() {
-        let _ = stdin.write_all(shas.join("\n").as_bytes());
-    }
-    let Ok(log_out) = log.wait_with_output() else {
+    //
+    // Through `git_piped`, so both processes are bounded and budgeted
+    // like every other git call here (#1582). They were the two
+    // classification calls with NO bound at all: a plain
+    // `wait_with_output`, which a hung git would have held forever.
+    let Ok(log_out) = git_piped(
+        dir,
+        &["log", "--stdin", "--no-walk", "-p", "--format=commit %H"],
+        shas.join("\n").into_bytes(),
+    ) else {
         return Safety::Unmerged;
     };
     if log_out.stdout.is_empty() {
         return Safety::Unmerged;
     }
 
-    let Ok(mut pid) = Command::new(crate::auth::git_program())
-        .arg("-C")
-        .arg(dir)
-        .args(["patch-id", "--stable"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return Safety::Unmerged;
-    };
-    if let Some(mut stdin) = pid.stdin.take() {
-        let _ = stdin.write_all(&log_out.stdout);
-    }
-    let Ok(out) = pid.wait_with_output() else {
+    let Ok(out) = git_piped(dir, &["patch-id", "--stable"], log_out.stdout) else {
         return Safety::Unmerged;
     };
 
@@ -1735,32 +2089,14 @@ fn batch_contains_patch(dir: &Path, candidates: &str, want: &str) -> Safety {
 /// make that a property of where they came from rather than of this
 /// code.
 fn patch_id(dir: &Path, from: &str, to: &str) -> Option<String> {
-    use std::io::Write;
-    use std::process::Stdio;
-
-    let diff = Command::new(crate::auth::git_program())
-        .arg("-C")
-        .arg(dir)
-        .args(["diff", from, to])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    // Bounded and budgeted like every other git call (#1582); see
+    // `batch_contains_patch`.
+    let diff = git_output(dir, &["diff", from, to]).ok()?;
     if !diff.status.success() || diff.stdout.is_empty() {
         return None;
     }
 
-    let mut child = Command::new(crate::auth::git_program())
-        .arg("-C")
-        .arg(dir)
-        .args(["patch-id", "--stable"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    child.stdin.take()?.write_all(&diff.stdout).ok()?;
-    let out = child.wait_with_output().ok()?;
+    let out = git_piped(dir, &["patch-id", "--stable"], diff.stdout).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -2081,9 +2417,19 @@ const SIZE_WORKERS: usize = 8;
 /// Unreadable entries are skipped rather than failing the whole
 /// measurement -- a permission error on one file should not turn a real
 /// size into "unknown".
+///
+/// Test-only, and with nothing excluded: the "everything under the path"
+/// rule the tests below pin is the walk's own. What `size_paths` excludes
+/// on top of it -- the OTHER worktrees nested inside this one (#1441) --
+/// is a property of the set of rows, not of one directory.
 #[cfg(test)]
 fn dir_size(path: &Path) -> u64 {
-    dir_size_within(path, std::time::Duration::MAX).unwrap_or(0)
+    dir_size_within(
+        path,
+        std::time::Duration::MAX,
+        &std::collections::HashSet::new(),
+    )
+    .unwrap_or(0)
 }
 
 /// How long ONE worktree's walk may run before it is abandoned.
@@ -2097,13 +2443,18 @@ fn dir_size(path: &Path) -> u64 {
 ///
 /// MEASURED on this machine, and the reason a single tree can be
 /// unbounded at all: 26 of 42 worktrees in one checkout live UNDER the
-/// main checkout, in a `worktrees` directory beneath it. So the parent's
-/// walk subsumes all 26 -- 235.02 GB and 1,125,352 files -- and every
-/// one of those bytes is then walked a second time as a worktree in its
-/// own right. The parent measured 265.15 GB in 38.63s where a leaf
-/// worktree measured 0.30 GB in 0.16s: a 240x spread within one
-/// repository. Add nesting two levels deep, or a network mount that
-/// answers `read_dir` slowly, and the parent's walk has no finish.
+/// main checkout, in a `worktrees` directory beneath it. Before #1441 the
+/// parent's walk subsumed all 26 -- 235.02 GB and 1,125,352 files -- and
+/// every one of those bytes was then walked a second time as a worktree
+/// in its own right. The parent measured 265.15 GB in 38.63s where a
+/// leaf worktree measured 0.30 GB in 0.16s: a 240x spread within one
+/// repository. That was a double count as well as a slow walk (#1441:
+/// a 153 GB main row whose nested worktrees summed to ~44 GB), and the
+/// walk now stops at every directory that is another worktree's row --
+/// see `size_paths`. The bound still stands, because nesting was only
+/// ONE way to be unbounded: a single real tree with millions of files,
+/// or a network mount that answers `read_dir` slowly, has no finish
+/// either, and the exclusion does nothing for those.
 ///
 /// 60s, not `GIT_TIMEOUT`'s 30s: 38.63s for a real parent checkout is a
 /// legitimate answer and must not be thrown away. The bound exists to
@@ -2120,6 +2471,18 @@ const SIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// checkout is the worst possible wrong answer. Callers propagate the
 /// `Option` all the way to the cell so the UI can say so.
 ///
+/// A directory in `skip` is not entered. `size_paths` passes the other
+/// worktrees of the same repository, so a worktree nested inside this
+/// one -- `<repo>/.claude/worktrees/x`, or one linked worktree inside
+/// another -- is counted on its OWN row and not a second time here
+/// (#1441). Only directories strictly BELOW `path` are compared, so
+/// `path` being in `skip` itself (it is: `skip` is every row) does not
+/// empty the walk. The comparison is exact `Path` equality, which is
+/// why both sides must be canonicalised the same way first: every child
+/// is `root.join(name)`, so a canonical root yields canonical children
+/// (symlinks are never entered), and on Windows both carry the same
+/// verbatim `\\?\` prefix.
+///
 /// The deadline is checked once per DIRECTORY rather than once per
 /// entry. A directory is the unit that can be pathological -- a network
 /// mount whose `read_dir` blocks, a permission wall -- and checking
@@ -2133,7 +2496,11 @@ const SIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// number is an artifact of which directories happened to pop off the
 /// stack first, not a bound the user can act on, and it would render
 /// indistinguishably from a real measurement.
-fn dir_size_within(path: &Path, budget: std::time::Duration) -> Option<u64> {
+fn dir_size_within(
+    path: &Path,
+    budget: std::time::Duration,
+    skip: &std::collections::HashSet<std::path::PathBuf>,
+) -> Option<u64> {
     let started = std::time::Instant::now();
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
@@ -2150,13 +2517,76 @@ fn dir_size_within(path: &Path, budget: std::time::Duration) -> Option<u64> {
                 continue;
             }
             if meta.is_dir() {
-                stack.push(e.path());
+                let child = e.path();
+                if !skip.contains(&child) {
+                    stack.push(child);
+                }
             } else {
                 total += meta.len();
             }
         }
     }
     Some(total)
+}
+
+/// How long `size_paths` waits for ALL its rows' paths to canonicalise.
+///
+/// Canonicalising is a handful of `lstat`s per path and normally takes
+/// microseconds, so this bound exists only to convert "never" into
+/// "kept as given" -- the #769 rule applied to the step before the walk.
+/// Without it one dead mount among the rows would hold up every row's
+/// size, which is exactly the stall #769 removed from the walk itself.
+const CANONICAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Each of `paths` canonicalised by `canon`, or kept as given if that
+/// fails or has not answered within `budget` (shared by all paths, not
+/// per path).
+///
+/// One detached thread per path, NOT joined: a `canonicalize` blocked on
+/// a mount that never answers cannot be interrupted, and joining it would
+/// re-create the stall this function exists to bound. The abandoned
+/// thread's later answer goes to a dropped receiver and is discarded. A
+/// thread that cannot be spawned leaves its path as given, like a
+/// timeout.
+///
+/// `canon` is a parameter so the timeout can be tested with a stand-in
+/// that blocks, rather than needing a real mount that does.
+fn canonical_rows(
+    paths: &[String],
+    budget: std::time::Duration,
+    canon: fn(&Path) -> std::io::Result<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut pending = 0usize;
+    for (i, p) in roots.iter().enumerate() {
+        let (tx, p) = (tx.clone(), p.clone());
+        let spawned = std::thread::Builder::new()
+            .name("worktree-canonicalize".into())
+            .spawn(move || {
+                // The receiver is gone once the budget is spent; a late
+                // answer has nowhere to go and nothing waiting on it.
+                let _ = tx.send((i, canon(&p)));
+            });
+        if spawned.is_ok() {
+            pending += 1;
+        }
+    }
+    drop(tx);
+    let deadline = std::time::Instant::now() + budget;
+    while pending > 0 {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok((i, Ok(canonical))) => {
+                roots[i] = canonical;
+                pending -= 1;
+            }
+            Ok((_, Err(_))) => pending -= 1,
+            // Timed out: whatever is still pending keeps its given path.
+            Err(_) => break,
+        }
+    }
+    roots
 }
 
 /// Size every path in `paths`, `SIZE_WORKERS` at a time.
@@ -2180,12 +2610,39 @@ fn dir_size_within(path: &Path, budget: std::time::Duration) -> Option<u64> {
 /// column stalled at N-1 forever with no row able to say why. A worker
 /// that gives up and reports keeps the cursor moving, which is what
 /// stops one bad directory from stalling the other 110.
+///
+/// Each byte is counted on EXACTLY ONE row (#1441). The paths are the
+/// rows of one page, so a directory that is itself one of them is not
+/// entered by any other row's walk: the main checkout stops at
+/// `<repo>/.worktrees/x`, and a linked worktree stops at a worktree
+/// nested inside it, however deep. Before this the main checkout's row
+/// included every worktree under it -- 153 GB against a real 71 GB, with
+/// the nested rows (~44 GB) counted twice -- and the rows could not be
+/// summed. A directory that is NOT a row (a submodule, an unrelated
+/// clone) is still counted where it sits; it has no row of its own.
+///
+/// Canonicalised up front, so the comparison survives a path that
+/// reached git through a symlink (macOS `/var` vs `/private/var`) and
+/// Windows' verbatim `\\?\C:\` form -- but under `CANONICAL_BUDGET`, see
+/// `canonical_rows`. Reports still carry the path AS GIVEN, since that
+/// is the row's key.
+///
+/// QUALIFICATION: a row whose path could not be canonicalised in time
+/// (or at all) is kept as given. It still matches a parent that spells
+/// it the same way, but one reached by a different spelling may then
+/// count it a second time. That is the only cost, and it is bounded to
+/// that row: such a path is most likely on a mount that is not
+/// answering, so its own walk will most likely report "could not
+/// measure" anyway.
 fn size_paths(paths: &[String], report: &(dyn Fn(&str, Option<u64>) + Sync)) {
+    let roots = canonical_rows(paths, CANONICAL_BUDGET, |p| std::fs::canonicalize(p));
+    let rows: std::collections::HashSet<std::path::PathBuf> = roots.iter().cloned().collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let workers = SIZE_WORKERS.min(paths.len().max(1));
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let next = &next;
+            let (roots, rows) = (&roots, &rows);
             scope.spawn(move || loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(p) = paths.get(i) else { break };
@@ -2197,7 +2654,7 @@ fn size_paths(paths: &[String], report: &(dyn Fn(&str, Option<u64>) + Sync)) {
                 // reason `size_venvs` logs per venv: the total says
                 // "slow", this says WHICH.
                 let started = std::time::Instant::now();
-                let bytes = dir_size_within(Path::new(p), SIZE_TIMEOUT);
+                let bytes = dir_size_within(&roots[i], SIZE_TIMEOUT, rows);
                 crate::diag!(
                     "[diag] worktree-size {} {}ms {}",
                     p,
@@ -2343,9 +2800,29 @@ const CLASSIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45)
 /// (#1136).
 ///
 /// Verified against real repositories rather than inferred: a conflicted
-/// `git rebase` leaves `REBASE_HEAD` and `rebase-merge/`, a conflicted
-/// `git merge` leaves `MERGE_HEAD`, and `git cherry-pick` leaves
-/// `CHERRY_PICK_HEAD`.
+/// `git merge` leaves `MERGE_HEAD`, `git cherry-pick` leaves
+/// `CHERRY_PICK_HEAD`, `git revert` leaves `REVERT_HEAD`, and a bisect
+/// leaves `BISECT_LOG`. Each of those is removed when its operation
+/// finishes -- by the commit or `--continue`, or by `bisect reset`.
+///
+/// A rebase is detected by its `rebase-merge/` or `rebase-apply/`
+/// DIRECTORY only, which is what git's own `wt-status.c` uses. NOT by
+/// `REBASE_HEAD` (#1438): a conflicted rebase writes it, but git 2.50.1
+/// leaves it behind once the rebase completes with `--continue` or
+/// `--skip`, and after an interactive rebase that stopped to edit. So
+/// `REBASE_HEAD` proves only that a rebase stopped at some point, and
+/// reading it as "in progress" classed every worktree ever rebased
+/// through a conflict as mid-rebase -- and so unremovable -- for the
+/// rest of its life.
+///
+/// A multi-commit cherry-pick or revert is also detected by its
+/// `sequencer/` directory (#1446). Stopped on a conflict it has both the
+/// `*_HEAD` ref and `sequencer/`; once the conflict is resolved and
+/// COMMITTED, the ref goes and `sequencer/` is the only marker left,
+/// while `git status` still says "Cherry-pick currently in progress" and
+/// the rest of the plan waits in `sequencer/todo`. Measured on git
+/// 2.50.1: `--continue`, `--abort` and `--quit` each remove it, so unlike
+/// `REBASE_HEAD` it does not outlive its operation.
 ///
 /// Paths are built with `PathBuf::join`, never `format!`: Windows
 /// `canonicalize` returns verbatim `\\?\C:\` paths and this has cost
@@ -2359,13 +2836,13 @@ fn operation_in_progress(dir: &Path) -> Option<GitOperation> {
     let git_dir = git(dir, &["rev-parse", "--absolute-git-dir"]).ok()?;
     let git_dir = Path::new(git_dir.trim());
 
-    // Ordered most- to least-specific. `rebase-merge` is checked
-    // alongside `REBASE_HEAD` because an interactive rebase stopped
-    // between commits has the directory without the ref.
+    // Ordered most- to least-specific. No `REBASE_HEAD`: it outlives a
+    // finished rebase (see above), and the directories cover every
+    // rebase that is actually running, including an interactive one
+    // stopped between commits, which has the directory without the ref.
     for (marker, op) in [
         ("rebase-merge", GitOperation::Rebase),
         ("rebase-apply", GitOperation::Rebase),
-        ("REBASE_HEAD", GitOperation::Rebase),
         ("MERGE_HEAD", GitOperation::Merge),
         ("CHERRY_PICK_HEAD", GitOperation::CherryPick),
         ("REVERT_HEAD", GitOperation::Revert),
@@ -2374,6 +2851,20 @@ fn operation_in_progress(dir: &Path) -> Option<GitOperation> {
         if git_dir.join(marker).exists() {
             return Some(op);
         }
+    }
+    // Last, because between commits it is the ONLY marker (#1446). The
+    // todo's first instruction names the operation. An unreadable or
+    // unrecognised todo still means a sequence is in flight -- absent is
+    // not zero -- so it falls back to cherry-pick, the command that
+    // writes a sequencer far more often than revert.
+    let sequencer = git_dir.join("sequencer");
+    if sequencer.is_dir() {
+        let todo = std::fs::read_to_string(sequencer.join("todo")).unwrap_or_default();
+        let first = todo.split_whitespace().next();
+        return Some(match first {
+            Some("revert") => GitOperation::Revert,
+            _ => GitOperation::CherryPick,
+        });
     }
     None
 }
@@ -2508,7 +2999,11 @@ fn safety_label(s: &Safety) -> &'static str {
         Safety::Unpushed(_) => "unpushed",
         Safety::NeverPushed => "never_pushed",
         Safety::MergedUpstreamDeleted => "merged_upstream_deleted",
+        Safety::MergedNoUpstream => "merged_no_upstream",
         Safety::DetachedMerged(_) => "detached_merged",
+        // The number is not carried, for the reason above: it names a
+        // pull request in what may be a private repository.
+        Safety::MergedAsPr(_) => "merged_as_pr",
         Safety::Empty => "empty",
         Safety::Unmerged => "unmerged",
         Safety::Locked(_) => "locked",
@@ -2523,75 +3018,177 @@ fn safety_label(s: &Safety) -> &'static str {
     }
 }
 
-/// `classify`, abandoning the worktree once `budget` is spent (#830).
+/// How many git calls one worktree's classification may make (#1582).
 ///
-/// Returns whether the verdict is a real one. `false` means the budget
-/// ran out and `w.safety` is now `Unknown`, which callers count
-/// SEPARATELY from a verdict -- see `classify_repo_streaming`.
+/// `CLASSIFY_TIMEOUT` bounds the TIME and this bounds the WORK. Time alone
+/// let a branch touching hundreds of files spend its whole 45s, on eight
+/// workers at once, in `content_landed`'s four calls per changed file, and
+/// a pass slowed by anything else (sizing on the same disk, a second pass)
+/// spent the same calls more slowly. A ceiling on calls turns such a
+/// branch into "could not classify" as soon as it is clear it is one,
+/// whatever the machine's speed.
 ///
-/// The work runs on a BORROWED THREAD and the caller stops waiting on
-/// it; it is not cancelled, because nothing here can cancel it. `classify`
-/// is a straight-line sequence of `Command::spawn`/`wait` calls with no
-/// cancellation point, and the `git` helper does not hand back a handle
-/// to kill the child with -- its own comment says so, for exactly this
-/// reason. So the honest description is "gives up on", not "stops".
+/// MEASURED by `live_classification_cost_per_worktree`, which now counts
+/// calls: every one of this repository's 8 worktrees (unmerged branches,
+/// the common case) took exactly 20. Above that the cost is
+/// `content_landed`'s, up to four calls per changed file, so a ceiling of
+/// 600 admits a branch of ~145 changed files. The slowest worktree ever
+/// measured here (3.3s, `CLASSIFY_TIMEOUT`'s table) is ~330 calls at the
+/// ~10 ms a call costs, so it stays inside the ceiling too, and 600 calls
+/// at that rate is ~6s, well inside the 45s time budget.
+const CLASSIFY_GIT_CALLS: u32 = 600;
+
+/// How long past its own budget a classification thread is waited for.
 ///
-/// The abandoned thread exits when its git calls do, and it costs one
-/// thread, not one POOL thread: this is `std::thread`, deliberately
-/// OUTSIDE tokio's blocking pool. That distinction is the one
-/// `GIT_TIMEOUT` documents -- a hung call that parks a pool thread
-/// "wedges every worktree operation until restart" -- and routing the
-/// abandonment through the pool would reproduce it at worktree
-/// granularity.
+/// Every git call inside the budget is killed at the deadline, so the
+/// thread returns within milliseconds of it, carrying the reason it
+/// stopped. This covers that gap. A thread still running after it is
+/// stuck in something that is not a git call (a `stat` on a hung mount),
+/// and is given up on as before.
+const CLASSIFY_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What one worktree's classification spent, and whether it produced a
+/// verdict.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Classified {
+    /// Git calls made, when the classification came back to say.
+    pub(crate) calls: Option<u32>,
+    /// Why it stopped before a verdict, or `None` for a real verdict.
+    pub(crate) stopped: Option<budget::Spent>,
+}
+
+impl Classified {
+    /// Whether `w.safety` is a real verdict rather than `Unknown` for a
+    /// spent budget.
+    #[cfg(test)]
+    pub(crate) fn is_verdict(&self) -> bool {
+        self.stopped.is_none()
+    }
+
+    /// For the diagnostic log: the verdict's name, or why it stopped.
+    fn describe(&self, w: &Worktree, budget: std::time::Duration) -> String {
+        let calls = self
+            .calls
+            .map_or_else(String::new, |n| format!(" ({n} git calls)"));
+        match self.stopped {
+            None => format!("{}{calls}", safety_label(&w.safety)),
+            Some(budget::Spent::Time) => {
+                format!("STOPPED after {}s{calls}", budget.as_secs())
+            }
+            Some(budget::Spent::Calls) => {
+                format!("STOPPED after {CLASSIFY_GIT_CALLS} git calls")
+            }
+        }
+    }
+}
+
+/// `classify`, STOPPED once `budget` or `CLASSIFY_GIT_CALLS` is spent
+/// (#830, #1582).
+///
+/// A spent budget leaves `w.safety` as `Unknown` carrying which budget
+/// ran out, and callers count that SEPARATELY from a verdict -- see
+/// `classify_repo_streaming`.
+///
+/// The work runs on its own thread with a [`budget`] installed, so every
+/// git call it makes checks the deadline and the call ceiling before it
+/// starts, and one still running at the deadline is killed. Before #1582
+/// the caller merely stopped WAITING: the thread ran on, still issuing
+/// git calls each bounded only by `GIT_TIMEOUT` and unbounded in number,
+/// and every 45s up to `CLASSIFY_WORKERS` more such orphans could start
+/// against the live workers. Now the thread returns within milliseconds
+/// of the deadline, and no git it started outlives it.
+///
+/// PARTIAL IS NOT NOTHING. What the thread did establish before the
+/// budget ran out -- the upstream, the last commit -- is kept; only the
+/// VERDICT is replaced, because a verdict computed from calls that were
+/// refused might be wrong, and this one guards deletion. `merged_at` goes
+/// with it, since it is only meaningful beside a merged verdict.
+///
+/// It is `std::thread`, deliberately OUTSIDE tokio's blocking pool: the
+/// distinction `GIT_TIMEOUT` documents -- a hung call that parks a pool
+/// thread "wedges every worktree operation until restart" -- applies to
+/// the non-git hang `CLASSIFY_GRACE` still gives up on.
 ///
 /// `Unknown` rather than a new variant. The enum already has the arm for
 /// "we could not say", every consumer already treats it as never-safe
 /// (`is_safe` is a two-variant allowlist), and the message is what makes
-/// it actionable. A new `Timeout` variant would need handling in every
-/// match in both languages to say the same thing this one already says.
+/// it actionable.
 fn classify_within(
     w: &mut Worktree,
     repo: &Path,
     default_branch: &str,
     budget: std::time::Duration,
-) -> bool {
+) -> Classified {
+    classify_within_calls(w, repo, default_branch, budget, CLASSIFY_GIT_CALLS)
+}
+
+/// [`classify_within`] with the call ceiling as a parameter, so a test
+/// can reach it with a fixture branch of a few files.
+fn classify_within_calls(
+    w: &mut Worktree,
+    repo: &Path,
+    default_branch: &str,
+    budget: std::time::Duration,
+    ceiling: u32,
+) -> Classified {
     // The main checkout is decided without a single git call
     // (`worktree_safety` returns on `is_main` first), so spending a
     // thread and a channel on it is pure overhead on the one row every
     // repository has.
     if w.is_main {
         classify(w, repo, default_branch);
-        return true;
+        return Classified {
+            calls: None,
+            stopped: None,
+        };
     }
 
     let (tx, rx) = std::sync::mpsc::channel();
-    // A CLONE crosses the thread boundary, not a borrow. `w` is behind a
-    // `&mut` the caller still owns, and the whole point is that this
-    // thread may outlive the wait -- so it cannot be allowed to keep
-    // writing into the caller's row after the budget expires. It writes
-    // into its own copy and sends that back; on timeout the copy is
-    // simply dropped, whenever it finally arrives.
+    // A CLONE crosses the thread boundary, not a borrow: `w` is behind a
+    // `&mut` the caller still owns, and if the thread outlives the wait
+    // (`CLASSIFY_GRACE`) it must not keep writing into the caller's row.
     let mut owned = w.clone();
     let repo = repo.to_path_buf();
     let branch = default_branch.to_string();
+    let deadline = std::time::Instant::now() + budget;
     std::thread::spawn(move || {
-        classify(&mut owned, &repo, &branch);
-        // The receiver is gone on timeout; that is expected, not an
-        // error -- the `git` helper's channel has the same contract.
-        let _ = tx.send(owned);
+        let ((), report) = budget::with(deadline, ceiling, || {
+            classify(&mut owned, &repo, &branch);
+        });
+        // The receiver is gone if the grace ran out; that is expected,
+        // not an error -- the `git` helper's channel has the same
+        // contract.
+        let _ = tx.send((owned, report));
     });
 
-    match rx.recv_timeout(budget) {
-        Ok(done) => {
+    let stopped = |w: &mut Worktree, why: budget::Spent| {
+        w.safety = Safety::Unknown(match why {
+            budget::Spent::Time => {
+                format!("classification did not finish within {}s", budget.as_secs())
+            }
+            budget::Spent::Calls => {
+                format!("classification stopped after {ceiling} git calls")
+            }
+        });
+        w.merged_at = None;
+    };
+    match rx.recv_timeout(budget + CLASSIFY_GRACE) {
+        Ok((done, report)) => {
             *w = done;
-            true
+            if let Some(why) = report.spent {
+                stopped(w, why);
+            }
+            Classified {
+                calls: Some(report.calls),
+                stopped: report.spent,
+            }
         }
         Err(_) => {
-            w.safety = Safety::Unknown(format!(
-                "classification did not finish within {}s",
-                budget.as_secs()
-            ));
-            false
+            stopped(w, budget::Spent::Time);
+            Classified {
+                calls: None,
+                stopped: Some(budget::Spent::Time),
+            }
         }
     }
 }
@@ -2664,6 +3261,17 @@ pub fn classify_repo_streaming(
     repo_path: &str,
     report: &mut (dyn FnMut(&Worktree) + Send),
 ) -> Result<(), String> {
+    classify_repo_streaming_within(repo_path, CLASSIFY_TIMEOUT, report)
+}
+
+/// [`classify_repo_streaming`] with the per-worktree time budget as a
+/// parameter, so a test can run a pass of worktrees that all time out in
+/// a second rather than in minutes.
+fn classify_repo_streaming_within(
+    repo_path: &str,
+    budget: std::time::Duration,
+    report: &mut (dyn FnMut(&Worktree) + Send),
+) -> Result<(), String> {
     let dir = Path::new(repo_path);
     // An empty vec on git failure resolved as SUCCESS, which left rows
     // stuck on "checking..." forever while the header confidently read
@@ -2691,22 +3299,19 @@ pub fn classify_repo_streaming(
                 // all, so a stall was indistinguishable from a slow
                 // repository. The total says "slow"; this says WHICH.
                 let started = std::time::Instant::now();
-                let ok = classify_within(&mut w, dir, branch, CLASSIFY_TIMEOUT);
+                let ran = classify_within(&mut w, dir, branch, budget);
+                // The VERDICT's name only, or why it stopped, and how many
+                // git calls it made (#1582). Not the `Debug` of the whole
+                // value: `Unknown` and `Locked` carry git's own free-text
+                // reason, which can name a branch or a path, and the
+                // diagnostic log is something a user pastes into an issue
+                // (`get_pr_detail` makes the same call about a repository
+                // name).
                 crate::diag!(
                     "[diag] worktree-safety {} {}ms {}",
                     w.path,
                     started.elapsed().as_millis(),
-                    if ok {
-                        // The VERDICT's name only. Not the `Debug` of the
-                        // whole value: `Unknown` and `Locked` carry git's
-                        // own free-text reason, which can name a branch
-                        // or a path, and the diagnostic log is something
-                        // a user pastes into an issue (`get_pr_detail`
-                        // makes the same call about a repository name).
-                        safety_label(&w.safety).to_string()
-                    } else {
-                        format!("ABANDONED after {}s", CLASSIFY_TIMEOUT.as_secs())
-                    }
+                    ran.describe(&w, budget)
                 );
                 // A poisoned lock means another worker panicked
                 // mid-report. Dropping this one verdict beats panicking
@@ -2791,16 +3396,12 @@ pub fn classify_main_checkout(repo_path: &str) -> Result<Worktree, String> {
     // `classify_repo_streaming` logs in: the total says a view was slow,
     // this says WHICH repository made it slow.
     let started = std::time::Instant::now();
-    let ok = classify_within(&mut w, dir, &branch, CLASSIFY_TIMEOUT);
+    let ran = classify_within(&mut w, dir, &branch, CLASSIFY_TIMEOUT);
     crate::diag!(
         "[diag] repo-upstream {} {}ms {}",
         w.path,
         started.elapsed().as_millis(),
-        if ok {
-            safety_label(&w.safety).to_string()
-        } else {
-            format!("ABANDONED after {}s", CLASSIFY_TIMEOUT.as_secs())
-        }
+        ran.describe(&w, CLASSIFY_TIMEOUT)
     );
 
     // An abandoned classification leaves `safety` as `Unknown` and
@@ -3209,7 +3810,7 @@ mod tests {
             .collect();
 
         let seen = std::cell::RefCell::new(Vec::new());
-        let outcomes = remove_worktrees_with_progress(&repo, &paths, |done, total| {
+        let outcomes = remove_worktrees_with_progress(&repo, &paths, None, |done, total, _| {
             seen.borrow_mut().push((done, total));
         });
 
@@ -3221,12 +3822,43 @@ mod tests {
         );
     }
 
+    /// Call `done` carries the outcome of `worktree_paths[done - 1]`
+    /// (#1544). The webview maps each progress frame onto its own
+    /// ordered target list by that index alone -- the frame has no path
+    /// -- so a callback out of order would drop the WRONG row from the
+    /// list while the right one stayed on disk.
+    #[test]
+    fn each_progress_call_carries_the_outcome_at_that_index() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path().to_string_lossy().to_string();
+        let paths: Vec<String> = (0..3)
+            .map(|i| {
+                dir.path()
+                    .join(format!("nope-{i}"))
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        remove_worktrees_with_progress(&repo, &paths, None, |done, _, o| {
+            seen.borrow_mut().push((done, o.path.clone()));
+        });
+
+        let want: Vec<(usize, String)> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i + 1, p.clone()))
+            .collect();
+        assert_eq!(seen.into_inner(), want);
+    }
+
     /// An empty batch must report nothing rather than a bare (0, 0),
     /// which a UI would render as a stuck progress line.
     #[test]
     fn an_empty_batch_reports_no_progress() {
         let seen = std::cell::RefCell::new(Vec::new());
-        let outcomes = remove_worktrees_with_progress("/tmp", &[], |d, t| {
+        let outcomes = remove_worktrees_with_progress("/tmp", &[], None, |d, t, _| {
             seen.borrow_mut().push((d, t));
         });
         assert!(seen.into_inner().is_empty());
@@ -3965,6 +4597,120 @@ prunable gitdir file points to non-existent location
             Safety::NeverPushed
         );
         let _ = repo;
+    }
+
+    /// A branch with no tracking config, built the way a contributor's
+    /// fetched PR is: commits of its own, never `--track`ed, never
+    /// `push -u`ed. When `squash` is true, main gains ONE commit holding
+    /// the branch's whole diff, as "Squash and merge" does; otherwise main
+    /// moves on without it.
+    ///
+    /// Two commits on the branch, not one, so per-commit `git cherry`
+    /// cannot match the squash and the aggregate patch-id is what proves
+    /// it. That is the shape #1439 measured.
+    fn untracked_branch_fixture(
+        squash: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let (tmp, repo, wt) = repo_with_worktree("contrib");
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new(crate::auth::git_program())
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs([
+                    ("GIT_AUTHOR_NAME", "octocat"),
+                    ("GIT_COMMITTER_NAME", "octocat"),
+                    ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+                    ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::fs::write(wt.join("a.txt"), "first half\n").unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "first half"]);
+        std::fs::write(wt.join("b.txt"), "second half\n").unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "second half"]);
+
+        if squash {
+            std::fs::write(repo.join("a.txt"), "first half\n").unwrap();
+            std::fs::write(repo.join("b.txt"), "second half\n").unwrap();
+            run_in(&repo, &["add", "-A"]);
+            run_in(&repo, &["commit", "-q", "-m", "both halves (#1)"]);
+        } else {
+            std::fs::write(repo.join("other.txt"), "unrelated\n").unwrap();
+            run_in(&repo, &["add", "-A"]);
+            run_in(&repo, &["commit", "-q", "-m", "something else"]);
+        }
+        (tmp, repo, wt)
+    }
+
+    /// #1439: a branch with no tracking config whose work was
+    /// squash-merged must not read "never pushed -- commits exist only
+    /// here". The content is on main, so it is merged and removable.
+    #[test]
+    fn a_merged_branch_with_no_tracking_config_is_not_never_pushed() {
+        let (_t, _repo, wt) = untracked_branch_fixture(true);
+
+        // The premises, or the test proves nothing: no config key, so
+        // `was_ever_pushed` answers false exactly as in the bug, and the
+        // tip is NOT an ancestor of main, so only the patch-id route can
+        // find the merge.
+        assert!(
+            !was_ever_pushed(&wt),
+            "fixture must have no tracking config"
+        );
+        assert!(
+            git(&wt, &["merge-base", "--is-ancestor", "HEAD", "main"]).is_err(),
+            "fixture must be a squash, not an ancestor"
+        );
+
+        let w = Worktree {
+            path: wt.to_string_lossy().into_owned(),
+            branch: "contrib".into(),
+            ..Default::default()
+        };
+        let s = worktree_safety(&w, "main", false, Some(0));
+        assert_eq!(s, Safety::MergedNoUpstream);
+        assert!(
+            s.is_safe(),
+            "merged content must be removable: {}",
+            s.reason()
+        );
+        assert!(s.reason().contains("merged"), "{}", s.reason());
+        assert!(
+            !s.reason().contains("only here"),
+            "the claim #1439 retracts: {}",
+            s.reason()
+        );
+    }
+
+    /// The other direction, and the one that protects work: with no
+    /// tracking config and commits main does not have, the branch is
+    /// still `NeverPushed`. Asking the merge question first must not
+    /// soften the refusal for content that did not land.
+    #[test]
+    fn an_unmerged_branch_with_no_tracking_config_is_still_never_pushed() {
+        let (_t, _repo, wt) = untracked_branch_fixture(false);
+        assert!(
+            !was_ever_pushed(&wt),
+            "fixture must have no tracking config"
+        );
+
+        let w = Worktree {
+            path: wt.to_string_lossy().into_owned(),
+            branch: "contrib".into(),
+            ..Default::default()
+        };
+        let s = worktree_safety(&w, "main", false, Some(0));
+        assert_eq!(s, Safety::NeverPushed);
+        assert!(!s.is_safe(), "unmerged local-only work must be refused");
     }
 
     /// `was_ever_pushed` reads the CHECKOUT's own branch. A detached
@@ -6074,8 +6820,12 @@ prunable gitdir file points to non-existent location
 
         // The fixture's branch is genuinely unmerged, so a bulk call
         // naming it must refuse rather than delete.
-        let outcomes =
-            remove_worktrees_with_progress(repo_s, &[wt.to_string_lossy().into_owned()], |_, _| {});
+        let outcomes = remove_worktrees_with_progress(
+            repo_s,
+            &[wt.to_string_lossy().into_owned()],
+            None,
+            |_, _, _| {},
+        );
         assert_eq!(outcomes.len(), 1);
         assert!(
             outcomes[0].error.is_some(),
@@ -6098,7 +6848,8 @@ prunable gitdir file points to non-existent location
                 "/nonexistent/path".to_string(),
                 wt.to_string_lossy().into_owned(),
             ],
-            |_, _| {},
+            None,
+            |_, _, _| {},
         );
         assert_eq!(outcomes.len(), 2, "every input must get an outcome");
         assert!(outcomes.iter().all(|o| o.error.is_some()));
@@ -6167,6 +6918,25 @@ prunable gitdir file points to non-existent location
             ),
         ] {
             assert_eq!(parse_owner_repo(url).as_deref(), Some(want), "{url}");
+        }
+        assert_eq!(
+            parse_owner_repo("git@gitlab.com:acme/team/project.git").as_deref(),
+            Some("gitlab.com/acme/team/project")
+        );
+        assert_eq!(
+            parse_owner_repo("https://gitlab.example/group/project.git").as_deref(),
+            Some("gitlab.example/group/project")
+        );
+        assert_ne!(
+            parse_owner_repo("https://github.com.evil/octocat/hello-world"),
+            parse_owner_repo("https://github.com/octocat/hello-world")
+        );
+        for (host, port) in [("github.com", 22), ("ssh.github.com", 443)] {
+            let remote = format!("ssh://git@{host}:{port}/octocat/hello-world.git");
+            assert_eq!(
+                parse_owner_repo(&remote).as_deref(),
+                Some("octocat/hello-world")
+            );
         }
         // Anything unrecognisable yields None rather than a guess: a
         // fuzzy match here pairs a PR with the wrong directory.
@@ -7537,7 +8307,11 @@ prunable gitdir file points to non-existent location
     /// (#754), and that a walk which will not finish becomes "could not
     /// measure" rather than nothing at all (#769).
     mod sizing {
-        use super::super::{dir_size, dir_size_within, size_paths, SIZE_TIMEOUT, SIZE_WORKERS};
+        use super::super::{
+            canonical_rows, dir_size, dir_size_within, size_paths, size_repo, SIZE_TIMEOUT,
+            SIZE_WORKERS,
+        };
+        use std::collections::HashSet;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Mutex;
 
@@ -7717,7 +8491,7 @@ prunable gitdir file points to non-existent location
             // Zero budget: the deadline is already spent when the first
             // directory pops, so this cannot depend on machine speed.
             assert_eq!(
-                dir_size_within(&root, std::time::Duration::ZERO),
+                dir_size_within(&root, std::time::Duration::ZERO, &HashSet::new()),
                 None,
                 "a walk that runs out of budget must say it could not \
                  measure; returning a number claims an answer it does \
@@ -7727,7 +8501,7 @@ prunable gitdir file points to non-existent location
             // The same tree measures fine with a real budget, so the
             // None above is the BOUND firing and not a broken walk.
             assert_eq!(
-                dir_size_within(&root, SIZE_TIMEOUT),
+                dir_size_within(&root, SIZE_TIMEOUT, &HashSet::new()),
                 Some(400),
                 "40 levels of one 10-byte file must still measure"
             );
@@ -7744,10 +8518,12 @@ prunable gitdir file points to non-existent location
         ///
         /// MEASURED on this machine, for why one tree can be unbounded
         /// at all: 26 of 42 worktrees in one checkout live UNDERNEATH
-        /// the main checkout, so the parent's walk subsumes all 26 --
-        /// 235.02 GB and 1,125,352 files, walked once as the parent and
-        /// again as 26 worktrees. The parent took 38.63s where a leaf
-        /// took 0.16s, a 240x spread inside one repository.
+        /// the main checkout, so before #1441 the parent's walk subsumed
+        /// all 26 -- 235.02 GB and 1,125,352 files, walked once as the
+        /// parent and again as 26 worktrees. The parent took 38.63s where
+        /// a leaf took 0.16s, a 240x spread inside one repository. The
+        /// walk now stops at nested worktrees, but one huge tree or a
+        /// slow mount is unbounded all the same, so this still holds.
         ///
         /// Asserts that EVERY path is reported, the slow one included.
         /// Reporting the other N-1 is not enough: the row for the bad
@@ -7772,6 +8548,7 @@ prunable gitdir file points to non-existent location
                     super::super::dir_size_within(
                         std::path::Path::new(p),
                         std::time::Duration::ZERO,
+                        &HashSet::new(),
                     )
                 } else {
                     b
@@ -7802,6 +8579,219 @@ prunable gitdir file points to non-existent location
                     assert_eq!(*b, Some(100), "a measurable tree keeps its real size");
                 }
             }
+        }
+
+        /// A worktree nested inside another row is counted on its own row
+        /// and NOT again inside the row that contains it (#1441).
+        ///
+        /// The main checkout's row read 153 GB where the whole checkout
+        /// was 71 GB, because nine worktrees lived under it and were
+        /// walked twice: once as themselves and once as part of the
+        /// parent. Covers both shapes -- a worktree under the main
+        /// checkout, and one under a LINKED worktree -- and that a plain
+        /// directory which is not a row is still counted where it sits.
+        #[test]
+        fn a_nested_worktree_is_counted_on_its_own_row_only() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let main = tmp.path().join("main");
+            tree(tmp.path(), "main", 1, 100);
+            // Not a row: a vendored directory belongs to the checkout.
+            tree(&main.join("vendor"), "lib", 1, 7);
+            let outer = tree(&main.join(".worktrees"), "outer", 1, 1_000);
+            let inner = tree(
+                &std::path::Path::new(&outer).join(".worktrees"),
+                "inner",
+                1,
+                10_000,
+            );
+            let main = main.to_string_lossy().to_string();
+            let paths = vec![main.clone(), outer.clone(), inner.clone()];
+
+            let seen = Mutex::new(std::collections::HashMap::new());
+            size_paths(&paths, &|p: &str, b: Option<u64>| {
+                seen.lock().unwrap().insert(p.to_string(), b);
+            });
+            let seen = seen.into_inner().unwrap();
+
+            assert_eq!(
+                seen[&main],
+                Some(107),
+                "the main checkout must not include the worktrees under it"
+            );
+            assert_eq!(
+                seen[&outer],
+                Some(1_000),
+                "a linked worktree must not include one nested inside it"
+            );
+            assert_eq!(seen[&inner], Some(10_000), "the nested row keeps its bytes");
+            // The rows now sum to what is actually on disk.
+            let sum: u64 = seen.values().map(|b| b.unwrap()).sum();
+            assert_eq!(sum, dir_size(std::path::Path::new(&main)));
+        }
+
+        /// Rows are compared after canonicalisation, not as spelled.
+        ///
+        /// The nested row arrives through a symlinked parent while the
+        /// main checkout arrives by its real path -- the macOS `/var`
+        /// versus `/private/var` shape, and on Windows the verbatim
+        /// `\\?\` prefix `canonicalize` adds. Compared as spelled, the
+        /// two never match and the double count of #1441 survives.
+        #[test]
+        #[cfg(unix)]
+        fn nested_rows_match_however_their_paths_are_spelled() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let real = tmp.path().join("real");
+            let main = tree(&real, "main", 1, 100);
+            tree(&real.join("main").join(".worktrees"), "x", 1, 1_000);
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let nested = link
+                .join("main")
+                .join(".worktrees")
+                .join("x")
+                .to_string_lossy()
+                .to_string();
+
+            let seen = Mutex::new(std::collections::HashMap::new());
+            size_paths(&[main.clone(), nested.clone()], &|p: &str, b| {
+                seen.lock().unwrap().insert(p.to_string(), b);
+            });
+            let seen = seen.into_inner().unwrap();
+            assert_eq!(seen[&main], Some(100));
+            assert_eq!(seen[&nested], Some(1_000));
+        }
+
+        /// Canonicalising the rows is bounded: a path that never answers
+        /// is kept as given, and the rest are not held up by it.
+        ///
+        /// #769's shape, one step earlier. The walk was bounded so one
+        /// dead mount could not stall every row; an UNBOUNDED
+        /// canonicalise before the walk would put that stall straight
+        /// back. The stand-in blocks for an hour, standing in for a mount
+        /// that never answers -- a real hanging mount cannot be made in
+        /// a test.
+        #[test]
+        fn canonicalising_the_rows_cannot_stall_on_one_path() {
+            fn canon(p: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+                if p.ends_with("hangs") {
+                    std::thread::sleep(std::time::Duration::from_secs(3_600));
+                }
+                if p.ends_with("fails") {
+                    return Err(std::io::Error::other("no such path"));
+                }
+                Ok(std::path::Path::new("canonical").join(p))
+            }
+            let paths = vec!["a".to_string(), "hangs".into(), "fails".into()];
+
+            let started = std::time::Instant::now();
+            let roots = canonical_rows(&paths, std::time::Duration::from_millis(200), canon);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "a path that never answers must not hold up the others: \
+                 took {:?}",
+                started.elapsed()
+            );
+            assert_eq!(
+                roots,
+                vec![
+                    std::path::Path::new("canonical").join("a"),
+                    std::path::PathBuf::from("hangs"),
+                    std::path::PathBuf::from("fails"),
+                ],
+                "answered paths are canonical; timed-out and failed ones \
+                 are kept as given"
+            );
+        }
+
+        /// The same, end to end through `git worktree list`: a file
+        /// written into a nested worktree moves that row and no other.
+        ///
+        /// Measured as a DELTA so the fixture's own `.git` bytes do not
+        /// have to be predicted. Before #1441 the main checkout's row
+        /// grew by every byte written into either nested worktree.
+        #[test]
+        fn size_repo_counts_a_nested_worktree_once() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ident = [
+                ("GIT_AUTHOR_NAME", "octocat"),
+                ("GIT_COMMITTER_NAME", "octocat"),
+                ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+                ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+            ];
+            let run = |dir: &std::path::Path, args: &[&str]| {
+                let out = std::process::Command::new(crate::auth::git_program())
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .envs(ident)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?}");
+            };
+            let repo = tmp.path().join("proj");
+            std::fs::create_dir_all(&repo).unwrap();
+            run(&repo, &["init", "-q", "-b", "main"]);
+            std::fs::write(repo.join("f"), "base\n").unwrap();
+            run(&repo, &["add", "-A"]);
+            run(&repo, &["commit", "-q", "-m", "base"]);
+            // One under the main checkout, one under THAT linked worktree.
+            let inner = repo.join(".worktrees").join("inner");
+            run(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "inner",
+                    inner.to_str().unwrap(),
+                ],
+            );
+            let deeper = inner.join(".worktrees").join("deeper");
+            run(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "deeper",
+                    deeper.to_str().unwrap(),
+                ],
+            );
+
+            let measure = || {
+                let sizes = size_repo(repo.to_str().unwrap()).unwrap();
+                assert_eq!(sizes.len(), 3, "main plus two worktrees: {sizes:?}");
+                let find = |suffix: &std::path::Path| {
+                    sizes
+                        .iter()
+                        .find(|(p, _)| std::path::Path::new(p).ends_with(suffix))
+                        .and_then(|(_, b)| *b)
+                        .unwrap_or_else(|| panic!("no size for {suffix:?} in {sizes:?}"))
+                };
+                (
+                    find(std::path::Path::new("proj")),
+                    find(&std::path::Path::new(".worktrees").join("inner")),
+                    find(&std::path::Path::new(".worktrees").join("deeper")),
+                )
+            };
+
+            let before = measure();
+            std::fs::write(inner.join("blob"), vec![b'x'; 1_000]).unwrap();
+            std::fs::write(deeper.join("blob"), vec![b'x'; 30_000]).unwrap();
+            let after = measure();
+
+            assert_eq!(
+                after.0, before.0,
+                "the main checkout must not grow when a nested worktree does"
+            );
+            assert_eq!(
+                after.1,
+                before.1 + 1_000,
+                "a linked worktree grows by its own bytes, not its nested one's"
+            );
+            assert_eq!(after.2, before.2 + 30_000);
         }
 
         /// The bound is generous enough not to reject honest walks.
@@ -7948,9 +8938,12 @@ prunable gitdir file points to non-existent location
             let target = tmp.path().join("proj-f0");
 
             let mut w = wt(target.to_str().unwrap());
-            let ok = classify_within(&mut w, &repo, "main", std::time::Duration::ZERO);
+            let ran = classify_within(&mut w, &repo, "main", std::time::Duration::ZERO);
 
-            assert!(!ok, "a budget that is already spent must report failure");
+            assert!(
+                !ran.is_verdict(),
+                "a budget that is already spent must report failure"
+            );
             assert!(
                 matches!(&w.safety, Safety::Unknown(m) if m.contains("did not finish")),
                 "an abandoned worktree must say it could not be classified, \
@@ -7969,7 +8962,7 @@ prunable gitdir file points to non-existent location
             // the Unknown above is the BOUND firing rather than a broken
             // classifier.
             let mut w = wt(target.to_str().unwrap());
-            assert!(classify_within(&mut w, &repo, "main", CLASSIFY_TIMEOUT));
+            assert!(classify_within(&mut w, &repo, "main", CLASSIFY_TIMEOUT).is_verdict());
             assert!(
                 !matches!(&w.safety, Safety::Unknown(m) if m.contains("did not finish")),
                 "a worktree with a real budget must reach a real verdict: {:?}",
@@ -8156,6 +9149,227 @@ prunable gitdir file points to non-existent location
                 "an unreadable repository must say so; resolving as an \
                  empty success is what left rows on 'checking...' while \
                  the header read '0 safe to remove': {err}"
+            );
+        }
+
+        /// A git that will not answer, standing in for the real one in a
+        /// test's own directories (#1582).
+        ///
+        /// Each invocation appends its pid, starts a CHILD of its own that
+        /// also records its pid -- the `ssh` of a fetch, in miniature --
+        /// and then sleeps far longer than any test waits. So every pid in
+        /// the file is a process that is still running unless something
+        /// killed it.
+        #[cfg(unix)]
+        fn hanging_git(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+            use std::os::unix::fs::PermissionsExt;
+            let pids = dir.join("pids");
+            let script = dir.join("hanging-git");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\necho $$ >> '{p}'\nsleep 60 &\necho $! >> '{p}'\nsleep 60\n",
+                    p = pids.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            (script, pids)
+        }
+
+        /// The pids a `hanging_git` recorded.
+        #[cfg(unix)]
+        fn recorded(pids: &Path) -> Vec<i32> {
+            std::fs::read_to_string(pids)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
+        }
+
+        /// Whether a pid names a live process. An exited child of the
+        /// test is reaped by `wait_bounded`; an orphaned grandchild is
+        /// reaped by init, which is why callers poll.
+        #[cfg(unix)]
+        fn alive(pid: i32) -> bool {
+            // SAFETY: signal 0 only checks the pid; no pointers.
+            unsafe { libc::kill(pid, 0) == 0 }
+        }
+
+        #[cfg(unix)]
+        fn all_gone_within(pids: &[i32], limit: std::time::Duration) -> Vec<i32> {
+            let until = std::time::Instant::now() + limit;
+            loop {
+                let live: Vec<i32> = pids.iter().copied().filter(|p| alive(*p)).collect();
+                if live.is_empty() || std::time::Instant::now() >= until {
+                    return live;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+
+        /// A git call still running when its budget expires is KILLED,
+        /// with everything it started, and the budget records why
+        /// (#1582, candidate 1).
+        ///
+        /// Before #1582 the helper moved the child into
+        /// `wait_with_output` on a thread and, on timeout, simply stopped
+        /// waiting: the child and its children ran on. Across a
+        /// 141-worktree pass that is a steady accumulation of git
+        /// processes competing with the live workers.
+        #[cfg(unix)]
+        #[test]
+        fn a_git_call_past_its_budget_is_killed_with_what_it_started() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (script, pids) = hanging_git(tmp.path());
+            let started = std::time::Instant::now();
+            let deadline = started + std::time::Duration::from_millis(300);
+            let (out, report) = super::super::budget::with(deadline, 100, || {
+                super::super::git_output_with(&script, tmp.path(), &["status"])
+            });
+            let took = started.elapsed();
+
+            let err = out.expect_err("a git that never answers must not succeed");
+            assert!(err.contains("time budget"), "{err}");
+            assert_eq!(report.spent, Some(super::super::budget::Spent::Time));
+            assert!(
+                took < std::time::Duration::from_secs(5),
+                "the call must end at its deadline, not at GIT_TIMEOUT: {took:?}"
+            );
+            let seen = recorded(&pids);
+            assert_eq!(seen.len(), 2, "git and the child it started: {seen:?}");
+            let live = all_gone_within(&seen, std::time::Duration::from_secs(3));
+            assert!(
+                live.is_empty(),
+                "no git may outlive its budget, nor anything it started: {live:?} still running"
+            );
+        }
+
+        /// A pass in which EVERY worktree times out ends in about two
+        /// budgets for twice as many worktrees as workers, and leaves no
+        /// git running (#1582, candidate 1; the issue's regression test).
+        ///
+        /// Each worktree's first git call hangs. With the budget
+        /// enforced inside the git helper, that call is killed at the
+        /// deadline and every later call in the same classification is
+        /// refused without a spawn, so each worktree costs exactly ONE
+        /// git process and one budget. Before #1582 the pass still
+        /// REPORTED on time -- `classify_within` stopped waiting -- but
+        /// each abandoned thread went on to its next git call, so the
+        /// count of processes grew past one per worktree and none of them
+        /// was ever killed. The budget here is 1s instead of 45s so the
+        /// test runs in seconds; `classify_repo_streaming` passes
+        /// `CLASSIFY_TIMEOUT` through the same code.
+        #[cfg(unix)]
+        #[test]
+        fn a_pass_where_every_worktree_times_out_stops_every_git() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            // Canonical, so the paths git reports match the prefix the
+            // fake is installed for (`/private/var` against `/var`).
+            let root = tmp.path().canonicalize().unwrap();
+            let n = CLASSIFY_WORKERS * 2;
+            let repo = repo_with_worktrees(&root, n);
+            let (script, pids) = hanging_git(&root);
+            // The worktrees only (`proj-f0`...), not the repository, so
+            // the listing itself still runs real git.
+            let _fake = super::super::fake_git::install(&root.join("proj-f"), &script);
+
+            let budget = std::time::Duration::from_secs(1);
+            let started = std::time::Instant::now();
+            let seen = Mutex::new(Vec::new());
+            super::super::classify_repo_streaming_within(
+                repo.to_str().unwrap(),
+                budget,
+                &mut |w| {
+                    seen.lock()
+                        .unwrap()
+                        .push((w.path.clone(), w.safety.clone()));
+                },
+            )
+            .unwrap();
+            let took = started.elapsed();
+
+            let seen = seen.into_inner().unwrap();
+            assert_eq!(seen.len(), n + 1, "every worktree is reported");
+            let timed_out = seen
+                .iter()
+                .filter(|(_, s)| matches!(s, Safety::Unknown(m) if m.contains("did not finish")))
+                .count();
+            assert_eq!(timed_out, n, "every worktree ran out of time: {seen:?}");
+            // Two rounds of eight, each one budget long, plus the grace
+            // and the listing. Far below the 30s one git call could take.
+            assert!(
+                took < budget * 2 + std::time::Duration::from_secs(4),
+                "{n} timed-out worktrees on {CLASSIFY_WORKERS} workers took {took:?}"
+            );
+            // Each git runs in the background, so let any in-flight spawn
+            // record itself before counting.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let all = recorded(&pids);
+            assert_eq!(
+                all.len(),
+                n * 2,
+                "one git per worktree (and its one child), then nothing: a \
+                 classification whose budget is spent must stop spending"
+            );
+            let live = all_gone_within(&all, std::time::Duration::from_secs(3));
+            assert!(
+                live.is_empty(),
+                "every git a timed-out classification started must be dead: {live:?}"
+            );
+        }
+
+        /// Past its CALL budget a worktree is `Unknown` with the reason,
+        /// never a verdict built from calls that were not made (#1582,
+        /// candidate 4).
+        ///
+        /// The fixture branch is unmerged, the verdict that costs the most
+        /// calls. With too few calls allowed, the helpers that were
+        /// refused would each have fallen back to a conservative answer,
+        /// and the result would read as a confident "not merged". Qualify
+        /// or suppress: it is suppressed to `Unknown`, saying why.
+        #[test]
+        fn past_its_call_budget_a_worktree_is_unknown_with_the_reason() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let repo = repo_with_worktrees(tmp.path(), 1);
+            let target = tmp.path().join("proj-f0");
+
+            let mut w = wt(target.to_str().unwrap());
+            let ran =
+                super::super::classify_within_calls(&mut w, &repo, "main", CLASSIFY_TIMEOUT, 2);
+            assert_eq!(ran.stopped, Some(super::super::budget::Spent::Calls));
+            assert_eq!(ran.calls, Some(2), "exactly the ceiling was spent");
+            assert!(
+                matches!(&w.safety, Safety::Unknown(m) if m.contains("stopped after 2 git calls")),
+                "{:?}",
+                w.safety
+            );
+            assert!(!w.safety.is_safe());
+
+            // The same worktree with the production ceiling reaches a real
+            // verdict, well inside it.
+            let mut w = wt(target.to_str().unwrap());
+            let ran = classify_within(&mut w, &repo, "main", CLASSIFY_TIMEOUT);
+            assert!(ran.is_verdict(), "{:?}", w.safety);
+            assert!(ran
+                .calls
+                .is_some_and(|n| n > 2 && n < super::super::CLASSIFY_GIT_CALLS));
+        }
+
+        /// A budget is gone once its run ends, so a pooled or reused
+        /// thread never refuses an unrelated git call with a budget it
+        /// did not install.
+        #[test]
+        fn a_budget_ends_with_its_run() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let repo = repo_with_worktrees(tmp.path(), 0);
+            let (_, report) = super::super::budget::with(std::time::Instant::now(), 0, || {
+                assert!(super::super::git(&repo, &["rev-parse", "HEAD"]).is_err());
+            });
+            assert!(report.spent.is_some());
+            assert!(
+                super::super::git(&repo, &["rev-parse", "HEAD"]).is_ok(),
+                "the spent budget leaked past its run"
             );
         }
 
@@ -8821,6 +10035,7 @@ mod live {
                 Safety::Unpushed(_) => "unpushed",
                 Safety::NeverPushed => "never_pushed",
                 Safety::MergedUpstreamDeleted => "merged_upstream_deleted",
+                Safety::MergedNoUpstream => "merged_no_upstream",
                 // The tally that produced the #819 column of the
                 // measured table in `worktree_safety`. Counted
                 // separately from `safe` on purpose: the whole question
@@ -8828,6 +10043,9 @@ mod live {
                 // moving into `never_pushed`, and a merged total would
                 // hide both halves.
                 Safety::DetachedMerged(_) => "detached_merged",
+                // Never produced by this offline scan (#1440): only the
+                // GitHub enrichment in `worktrees::github` reaches it.
+                Safety::MergedAsPr(_) => "merged_as_pr",
                 Safety::Empty => "empty",
                 Safety::Unmerged => "unmerged",
                 Safety::Locked(_) => "locked",
@@ -9814,14 +11032,31 @@ mod live {
 
         let whole = std::time::Instant::now();
         let mut each: Vec<(u128, String)> = Vec::new();
+        // Git calls per worktree too (#1582), under a budget that cannot
+        // run out, so `CLASSIFY_GIT_CALLS` is set from a measurement.
+        let mut calls: Vec<u32> = Vec::new();
         for w in &listed {
             let mut w = w.clone();
             let t = std::time::Instant::now();
-            classify(&mut w, &repo, &default);
+            let ((), report) = budget::with(
+                std::time::Instant::now() + std::time::Duration::from_secs(3600),
+                u32::MAX,
+                || classify(&mut w, &repo, &default),
+            );
             each.push((t.elapsed().as_millis(), w.path.clone()));
+            calls.push(report.calls);
         }
         let total = whole.elapsed();
         each.sort_unstable();
+        calls.sort_unstable();
+        let q = |v: f64| calls[((calls.len() as f64 - 1.0) * v).round() as usize];
+        println!(
+            "git calls per worktree: p50={} p90={} p99={} max={}",
+            q(0.50),
+            q(0.90),
+            q(0.99),
+            calls.last().copied().unwrap_or(0),
+        );
 
         let at = |q: f64| each[((each.len() as f64 - 1.0) * q).round() as usize].0;
         println!(
@@ -10087,10 +11322,23 @@ pub fn fetch_refs(path: &str) -> Result<String, String> {
     git(dir, args)
 }
 
+/// `github` is the same delete-time GitHub check `remove_worktree_asking`
+/// takes (#1440), asked only for a row the offline gate would refuse as
+/// unmerged or unpushed. `None` is the offline gate alone.
+///
+/// `on_progress` gets `(done, total, outcome)` after each removal, in
+/// the ORDER of `worktree_paths`: call `done` is always the outcome of
+/// `worktree_paths[done - 1]`. That ordering is a contract, not an
+/// accident of the loop (#1544): the webview holds the same ordered
+/// list, so a caller can report WHICH row went by index alone and keep
+/// the path out of anything it emits. The outcome is handed over whole
+/// so the CALLER decides what leaves the process; this module emits
+/// nothing.
 pub fn remove_worktrees_with_progress(
     repo_path: &str,
     worktree_paths: &[String],
-    mut on_progress: impl FnMut(usize, usize),
+    github: Option<super::github::Ask<'_>>,
+    mut on_progress: impl FnMut(usize, usize, &RemovalOutcome),
 ) -> Vec<RemovalOutcome> {
     let total = worktree_paths.len();
     worktree_paths
@@ -10099,12 +11347,12 @@ pub fn remove_worktrees_with_progress(
         .map(|(i, p)| {
             let outcome = RemovalOutcome {
                 path: p.clone(),
-                error: remove_worktree(repo_path, p).err(),
+                error: remove_inner(repo_path, p, false, github).err(),
             };
             // AFTER the removal, so the count means "done", not
             // "started" -- a progress bar that reaches 100% before the
             // work finishes is worse than none.
-            on_progress(i + 1, total);
+            on_progress(i + 1, total, &outcome);
             outcome
         })
         .collect()
@@ -10154,7 +11402,27 @@ fn canonical_key(p: &Path) -> String {
 /// administrative files, where a raw delete leaves a stale entry making
 /// the repo report a worktree that no longer exists.
 pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<(), String> {
-    remove_inner(repo_path, worktree_path, false)
+    remove_inner(repo_path, worktree_path, false, None)
+}
+
+/// [`remove_worktree`], with GitHub's record of a merge as a second
+/// route through the gate (#1440).
+///
+/// The offline gate runs first and unchanged. Only when it refuses a row
+/// as `Unmerged` or `Unpushed` -- the two verdicts the scan's GitHub
+/// enrichment can upgrade -- is `github` asked, FRESH, about the branch,
+/// and the answer must pass `github::qualifying_pr` against the HEAD
+/// git reports right now. Anything else keeps the offline refusal.
+///
+/// Fresh rather than trusted from the scan for the reason the offline
+/// gate is: the scan is a snapshot. A commit made since would sit past
+/// the PR's head, and the strict rule refuses exactly that.
+pub fn remove_worktree_asking(
+    repo_path: &str,
+    worktree_path: &str,
+    github: super::github::Ask<'_>,
+) -> Result<(), String> {
+    remove_inner(repo_path, worktree_path, false, Some(github))
 }
 
 /// Remove a worktree the safety gate would refuse.
@@ -10188,10 +11456,15 @@ pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<(), Strin
 /// worktree still fails here, loudly, rather than being torn out from
 /// under whatever holds it.
 pub fn remove_worktree_forced(repo_path: &str, worktree_path: &str) -> Result<(), String> {
-    remove_inner(repo_path, worktree_path, true)
+    remove_inner(repo_path, worktree_path, true, None)
 }
 
-fn remove_inner(repo_path: &str, worktree_path: &str, allow_unsafe: bool) -> Result<(), String> {
+fn remove_inner(
+    repo_path: &str,
+    worktree_path: &str,
+    allow_unsafe: bool,
+    github: Option<super::github::Ask<'_>>,
+) -> Result<(), String> {
     let repo = Path::new(repo_path);
     let target = Path::new(worktree_path);
 
@@ -10233,7 +11506,11 @@ fn remove_inner(repo_path: &str, worktree_path: &str, allow_unsafe: bool) -> Res
         };
         let safety = worktree_safety(wt, &branch, has_upstream, ahead);
         if !safety.is_safe() {
-            return Err(format!("not safe to remove: {}", safety.reason()));
+            // GitHub's record of a merge, as a second route (#1440). It can
+            // only let through what the offline gate refused as unmerged or
+            // unpushed; every other refusal -- dirty, in progress, locked --
+            // returns here exactly as before.
+            super::github::gate(wt, &safety, github)?;
         }
     } else {
         log::warn!("removing {worktree_path} past the safety gate, by explicit confirmation");
@@ -10663,6 +11940,200 @@ mod in_progress_tests {
 
         assert_eq!(operation_in_progress(dir), None);
         assert_eq!(conflicted_files(dir), Some(0), "and nothing is conflicted");
+    }
+
+    /// #1438: a conflicted rebase that was FINISHED is not in progress.
+    ///
+    /// Git leaves `REBASE_HEAD` behind after `rebase --continue`, so a
+    /// marker list that included it reported this worktree as mid-rebase
+    /// forever -- and blocked its removal. The state had never been
+    /// modelled: every earlier test stopped at the conflict or aborted.
+    #[test]
+    fn a_finished_conflicted_rebase_is_not_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        assert!(run(dir, &["checkout", "-q", "feat"]));
+        let _ = run(dir, &["rebase", "main"]);
+        assert_eq!(
+            operation_in_progress(dir),
+            Some(GitOperation::Rebase),
+            "precondition: stopped on the conflict"
+        );
+
+        std::fs::write(dir.join("f.txt"), "resolved\n").unwrap();
+        assert!(run(dir, &["add", "f.txt"]));
+        let continued = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rebase", "--continue"])
+            .envs(IDENT)
+            .env("GIT_EDITOR", "true")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(continued, "rebase --continue must succeed");
+        assert!(
+            !dir.join(".git").join("rebase-merge").exists(),
+            "precondition: the rebase finished"
+        );
+        // The residue that caused #1438. Not asserted, because a future
+        // git that tidies it up is not a failure of this code; but
+        // reported, since `None` below then passes without exercising it.
+        if !dir.join(".git").join("REBASE_HEAD").exists() {
+            eprintln!("this git does not leave REBASE_HEAD behind");
+        }
+
+        assert_eq!(operation_in_progress(dir), None);
+    }
+
+    /// The other markers ARE cleared when their operation finishes --
+    /// measured rather than assumed, because `REBASE_HEAD` showed that a
+    /// marker an operation writes need not be removed by it.
+    #[test]
+    fn finished_merge_cherry_pick_revert_and_bisect_are_not_in_progress() {
+        let resolve_and_commit = |dir: &Path| {
+            std::fs::write(dir.join("f.txt"), "resolved\n").unwrap();
+            assert!(run(dir, &["add", "f.txt"]));
+            assert!(run(dir, &["commit", "-q", "--no-edit"]));
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        let _ = run(dir, &["merge", "feat"]);
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::Merge));
+        resolve_and_commit(dir);
+        assert_eq!(operation_in_progress(dir), None, "merge committed");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        let _ = run(dir, &["cherry-pick", "feat"]);
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::CherryPick));
+        resolve_and_commit(dir);
+        assert_eq!(operation_in_progress(dir), None, "cherry-pick committed");
+
+        // Reverting a commit that a later one rewrote the same line of
+        // conflicts, which is the stopped state being finished here.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        assert!(run(dir, &["checkout", "-q", "feat"]));
+        std::fs::write(dir.join("f.txt"), "later\n").unwrap();
+        assert!(run(dir, &["commit", "-q", "-am", "later"]));
+        let _ = run(dir, &["revert", "--no-edit", "HEAD~1"]);
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::Revert));
+        resolve_and_commit(dir);
+        assert_eq!(operation_in_progress(dir), None, "revert committed");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        assert!(run(dir, &["bisect", "start"]));
+        assert!(run(dir, &["bisect", "bad"]));
+        assert!(run(dir, &["bisect", "good", "HEAD~1"]));
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::Bisect));
+        assert!(run(dir, &["bisect", "reset"]));
+        assert_eq!(operation_in_progress(dir), None, "bisect reset");
+    }
+
+    /// Two commits on `feat` after its base: the first conflicts with
+    /// `main`, the second (a new file) does not. Picking or reverting
+    /// both stops on the first with the second still queued.
+    fn two_step_sequence(dir: &Path) {
+        conflicting(dir);
+        assert!(run(dir, &["checkout", "-q", "feat"]));
+        std::fs::write(dir.join("g.txt"), "second\n").unwrap();
+        assert!(run(dir, &["add", "g.txt"]));
+        assert!(run(dir, &["commit", "-q", "-m", "second"]));
+        assert!(run(dir, &["checkout", "-q", "main"]));
+    }
+
+    /// #1446: a multi-commit cherry-pick paused BETWEEN commits.
+    ///
+    /// Once the conflict is resolved and committed, `CHERRY_PICK_HEAD` is
+    /// gone and `sequencer/` is all that is left -- the worktree is clean,
+    /// so without this it read as removable while the rest of the pick
+    /// plan waited in `sequencer/todo`.
+    #[test]
+    fn a_cherry_pick_paused_between_commits_is_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        two_step_sequence(dir);
+        let _ = run(dir, &["cherry-pick", "feat~1", "feat"]);
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::CherryPick));
+
+        std::fs::write(dir.join("f.txt"), "resolved\n").unwrap();
+        assert!(run(dir, &["add", "f.txt"]));
+        assert!(run(dir, &["commit", "-q", "--no-edit"]));
+        assert!(
+            !dir.join(".git").join("CHERRY_PICK_HEAD").exists(),
+            "precondition: only the sequencer is left"
+        );
+        assert!(dir.join(".git").join("sequencer").is_dir(), "precondition");
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::CherryPick));
+
+        let continued = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["cherry-pick", "--continue"])
+            .envs(IDENT)
+            .env("GIT_EDITOR", "true")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(continued, "cherry-pick --continue must succeed");
+        assert_eq!(operation_in_progress(dir), None, "the sequence finished");
+    }
+
+    /// The same state for `revert`, named as a revert rather than
+    /// defaulting to cherry-pick: the todo's first word says which.
+    #[test]
+    fn a_revert_paused_between_commits_is_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        conflicting(dir);
+        assert!(run(dir, &["checkout", "-q", "feat"]));
+        std::fs::write(dir.join("f.txt"), "later\n").unwrap();
+        assert!(run(dir, &["commit", "-q", "-am", "later"]));
+        std::fs::write(dir.join("g.txt"), "extra\n").unwrap();
+        assert!(run(dir, &["add", "g.txt"]));
+        assert!(run(dir, &["commit", "-q", "-m", "extra"]));
+        // Reverting "theirs" (HEAD~2) conflicts with "later", and "extra"
+        // (HEAD) is queued after it, so the sequence stops on the first
+        // with work left.
+        let _ = run(dir, &["revert", "--no-edit", "HEAD~2", "HEAD"]);
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::Revert));
+
+        std::fs::write(dir.join("f.txt"), "resolved\n").unwrap();
+        assert!(run(dir, &["add", "f.txt"]));
+        assert!(run(dir, &["commit", "-q", "--no-edit"]));
+        assert!(
+            !dir.join(".git").join("REVERT_HEAD").exists(),
+            "precondition: only the sequencer is left"
+        );
+        assert!(dir.join(".git").join("sequencer").is_dir(), "precondition");
+        assert_eq!(operation_in_progress(dir), Some(GitOperation::Revert));
+    }
+
+    /// And the sequencer does not outlive an abandoned sequence: `--abort`
+    /// and `--quit` both clear it, so this cannot become #1438 again.
+    #[test]
+    fn abandoning_a_paused_sequence_clears_the_state() {
+        for end in ["--abort", "--quit"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            two_step_sequence(dir);
+            let _ = run(dir, &["cherry-pick", "feat~1", "feat"]);
+            std::fs::write(dir.join("f.txt"), "resolved\n").unwrap();
+            assert!(run(dir, &["add", "f.txt"]));
+            assert!(run(dir, &["commit", "-q", "--no-edit"]));
+            assert!(operation_in_progress(dir).is_some(), "precondition");
+
+            assert!(run(dir, &["cherry-pick", end]), "cherry-pick {end}");
+            assert_eq!(operation_in_progress(dir), None, "after {end}");
+        }
     }
 
     /// An ABORTED rebase leaves no markers, so the row goes back to

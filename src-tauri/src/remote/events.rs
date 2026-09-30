@@ -3,7 +3,7 @@
 //!
 //! # How events get here
 //!
-//! The poll loop and a few commands `app.emit(...)` the nine events in
+//! The poll loop and a few commands `app.emit(...)` the events in
 //! [`EVENT_NAMES`], which the frontend's hooks listen for. The hub taps
 //! them with `listen_any` on the `AppHandle`, one listener per name,
 //! rather than by wrapping each emit site in a helper that also pushes
@@ -23,9 +23,8 @@
 //! payloads are untouched: the hub reads them and never re-emits.
 //!
 //! Tauri runs Rust listeners on the emitting thread, under its listener
-//! lock, so the callback does one thing: push onto a
-//! `tokio::sync::broadcast` channel, which never blocks and never
-//! re-enters Tauri.
+//! lock. The callback retains the latest source frame and pushes onto a
+//! `tokio::sync::broadcast` channel; it never awaits or re-enters Tauri.
 //!
 //! # The stream a phone sees
 //!
@@ -40,7 +39,8 @@
 //! The first frame is always a `prs-updated` carrying the cached
 //! snapshot -- the same list `get_cached` returns -- so a phone renders
 //! immediately after (re)connecting instead of waiting up to a poll
-//! interval. A bare comment line `:` goes out after every [`KEEP_ALIVE`]
+//! interval. The latest versioned source frames follow it, so modern clients
+//! recover missed rows and status for both lists. A bare comment line `:` goes out after every [`KEEP_ALIVE`]
 //! of silence so NAT tables stay warm and the phone can tell idle from
 //! dead.
 //!
@@ -88,12 +88,15 @@ pub const PATH: &str = "/v1/events";
 pub const EVENT_NAMES: &[&str] = &[
     "prs-updated",
     "poll-state",
+    "source-poll-status",
+    "gitlab-data-changed",
     "poll-error",
     "prs-truncated",
     "prs-incomplete",
     "store-error",
     "worktree-removal-progress",
     "reviewing-short",
+    "reviewing-updated",
     "update-run-progress",
     "update-run-done",
     // Widening this list widens a security boundary -- see the module
@@ -158,6 +161,29 @@ pub const EVENT_NAMES: &[&str] = &[
     // foreground. Without this the phone shows a caveat that never moves,
     // which is indistinguishable from one that is broken.
     "stats-backfill-progress",
+    // The fifteenth, and the first about a Claude Code session (#1477):
+    // `{ session_id, size, seq }` when a RUNNING session's transcript
+    // changed, so a phone reading that transcript fetches within about a
+    // second instead of waiting out its poll's backoff.
+    //
+    // It carries NO transcript text, and must never start to. #1488's
+    // masking covers `/v1/call` answers only; nothing on this list is
+    // masked, so an event is only safe to add here if nothing in it came
+    // out of a transcript. `claude::activity`'s
+    // `the_payload_carries_no_transcript_content` pins the field set.
+    //
+    // Weighed on the same test as the entries above, and it passes
+    // trivially: `claude_sessions`, an allowlisted Read, already RETURNS
+    // every session id to this phone, and a byte size says only that the
+    // file changed -- which the phone's next page read would say anyway.
+    // No path, no name, no counts.
+    //
+    // Volume: emitted only on change, at most `MAX_PER_TICK` (8) per
+    // second however many sessions are writing, and none while nothing
+    // is. A nudge lost to a lag cut or a reconnect costs latency only:
+    // the follow keeps its own poll. `claude::activity`'s module docs
+    // carry the worst case against `CAPACITY`.
+    "claude-session-activity",
 ];
 
 /// The event name the opening snapshot frame is sent under, so the
@@ -171,7 +197,13 @@ pub const KEEP_ALIVE: Duration = Duration::from_secs(15);
 /// burstiest producer is `worktree-removal-progress`, one frame per
 /// worktree removed; a phone keeps up with that unless its socket has
 /// stopped draining, and then ending the stream is the right answer.
-const CAPACITY: usize = 256;
+///
+/// The steadiest producer is `claude-session-activity` (#1477): only on
+/// change, and capped at `claude::activity::MAX_PER_TICK` frames per
+/// second however many sessions are writing -- so nudges alone take at
+/// least `CAPACITY / MAX_PER_TICK` = 32 s of a socket not draining to
+/// fill this, and a nudge lost to the cut costs latency, not data.
+pub(crate) const CAPACITY: usize = 256;
 
 /// One event as the webview received it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -192,18 +224,48 @@ pub struct Emitted {
 pub type SnapshotSource =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>;
 
+type SourceFrames = Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<(crate::identity::Source, crate::store::CachedList), Emitted>,
+    >,
+>;
+
 /// The broadcast every subscriber hangs off. One per process, held in
 /// `gate::Remote`, attached to the app once at startup; the listener
 /// clones the `Arc` each time it starts.
 pub struct Hub {
     tx: broadcast::Sender<Emitted>,
     snapshot: SnapshotSource,
+    sources: SourceFrames,
+}
+
+/// Retain only the newest publication for each source/list, including while no
+/// phone is connected. Parsing just the routing fields skips the row payload.
+fn remember_source(sources: &SourceFrames, event: &Emitted) {
+    if event.name != "source-poll-status" {
+        return;
+    }
+    #[derive(serde::Deserialize)]
+    struct Key {
+        source: crate::identity::Source,
+        list: crate::store::CachedList,
+    }
+    if let Ok(key) = serde_json::from_str::<Key>(&event.json) {
+        sources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((key.source, key.list), event.clone());
+    }
 }
 
 impl Hub {
     pub fn new(snapshot: SnapshotSource) -> Self {
         let (tx, _) = broadcast::channel(CAPACITY);
-        Self { tx, snapshot }
+        Self {
+            tx,
+            snapshot,
+            sources: Arc::default(),
+        }
     }
 
     /// Tap every emit of every name in [`EVENT_NAMES`]. Call once; the
@@ -211,13 +273,16 @@ impl Hub {
     pub fn attach(&self, app: &AppHandle) {
         for name in EVENT_NAMES {
             let tx = self.tx.clone();
+            let sources = self.sources.clone();
             app.listen_any(*name, move |event| {
                 // No receivers is the usual state (no phone connected)
                 // and not an error.
-                let _ = tx.send(Emitted {
+                let event = Emitted {
                     name: (*name).to_string(),
                     json: event.payload().to_string(),
-                });
+                };
+                remember_source(&sources, &event);
+                let _ = tx.send(event);
             });
         }
     }
@@ -227,10 +292,12 @@ impl Hub {
     /// to the wire verbatim. Production goes through [`Hub::attach`];
     /// this is for tests and for code with no `AppHandle` in reach.
     pub fn publish(&self, name: &str, json: String) {
-        let _ = self.tx.send(Emitted {
+        let event = Emitted {
             name: name.to_string(),
             json,
-        });
+        };
+        remember_source(&self.sources, &event);
+        let _ = self.tx.send(event);
     }
 
     fn subscribe(&self) -> broadcast::Receiver<Emitted> {
@@ -273,7 +340,18 @@ pub async fn subscribe(
         name: SNAPSHOT_EVENT.to_string(),
         json,
     });
-    let frames = stream::iter(first)
+    // The legacy SQLite frame keeps older clients compatible. Modern clients
+    // need versioned receipts/status too: they deliberately ignore unversioned
+    // rows after seeing source status. Replay both lists without waiting for a
+    // new poll; queued older events are rejected by their revisions.
+    let sources: Vec<_> = hub
+        .sources
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    let frames = stream::iter(first.into_iter().chain(sources))
         .chain(live(events, sub))
         .map(|e| Ok(sse::Event::default().event(e.name).data(e.json)));
     Some(Sse::new(frames).keep_alive(KeepAlive::new().interval(KEEP_ALIVE)))
@@ -633,6 +711,46 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn reconnect_replays_a_missed_source_publication_without_another_poll() {
+        let hub = Arc::new(Hub::new(fixed_snapshot(Some("[]".into()))));
+        let certs = Arc::new(MemoryCerts::default());
+        let server = serve_with(certs, hub.clone()).await;
+        let phone = Identity::generate().unwrap();
+        server.certs.pair(&phone.fingerprint());
+        let frame = |revision| {
+            webview_json(&json!({
+                "source": { "provider": "github", "host": "github.com" },
+                "list": "reviewing", "session": "desktop", "revision": revision,
+                "receipt_revision": revision, "phase": "ready", "error": null,
+                "prs": [{ "number": revision }]
+            }))
+        };
+        hub.publish("source-poll-status", frame(1));
+        let mut client = SseClient::connect(server.handle.local_addr(), &phone, &server.fp).await;
+        assert_eq!(
+            client.next_frame().await,
+            Some(("prs-updated".into(), "[]".into()))
+        );
+        assert_eq!(
+            client.next_frame().await,
+            Some(("source-poll-status".into(), frame(1)))
+        );
+        drop(client);
+        // This publication happens while the phone has no event connection.
+        hub.publish("source-poll-status", frame(2));
+        let mut resumed = SseClient::connect(server.handle.local_addr(), &phone, &server.fp).await;
+        assert_eq!(
+            resumed.next_frame().await,
+            Some(("prs-updated".into(), "[]".into()))
+        );
+        assert_eq!(
+            resumed.next_frame().await,
+            Some(("source-poll-status".into(), frame(2)))
+        );
+        server.handle.stop().await;
+    }
+
+    #[tokio::test]
     async fn a_revoked_phones_stream_ends() {
         let hub = Arc::new(Hub::new(fixed_snapshot(Some("[]".into()))));
         let certs = Arc::new(MemoryCerts::default());
@@ -683,6 +801,16 @@ pub(crate) mod tests {
             Some(("poll-error".into(), "\"rate limited\"".into()))
         );
         server.handle.stop().await;
+    }
+
+    /// The nudges' worst case fits the buffer with room to spare: a
+    /// subscriber is not cut by nudges alone until its socket has
+    /// stopped draining for `CAPACITY / MAX_PER_TICK` ticks (#1477).
+    #[test]
+    fn nudges_alone_take_thirty_seconds_of_a_stalled_socket_to_fill_the_buffer() {
+        let ticks = CAPACITY / crate::claude::activity::MAX_PER_TICK;
+        let secs = ticks as u64 * crate::claude::activity::TICK.as_secs();
+        assert!(secs >= 30, "only {secs}s of nudges fill CAPACITY");
     }
 
     #[test]

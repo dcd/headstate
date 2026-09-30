@@ -92,6 +92,13 @@ describe("StatusBar on a phone", () => {
 });
 
 describe("StatusBar", () => {
+  it("does not diagnose sign-out when GitHub auth could not be checked", () => {
+    render(<StatusBar updatedAt={Date.now()} githubAuthAvailable={null} />);
+    expect(screen.getByText("GitHub status unavailable")).toBeTruthy();
+    expect(screen.queryByText("PRs up to date")).toBeNull();
+    expect(screen.queryByText(/Updated just now/)).toBeNull();
+    expect(screen.queryByText(/sign in/)).toBeNull();
+  });
   it("shows when the data was last updated", () => {
     render(<StatusBar updatedAt={Date.now() - 90_000} />);
     expect(screen.getByText(/updated/i)).toBeTruthy();
@@ -101,7 +108,7 @@ describe("StatusBar", () => {
   it("distinguishes fetching from idle", () => {
     state.current = "fetching";
     const { unmount } = render(<StatusBar updatedAt={Date.now()} />);
-    expect(screen.getByText(/checking github/i)).toBeTruthy();
+    expect(screen.getByText("Checking PRs…")).toBeTruthy();
     unmount();
     state.current = "idle";
     render(<StatusBar updatedAt={Date.now()} />);
@@ -151,7 +158,28 @@ describe("StatusBar", () => {
     state.current = "idle";
     state.error = null;
     render(<StatusBar updatedAt={Date.now()} />);
-    expect(screen.getByText(/PRs up to date/i)).toBeTruthy();
+    expect(screen.getByText("PRs up to date")).toBeTruthy();
+  });
+
+  /// Every state the poll drives names its subject, not only "ok" (#1115).
+  ///
+  /// "Checking GitHub…" and "Could not reach GitHub" made the same
+  /// app-wide claim from the PR poll's evidence alone. Exact strings, so a
+  /// label that drops its subject fails here rather than in a bug report.
+  it.each([
+    ["fetching", null, Date.now(), "Checking PRs…"],
+    ["retrying", null, Date.now() - 300_000, "Retrying PRs…"],
+    ["idle", "boom", Date.now() - 3_600_000, "Could not refresh PRs"],
+    ["idle", "boom", 0, "Could not load PRs"],
+  ] as const)("names pull requests while %s (error=%s)", (current, error, updatedAt, text) => {
+    state.current = current;
+    state.error = error;
+    const { unmount } = render(<StatusBar updatedAt={updatedAt} />);
+    expect(screen.getByText(text)).toBeTruthy();
+    expect(screen.queryByText(/GitHub/)).toBeNull();
+    unmount();
+    state.current = "idle";
+    state.error = null;
   });
 
   // The bug behind #190 being invisible: this line could only ever say
@@ -175,11 +203,11 @@ describe("StatusBar", () => {
       state.error = "boom";
 
       const never = render(<StatusBar updatedAt={0} />);
-      expect(screen.getByText(/could not reach github/i)).toBeTruthy();
+      expect(screen.getByText("Could not load PRs")).toBeTruthy();
       never.unmount();
 
       const stale = render(<StatusBar updatedAt={Date.now() - 3_600_000} />);
-      expect(screen.getByText(/could not refresh/i)).toBeTruthy();
+      expect(screen.getByText("Could not refresh PRs")).toBeTruthy();
       stale.unmount();
 
       state.error = null;
@@ -198,7 +226,8 @@ describe("StatusBar", () => {
       state.current = "fetching";
       state.error = "still broken";
       const { unmount } = render(<StatusBar updatedAt={0} />);
-      expect(screen.queryByText(/checking github/i)).toBeNull();
+      expect(screen.queryByText(/checking/i)).toBeNull();
+      expect(screen.getByText("Could not load PRs")).toBeTruthy();
       unmount();
       state.current = "idle";
       state.error = null;
@@ -234,7 +263,7 @@ describe("StatusBar", () => {
     state.current = "retrying";
     state.error = null;
     const { container } = render(<StatusBar updatedAt={Date.now() - 300_000} />);
-    expect(screen.getByText(/retrying/i)).toBeTruthy();
+    expect(screen.getByText("Retrying PRs…")).toBeTruthy();
     expect(screen.queryByText(/up to date/i)).toBeNull();
     expect(container.querySelector(".bg-\\[\\#3fb950\\]")).toBeNull();
     state.current = "idle";
@@ -438,5 +467,44 @@ describe("a panicked background task", () => {
     render(<StatusBar updatedAt={Date.now()} />);
     expect(await screen.findByText("PRs up to date")).toBeTruthy();
     expect(screen.queryByText(/Background updates stopped/)).toBeNull();
+  });
+});
+
+
+describe("selected source status", () => {
+  const gitlab = { rows: [], coverage: "complete" as const, staleSecs: null, loading: false, refreshing: false, error: null };
+  afterEach(() => { state.error = null; stubViewport(null); });
+
+  it("uses GitLab freshness and ignores GitHub auth and poll failures in GitLab-only mode", () => {
+    stubViewport(1400);
+    state.error = "GitHub failed";
+    render(<StatusBar updatedAt={Date.now()} githubAuthAvailable={false} selection="gitlab" gitlab={gitlab} />);
+    expect(screen.getByText("GitLab MRs updated within the last hour").previousElementSibling?.className).toContain("3fb950");
+    expect(screen.queryByText(/GitHub/)).toBeNull();
+    expect(screen.queryByText("PRs up to date")).toBeNull();
+    expect(screen.queryByText("Updated just now")).toBeNull();
+  });
+
+  it("names each provider in Both mode and qualifies a failed partial GitLab receipt", () => {
+    stubViewport(1400);
+    render(<StatusBar updatedAt={Date.now()} selection="both" gitlab={{ ...gitlab, coverage: { partial: { total: null } }, error: "GitLab refused credentials" }} />);
+    expect(screen.getByText("GitHub · PRs up to date")).toBeTruthy();
+    const status = screen.getByText("GitLab MRs updated within the last hour · partial list · refresh failed");
+    expect(status.previousElementSibling?.className).toContain("d29922");
+    expect(screen.queryByText("PRs up to date")).toBeNull();
+  });
+
+  it("marks a stale GitLab receipt amber even when its coverage is complete", () => {
+    stubViewport(1400);
+    render(<StatusBar updatedAt={Date.now()} selection="gitlab" gitlab={{ ...gitlab, staleSecs: 7200 }} />);
+    const status = screen.getByText("GitLab MRs last updated 2 hours ago · stale");
+    expect(status.previousElementSibling?.className).toContain("d29922");
+  });
+
+  it("does not substitute a GitHub timestamp for missing GitLab freshness", () => {
+    stubViewport(1400);
+    render(<StatusBar updatedAt={Date.now()} selection="gitlab" gitlab={{ ...gitlab, staleSecs: "unknown", coverage: "unknown" }} />);
+    expect(screen.getByText("GitLab MRs freshness unavailable · completeness unknown")).toBeTruthy();
+    expect(screen.queryByText(/just now/)).toBeNull();
   });
 });

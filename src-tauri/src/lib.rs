@@ -11,7 +11,9 @@ pub mod commands;
 pub mod diag;
 pub mod docker;
 pub mod github;
+pub mod gitlab;
 pub mod health;
+pub mod identity;
 /// Rules stated elsewhere in this codebase, asserted over its own source
 /// (#854). Test-only: the module holds no shipped code, and is declared
 /// here so `cargo test` compiles it.
@@ -23,7 +25,9 @@ pub mod poll;
 pub mod redact;
 pub mod release_notes;
 pub mod remote;
+pub mod report;
 pub mod repos;
+pub mod source_poll;
 pub mod store;
 pub mod tools;
 pub mod tray;
@@ -288,7 +292,14 @@ pub fn run() {
             commands::background_panicked,
             commands::background_health,
             commands::tool_versions,
+            commands::get_gitlab_auth_state,
+            commands::get_gitlab_host,
+            commands::set_gitlab_host,
+            commands::get_source_snapshot,
+            commands::refresh_source,
+            commands::set_source_selection,
             commands::read_log_tail,
+            commands::diagnostic_bundle,
             commands::reveal_log,
             commands::pull_checkout,
             commands::fetch_refs,
@@ -302,7 +313,13 @@ pub fn run() {
             commands::get_reviewing,
             commands::count_reviewing,
             commands::get_pr_detail,
+            commands::get_gitlab_detail,
+            commands::gitlab_action_capabilities,
+            commands::gitlab_action,
+            commands::get_review_gates,
+            commands::get_ready_pushers,
             commands::act_on_pr,
+            commands::merge_stack,
             commands::build_target,
             commands::get_viewer,
             commands::rerun_checks,
@@ -352,16 +369,19 @@ pub fn run() {
             commands::claude_search_transcripts,
             commands::claude_index_coverage,
             commands::claude_sessions,
-            commands::claude_sessions_for_pr,
+            commands::claude_sessions_for_pr_number,
             commands::claude_session_detail,
+            commands::claude_session_digest,
+            commands::claude_transcript_opening_prompt,
             commands::claude_subagent_rollup,
             commands::claude_session_events,
             commands::claude_event_profile,
             commands::claude_reveal_path,
             commands::claude_usage_profile,
             commands::claude_session_usage,
-            commands::claude_transcript_tail,
-            commands::claude_transcript_follow,
+            commands::claude_transcript_block_text,
+            commands::claude_transcript_page,
+            commands::claude_transcript_find,
             commands::claude_poll_live,
             commands::claude_overview,
             commands::claude_coverage,
@@ -431,6 +451,9 @@ pub fn run() {
             commands::claude_stop_session,
             commands::claude_launch_worktree_preview,
             commands::claude_launch_session_preview,
+            commands::claudify_pr_command,
+            commands::claude_launch_pr,
+            commands::claude_launch_pr_preview,
             commands::claude_launch_terms,
             commands::assessed_worktrees,
             commands::remove_worktree_forced,
@@ -442,6 +465,9 @@ pub fn run() {
             commands::get_merged_detail,
             commands::stats_count,
             commands::stats_tree,
+            commands::gitlab_stats_tree,
+            commands::gitlab_stats_load,
+            commands::gitlab_stats_backfill,
             commands::stats_board,
             commands::stats_series,
             commands::stats_reviewers,
@@ -450,6 +476,7 @@ pub fn run() {
             remote::pairing::respond_to_pairing,
             remote::pairing::list_paired_devices,
             remote::pairing::revoke_paired_device,
+            remote::pairing::set_paired_device_access,
             remote::gate::get_remote_enabled,
             remote::gate::set_remote_enabled,
         ])
@@ -521,6 +548,7 @@ pub fn run() {
             // to signal even when nothing is listening for it.
             let waker = Arc::new(tokio::sync::Notify::new());
             app.manage(poll::Waker(waker.clone()));
+            app.manage(source_poll::SourcePolls::default());
 
             // Managed unconditionally, like the Waker: the settings command
             // must find it whether or not auth succeeded.
@@ -542,6 +570,30 @@ pub fn run() {
             // Starts true: the app opens on a PR view.
             let needs_gh = Arc::new(AtomicBool::new(true));
             app.manage(poll::ViewNeedsGithub(needs_gh.clone()));
+            let github_source_enabled = Arc::new(AtomicBool::new(
+                store::open_db(&commands::db_path(&handle)).ok()
+                    .and_then(|c| store::settings::get::<String>(&c, store::settings::keys::SOURCE_SELECTION).ok().flatten())
+                    .as_deref() != Some("gitlab"),
+            ));
+            app.manage(poll::GithubSourceEnabled(github_source_enabled.clone()));
+            let gitlab_selected = store::open_db(&commands::db_path(&handle))
+                .ok()
+                .and_then(|c| {
+                    store::settings::get::<String>(&c, store::settings::keys::SOURCE_SELECTION)
+                        .ok()
+                        .flatten()
+                })
+                .is_some_and(|selection| selection == "gitlab" || selection == "both");
+            let saved_gitlab_host = store::open_db(&commands::db_path(&handle))
+                .ok()
+                .and_then(|conn| gitlab::host::read_host(&conn).ok());
+            let gitlab_control = Arc::new(gitlab::poll::Control::new(
+                saved_gitlab_host.filter(|_| gitlab_selected).map(|host| identity::Source {
+                    provider: identity::Provider::Gitlab,
+                    host,
+                }),
+            ));
+            app.manage(gitlab_control.clone());
             // Which repositories have a background update run going,
             // and how the last one ended. Default-constructed: it is
             // empty until someone starts a run.
@@ -981,6 +1033,15 @@ pub fn run() {
                 gh_client.is_some()
             );
 
+            let focused = Arc::new(AtomicBool::new(true));
+            app.manage(Focused(focused.clone()));
+            gitlab::poll::spawn(
+                handle.clone(),
+                gitlab_control,
+                focused.clone(),
+                interval.clone(),
+            );
+
             if let Some(client) = gh_client {
                 // WHICH account, not just that there is one. A reported
                 // failure took four rounds partly because the log said
@@ -1010,9 +1071,7 @@ pub fn run() {
                 // self-referential. `spawn_backfill`'s own docs carry the
                 // argument in full.
                 poll::spawn_backfill(handle.clone(), client.clone());
-                let focused = Arc::new(AtomicBool::new(true));
-                app.manage(Focused(focused.clone()));
-                poll::spawn(handle, client, focused, waker, interval, needs_gh);
+                poll::spawn(handle, client, focused, waker, interval, needs_gh, github_source_enabled);
             }
 
             tray::setup_tray(&app.handle().clone())?;
@@ -1021,6 +1080,12 @@ pub fn run() {
             // the signed-in login through it. Off by default; this only
             // binds a port when the setting says so.
             remote::gate::setup(&app.handle().clone());
+
+            // The session activity nudge (#1477): a one-second stat of
+            // RUNNING sessions' transcripts, emitting a content-free
+            // `claude-session-activity` on change. Its own thread, not
+            // the 60-second health loop's: its whole point is latency.
+            claude::activity::spawn(app.handle().clone());
 
             Ok(())
         })
@@ -1061,6 +1126,9 @@ pub fn run() {
                 if *is_focused {
                     if let Some(waker) = window.try_state::<poll::Waker>() {
                         waker.0.notify_one();
+                    }
+                    if let Some(control) = window.try_state::<Arc<gitlab::poll::Control>>() {
+                        control.wake();
                     }
                 }
             }

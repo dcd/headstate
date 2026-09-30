@@ -1,8 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { emit } from "@tauri-apps/api/event";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, describe, expect, it } from "vitest";
+import { useSourceSelection } from "../store/sourceSelection";
 import { AuthGate } from "./AuthGate";
 import { AUTH_EXPIRED, NOT_ASKED } from "@/lib/notAsked";
 
@@ -13,9 +14,15 @@ afterEach(() => {
   clearMocks();
 });
 
-function renderGated(authState: { ok: boolean; message: string }) {
+function renderGated(authState: { ok: boolean; message: string }, gitlabOk = false) {
   mockIPC((cmd) => {
     if (cmd === "get_auth_state") return authState;
+    if (cmd === "get_gitlab_host") return "gitlab.com";
+    if (cmd === "get_gitlab_auth_state") return {
+      host: "gitlab.com", ok: gitlabOk,
+      issue: gitlabOk ? null : "unverified",
+      message: gitlabOk ? "" : "GitLab.com authentication could not be verified.",
+    };
     return undefined;
   }, { shouldMockEvents: true });
 
@@ -35,20 +42,35 @@ describe("AuthGate", () => {
     expect(await screen.findByText("protected content")).toBeTruthy();
   });
 
-  it("shows the gh CLI install screen when not authenticated", async () => {
+  it("keeps local views available when GitHub is not authenticated", async () => {
     renderGated({
       ok: false,
       message: "gh auth status: not logged in to github.com",
     });
 
-    expect(await screen.findByText("Headstate needs the GitHub CLI")).toBeTruthy();
+    expect(await screen.findByText("protected content")).toBeTruthy();
     expect(
-      screen.getByText("gh auth status: not logged in to github.com"),
+      screen.getByText(/GitHub is unavailable: gh auth status: not logged in to github.com/),
     ).toBeTruthy();
-    expect(
-      screen.getByText((_, el) => el?.tagName === "PRE" && !!el.textContent?.includes("gh auth login")),
-    ).toBeTruthy();
-    expect(screen.queryByText("protected content")).toBeNull();
+    expect(await screen.findByText(/GitLab.com authentication could not be verified/)).toBeTruthy();
+  });
+
+  it("allows GitLab sign-in when gh is missing", async () => {
+    renderGated({ ok: false, message: "gh was not found" }, true);
+    expect(await screen.findByText("protected content")).toBeTruthy();
+    expect(await screen.findByText(/GitLab sign-in for gitlab.com is verified/)).toBeTruthy();
+  });
+
+  it("does not let missing GitLab authentication hide GitHub", async () => {
+    renderGated({ ok: true, message: "" }, false);
+    expect(await screen.findByText("protected content")).toBeTruthy();
+    expect(screen.queryByText(/GitLab.com authentication could not/)).toBeNull();
+  });
+
+  it("keeps the app open when both providers are signed in", async () => {
+    renderGated({ ok: true, message: "" }, true);
+    expect(await screen.findByText("protected content")).toBeTruthy();
+    expect(screen.queryByText(/GitHub is unavailable/)).toBeNull();
   });
 
   it("surfaces a poll-error banner above authenticated content", async () => {
@@ -65,6 +87,40 @@ describe("AuthGate", () => {
     // Content stays mounted -- a poll failure is not a reason to hide the
     // last-known-good cached data.
     expect(screen.getByText("protected content")).toBeTruthy();
+  });
+
+  /// The banner's "Report this" passed neither the view nor the
+  /// diagnostics flag, so the report said nothing about either (#1575).
+  ///
+  /// The desktop's bundle is NOT answered here, so the diagnostics line
+  /// can only have come from the banner's own prop.
+  it("passes the view and diagnostics into the poll banner's report", async () => {
+    mockIPC(
+      (cmd) => {
+        if (cmd === "get_auth_state") return { ok: true, message: "" };
+        if (cmd === "get_ui_prefs") return { diagnostic_logging: true };
+        return undefined;
+      },
+      { shouldMockEvents: true },
+    );
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <AuthGate>
+          <div>protected content</div>
+        </AuthGate>
+      </QueryClientProvider>,
+    );
+    await screen.findByText("protected content");
+    await emit("poll-error", "GitHub request timed out after 30s");
+    const button = await screen.findByRole("button", { name: "Report this" });
+    // Prefs load asynchronously; the report reads them when opened.
+    await waitFor(() => expect(qc.getQueryData(["ui-prefs"])).toBeTruthy());
+    fireEvent.click(button);
+    const where = await screen.findByRole("textbox", { name: "Where" });
+    const text = (where as HTMLTextAreaElement).value;
+    expect(text).toContain("View: My pull requests");
+    expect(text).toContain("Diagnostic logging: on");
   });
 
   /// A poll the app DECLINED to issue is not a failed refresh (#1124),
@@ -199,4 +255,13 @@ describe("AuthGate", () => {
     expect(screen.queryByText(/Not refreshing in the background/)).toBeNull();
     expect(screen.getByRole("alert")).toBeTruthy();
   });
+});
+
+it("reports GitLab authentication failure in GitLab-only mode without hiding content", async () => {
+  useSourceSelection.setState({ selection: "gitlab" });
+  try {
+    renderGated({ ok: true, message: "" });
+    expect(await screen.findByRole("button", { name: "Retry GitLab authentication" })).toBeTruthy();
+    expect(screen.getByText("protected content")).toBeTruthy();
+  } finally { useSourceSelection.setState({ selection: "github" }); }
 });

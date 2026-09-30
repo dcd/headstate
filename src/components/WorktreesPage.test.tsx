@@ -70,6 +70,10 @@ const state = vi.hoisted(() => ({
   // page never read `isError`, so a rejection showed skeletons and then
   // silently became an em dash.
   sizingFailed: false,
+  // What the failed sizing pass rejected with (#1459), for the "not
+  // measured" hint: a desktop that did not answer is not "a very large
+  // tree".
+  sizingError: undefined as unknown,
   // The orphan confirmation's measured size (#845). An orphan's size
   // comes from nowhere else on this page -- `sizeWorktrees` opens with
   // `git worktree list` inside a repository that is gone -- so it is its
@@ -84,6 +88,10 @@ const state = vi.hoisted(() => ({
   orphanMeasuring: false,
   orphanSizeFailed: false,
 }));
+
+/// How many worktree rows have rendered (#1582), counted through the one
+/// hook every row calls.
+const rowRenders = vi.hoisted(() => ({ count: 0 }));
 
 const toastSuccess = vi.hoisted(() => vi.fn());
 const toastError = vi.hoisted(() => vi.fn());
@@ -139,7 +147,13 @@ vi.mock("../api/hooks", () => ({
   useUpdateProgress: () => null,
   useCancelUpdateRun: () => () => Promise.resolve(),
   // Not opened in these tests: the disclosure is closed by default.
-  useAssessment: () => ({ data: undefined, isLoading: false }),
+  //
+  // Called once per row RENDER, which is what makes it the row-render
+  // counter for #1582's test below.
+  useAssessment: () => {
+    rowRenders.count += 1;
+    return { data: undefined, isLoading: false };
+  },
   // The cleanup manifest joins worktrees to the images they own, so the
   // page now reads Docker state -- but only while the confirmation is
   // open, which is why the default here is an empty list.
@@ -243,6 +257,7 @@ vi.mock("../api/hooks", () => ({
     // #769: the page must read this. A mock that omitted it would let
     // the "rejection shows skeletons forever" bug pass unnoticed.
     isError: state.sizingFailed,
+    error: state.sizingFailed ? state.sizingError : null,
   }),
 }));
 
@@ -251,7 +266,9 @@ const forceFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 const unlockFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 type Outcome = { path: string; error: string | null };
 const removeManyFn = vi.hoisted(() =>
-  vi.fn<(repo: string, paths: string[]) => Promise<Outcome[]>>((_r, paths) =>
+  vi.fn<
+    (repo: string, paths: string[], onRemoved?: (path: string) => void) => Promise<Outcome[]>
+  >((_r, paths) =>
     Promise.resolve(paths.map((p) => ({ path: p, error: null }))),
   ),
 );
@@ -389,6 +406,7 @@ describe("WorktreesPage on a phone", () => {
       sizesFailed: 0,
       sizing: false,
       sizingFailed: false,
+      sizingError: undefined,
       // #845. A leaked `orphanMeasuring` would put every orphan dialog
       // on "Measuring…" and hide the figure the dialog exists to state.
       orphanBytes: 2_684_354_560,
@@ -545,6 +563,7 @@ describe("WorktreesPage", () => {
       // #769. A leaked failure flag turns every later size assertion
       // into "not measured", which is a confusing way to fail.
       sizingFailed: false,
+      sizingError: undefined,
       sizesFailed: 0,
       assessed: [],
       prs: [],
@@ -918,6 +937,39 @@ describe("WorktreesPage", () => {
     render(<WorktreesPage />);
     expect(screen.getByText(/not measured/i)).not.toBeNull();
     expect(screen.getByText("2.0 KB")).not.toBeNull();
+  });
+
+  /// A pass that FAILED keeps the sizes it had already streamed (#1459).
+  ///
+  /// On the phone a sizing call can outlive the companion's deadline
+  /// after the stream has delivered most of its rows. Those rows were
+  /// measured; blanking them to "not measured" because the call as a
+  /// whole failed threw real numbers away -- partial is not nothing.
+  /// Only the row with no answer takes the failure, and its hint says
+  /// what failed rather than blaming the tree's size.
+  it("keeps streamed sizes when the sizing pass fails, and says why the rest are missing", () => {
+    Object.assign(state, {
+      repos: [
+        {
+          identity: null,
+          name: "proj",
+          path: "/code/proj",
+          worktrees: [
+            wt({ path: "/code/proj/ok", size_bytes: null, safety: { kind: "safe" } }),
+            wt({ path: "/code/proj/late", size_bytes: null, safety: { kind: "safe" } }),
+          ],
+        },
+      ],
+      partialSizes: new Map<string, number | null>([["/code/proj/ok", 2048]]),
+      sizing: false,
+      sizingFailed: true,
+      sizingError: "Desktop is unreachable: timed out",
+    });
+    render(<WorktreesPage />);
+    expect(screen.getByText("2.0 KB")).not.toBeNull();
+    const missing = screen.getAllByText(/not measured/i);
+    expect(missing).toHaveLength(1);
+    expect(missing[0].getAttribute("title")).toMatch(/Desktop is unreachable: timed out/);
   });
 
   /// The all-repositories rollup says it too, once the pass is done.
@@ -1366,7 +1418,11 @@ describe("WorktreesPage", () => {
         render(<WorktreesPage />);
         fireEvent.click(screen.getByRole("button", { name: /claudify/i }));
 
-        const model = await screen.findByLabelText(/model/i);
+        // Wait for the served vocabulary, not just the select: before it
+        // arrives the select holds only its empty option, and a change to
+        // "opus" there is a no-op (the race that ejected #1559).
+        await screen.findByRole("option", { name: "opus" });
+        const model = screen.getByLabelText(/model/i);
         fireEvent.change(model, { target: { value: "opus" } });
         const perms = screen.getByLabelText(/permissions/i);
         fireEvent.change(perms, { target: { value: "bypassPermissions" } });
@@ -2764,7 +2820,7 @@ describe("WorktreesPage", () => {
     /// Safe and MergedUpstreamDeleted are offered PLAINLY: both mean
     /// the work is on the default branch and the tree is clean, so both
     /// take the ordinary confirmation rather than the override.
-    it.each([["safe"], ["merged_upstream_deleted"]] as const)(
+    it.each([["safe"], ["merged_upstream_deleted"], ["merged_no_upstream"]] as const)(
       "sends a %s row to the plain confirmation",
       (kind) => {
         state.classified = [wt({ safety: { kind } })];
@@ -3738,6 +3794,69 @@ describe("WorktreesPage", () => {
       expect(container.querySelectorAll('[title="checking…"]').length).toBeGreaterThan(0);
     });
 
+    /// A verdict landing re-renders ITS row, not the repository (#1582).
+    ///
+    /// The page re-renders once per frame while verdicts stream, and each
+    /// render used to rebuild every row: on a 141-worktree repository,
+    /// 141 row renders per verdict. MEASURED in the Worktrees browser
+    /// harness at 4x CPU throttling, that held the main thread at 89% and
+    /// delivered verdicts up to 7.5 s late, while the window was in front.
+    it("re-renders only the row whose verdict landed", () => {
+      state.classified = undefined;
+      const paths = Array.from({ length: 40 }, (_, i) => `/code/wt-${i}`);
+      state.repos = [
+        {
+          identity: null,
+          name: "proj",
+          path: "/code/proj",
+          worktrees: paths.map((path) => wt({ path, safety: { kind: "pending" } })),
+        },
+      ];
+      state.classifying = true;
+      state.partialVerdicts = new Map();
+      const { rerender } = render(<WorktreesPage />);
+      expect(rowRenders.count).toBeGreaterThanOrEqual(40);
+
+      rowRenders.count = 0;
+      state.partialVerdicts = new Map([
+        [paths[7], wt({ path: paths[7], safety: { kind: "safe" } })],
+      ]);
+      rerender(<WorktreesPage />);
+      // The row that changed, and nothing else.
+      expect(rowRenders.count).toBe(1);
+      expect(screen.getByText(/merged, pushed/i)).toBeTruthy();
+      expect(screen.getByText(/39 to go/)).toBeTruthy();
+    });
+
+    /// A memoised row still acts on the page's CURRENT state (#1582).
+    ///
+    /// The handlers a row holds are stable wrappers, so a row that did
+    /// not re-render must still reach the latest page closure: a
+    /// shift-click range built from a stale visible order would select
+    /// the wrong rows.
+    it("a row that did not re-render still selects against the current list", () => {
+      state.classified = undefined;
+      const paths = ["/code/a", "/code/b", "/code/c", "/code/d"];
+      state.repos = [
+        {
+          identity: null,
+          name: "proj",
+          path: "/code/proj",
+          worktrees: paths.map((path) => wt({ path, safety: { kind: "pending" } })),
+        },
+      ];
+      state.classifying = true;
+      state.partialVerdicts = new Map();
+      const { rerender } = render(<WorktreesPage />);
+      state.partialVerdicts = new Map([[paths[1], wt({ path: paths[1], safety: { kind: "safe" } })]]);
+      rerender(<WorktreesPage />);
+
+      const boxes = screen.getAllByRole("checkbox", { name: /select/i });
+      fireEvent.click(boxes[0]);
+      fireEvent.click(boxes[3], { shiftKey: true });
+      expect(useFilters.getState().checked).toEqual(expect.arrayContaining(paths));
+    });
+
     /// One unclassifiable worktree must not suppress the others.
     ///
     /// The issue's second acceptance criterion verbatim: "a hung or
@@ -4120,5 +4239,47 @@ describe("WorktreesPage selection", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: /Select a/ }));
     fireEvent.click(screen.getByRole("button", { name: /Remove 1 selected/ }));
     expect(screen.queryByText(/will NOT be removed/)).toBeNull();
+  });
+
+  const removeAllThree = () => {
+    render(<WorktreesPage />);
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select a/ }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select c/ }), { shiftKey: true });
+    fireEvent.click(screen.getByRole("button", { name: /Remove 3 selected/ }));
+    fireEvent.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: /Remove 3 worktrees/ }),
+    );
+  };
+
+  /// #1544: each removed row is unticked as it goes, and a refused one
+  /// stays ticked so the user can see what did not go.
+  it("unticks each removed row as it goes and keeps a refused one ticked", async () => {
+    removeManyFn.mockImplementationOnce((_r, _paths, onRemoved) => {
+      onRemoved?.("/code/a");
+      onRemoved?.("/code/c");
+      return Promise.resolve([
+        { path: "/code/a", error: null },
+        { path: "/code/b", error: "not safe to remove: 2 uncommitted files" },
+        { path: "/code/c", error: null },
+      ]);
+    });
+    removeAllThree();
+
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    expect(useFilters.getState().checked).toEqual(["/code/b"]);
+  });
+
+  /// Partial is not nothing: a run that fails after removing one row
+  /// leaves that row unticked, so the next confirmation does not count
+  /// it as "hidden by the current filters".
+  it("unticks what was removed before a run failed midway", async () => {
+    removeManyFn.mockImplementationOnce((_r, _paths, onRemoved) => {
+      onRemoved?.("/code/a");
+      return Promise.reject("the connection dropped");
+    });
+    removeAllThree();
+
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    expect([...useFilters.getState().checked].sort()).toEqual(["/code/b", "/code/c"]);
   });
 });
